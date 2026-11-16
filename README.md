@@ -33,6 +33,15 @@ pnpm preview    # ดูผล build
 
 `dist/` เป็น static site ล้วน วางบน S3, Cloudflare Pages, GitHub Pages, Netlify ฯลฯ ได้ทันที
 
+### Deploy บน Cloudflare Pages
+
+| Setting | ค่า |
+|---|---|
+| Framework preset | Astro |
+| Build command | `pnpm build` |
+| Build output directory | `dist` |
+| Node.js | อ่านจากไฟล์ `.node-version` อัตโนมัติ (Astro 7 ต้องการ Node `>=22.23.4`) |
+
 ## ตรวจตัวอย่าง code
 
 ต้องมี Go 1.26+
