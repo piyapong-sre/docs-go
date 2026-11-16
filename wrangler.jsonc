@@ -1,0 +1,11 @@
+// Cloudflare Workers config: serve the static Astro build (dist/) as assets.
+// Having this file stops Cloudflare's auto-setup from adding the Astro
+// Cloudflare adapter, which this fully static site does not need.
+{
+  "name": "docs-go",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "404-page"
+  }
+}

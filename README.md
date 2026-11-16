@@ -33,14 +33,19 @@ pnpm preview    # ดูผล build
 
 `dist/` เป็น static site ล้วน วางบน S3, Cloudflare Pages, GitHub Pages, Netlify ฯลฯ ได้ทันที
 
-### Deploy บน Cloudflare Pages
+### Deploy บน Cloudflare
 
-| Setting | ค่า |
-|---|---|
-| Framework preset | Astro |
-| Build command | `pnpm build` |
-| Build output directory | `dist` |
-| Node.js | อ่านจากไฟล์ `.node-version` อัตโนมัติ (Astro 7 ต้องการ Node `>=22.23.4`) |
+เว็บนี้เป็น static ล้วน **ไม่ต้องใช้** `@astrojs/cloudflare` adapter (ถ้าใส่ build จะพังเพราะ `satteri` ไป resolve wasm binding)
+ไฟล์ `wrangler.jsonc` บอก Cloudflare ให้เสิร์ฟ `dist/` เป็น static assets และกันไม่ให้ระบบ auto-setup เติม adapter เอง
+
+| Setting | Workers (Workers Builds) | Pages |
+|---|---|---|
+| Build command | `pnpm build` | `pnpm build` |
+| Deploy command | `npx wrangler deploy` | – |
+| Build output directory | – (อ่านจาก `wrangler.jsonc`) | `dist` |
+
+- Node.js อ่านจากไฟล์ `.node-version` อัตโนมัติ (Astro 7 ต้องการ Node `>=22.23.4`)
+- ชื่อ Worker ใน Cloudflare ต้องตรงกับ `name` ใน `wrangler.jsonc` (`docs-go`)
 
 ## ตรวจตัวอย่าง code
 
