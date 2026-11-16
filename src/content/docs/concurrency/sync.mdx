@@ -1,0 +1,213 @@
+---
+title: sync และ atomic
+description: ป้องกัน shared state ด้วย Mutex, RWMutex, Once, OnceValue และ sync/atomic พร้อมรู้ว่าเมื่อไหร่ควรใช้ sync.Map
+sidebar:
+  order: 4
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/concurrency/sync/main.go?raw';
+
+channel เหมาะกับการ **ส่งต่อข้อมูล** ระหว่าง goroutine แต่หลายครั้งเรามีแค่ state ก้อนหนึ่ง
+(counter, cache, map ของ session) ที่หลาย goroutine ต้องอ่านเขียน กรณีนี้ใช้ package `sync` ง่ายและตรงไปตรงมากว่า
+
+## ทำไมต้องป้องกัน
+
+```go
+count := 0
+for range 1000 {
+	wg.Go(func() { count++ }) // ❌ data race
+}
+```
+
+`count++` ไม่ใช่คำสั่งเดียว แต่คือ "อ่าน → บวก → เขียน" ถ้าสอง goroutine อ่านค่าเดียวกันพร้อมกัน
+ค่าที่บวกจะหายไปหนึ่งครั้ง ผลลัพธ์จะได้น้อยกว่า 1000 และต่างกันทุกครั้งที่รัน
+ส่วน **map** ที่ถูกเขียนพร้อมกันจากหลาย goroutine อาจทำให้โปรแกรมล่มทันทีด้วย `fatal error: concurrent map writes`
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/concurrency/sync/main.go" />
+
+```text title="Output"
+hits: 1000
+lang: go
+ops: 5000
+init once
+loading config (once)
+env: dev
+```
+
+## sync.Mutex
+
+**Mutex** (mutual exclusion) คือกุญแจที่ให้ goroutine เข้าไปทำงานใน critical section ได้ทีละตัว
+
+```go
+type SafeCounter struct {
+	mu sync.Mutex
+	m  map[string]int
+}
+
+func (c *SafeCounter) Inc(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[key]++
+}
+```
+
+- `Lock()` ถ้ามีคนถือกุญแจอยู่ จะรอจนกว่าจะถูก `Unlock()`
+- ใช้ `defer c.mu.Unlock()` ทันทีหลัง `Lock()` เพื่อไม่ลืมปลด แม้ return กลางทางหรือ panic
+- zero value ของ `sync.Mutex` ใช้ได้เลย ไม่ต้อง initialize
+- ธรรมเนียมคือวาง `mu` ไว้ **เหนือ field ที่มันป้องกัน** ใน struct
+
+<Aside type="caution" title="ห้าม copy Mutex">
+struct ที่มี `sync.Mutex` ต้องส่งต่อเป็น pointer และ method ต้องใช้ **pointer receiver**
+ถ้าใช้ value receiver แต่ละ method จะได้ Mutex สำเนาคนละตัว การ lock จึงไม่มีผล `go vet` (copylocks) จับกรณีนี้ได้
+(ทบทวน receiver ได้ที่ [Method](/intermediate/methods/))
+</Aside>
+
+## sync.RWMutex
+
+ถ้า **อ่านบ่อยมากแต่เขียนน้อย** ใช้ `RWMutex` ให้หลาย reader อ่านพร้อมกันได้
+
+| method | ใช้เมื่อ | ระหว่างถืออยู่ |
+|---|---|---|
+| `RLock()` / `RUnlock()` | อ่าน | reader อื่นเข้าได้ writer ต้องรอ |
+| `Lock()` / `Unlock()` | เขียน | ทุกคนต้องรอ |
+
+<Aside type="tip">
+`RWMutex` มี overhead มากกว่า `Mutex` และไม่ได้เร็วกว่าเสมอไป ถ้า critical section สั้นๆ หรือสัดส่วนการเขียนสูง
+`Mutex` ธรรมดาอาจเร็วกว่า เริ่มจาก `Mutex` แล้วค่อยเปลี่ยนเมื่อวัดผลแล้วว่าคุ้ม
+</Aside>
+
+## sync.Once, OnceValue, OnceFunc
+
+ใช้ทำงานบางอย่าง **ครั้งเดียว** อย่างปลอดภัย แม้หลาย goroutine เรียกพร้อมกัน เช่น lazy initialization
+
+```go
+var once sync.Once
+once.Do(func() { fmt.Println("init once") }) // เรียกกี่ครั้งก็ทำงานครั้งเดียว
+```
+
+Go 1.21 เพิ่มตัวช่วยที่ใช้ง่ายกว่า
+
+```go
+// OnceValue: ทำครั้งเดียวและจำค่าที่คืน
+var getConfig = sync.OnceValue(func() map[string]string {
+	return loadFromDisk()
+})
+
+// OnceValues: แบบคืนสองค่า เหมาะกับ (value, error)
+var getDB = sync.OnceValues(func() (*sql.DB, error) {
+	return sql.Open("pgx", dsn)
+})
+
+// OnceFunc: ห่อ function ให้ทำงานครั้งเดียว
+var cleanup = sync.OnceFunc(func() { os.RemoveAll(tmp) })
+```
+
+ในตัวอย่าง `getConfig()` ถูกเรียก 4 ครั้งจากหลาย goroutine แต่ `loading config (once)` พิมพ์ครั้งเดียว
+
+## sync/atomic
+
+สำหรับตัวเลขหรือค่าเดี่ยวๆ `sync/atomic` เร็วกว่า Mutex เพราะใช้คำสั่งระดับ CPU โดยตรง
+
+```go
+var ops atomic.Int64
+ops.Add(1)          // บวกแบบ atomic
+n := ops.Load()     // อ่าน
+ops.Store(0)        // เขียน
+ops.CompareAndSwap(old, new)
+```
+
+type ที่ใช้บ่อย: `atomic.Int32`, `atomic.Int64`, `atomic.Uint64`, `atomic.Bool`, `atomic.Pointer[T]`, `atomic.Value`
+
+<Aside type="caution" title="atomic ใช้กับค่าเดียวเท่านั้น">
+ถ้าต้องอัปเดต **หลาย field ให้สอดคล้องกัน** (เช่น ลด stock แล้วเพิ่มยอดขาย) atomic ไม่ช่วย
+เพราะแต่ละ field atomic แยกกัน คนอื่นอาจเห็นสถานะครึ่งๆ กลางๆ ได้ — ใช้ Mutex ครอบทั้งชุด
+</Aside>
+
+## sync.Map — ใช้เมื่อไหร่
+
+`sync.Map` เป็น map ที่ปลอดภัยต่อ concurrent access ในตัว แต่ **ไม่ใช่ตัวเลือกแรก**
+ส่วนใหญ่ `map` + `Mutex` (หรือ `RWMutex`) อ่านง่ายกว่า มี type safety และเร็วพอ
+
+`sync.Map` เหมาะกับสองกรณีที่ document ของ Go ระบุไว้
+
+1. key ถูกเขียนครั้งเดียวแต่ถูกอ่านหลายครั้ง (cache ที่โตขึ้นเรื่อยๆ)
+2. หลาย goroutine อ่าน/เขียน **ชุด key ที่ไม่ซ้อนทับกัน**
+
+```go
+var m sync.Map
+m.Store("go", 1)
+v, ok := m.Load("go")          // v เป็น any ต้อง type assert
+actual, loaded := m.LoadOrStore("go", 2)
+m.Range(func(k, v any) bool { return true })
+```
+
+## Mutex หรือ channel?
+
+| สถานการณ์ | เลือก |
+|---|---|
+| ปกป้อง state ภายใน struct (counter, cache, map) | **Mutex** |
+| ส่งต่องาน/ข้อมูลจาก goroutine หนึ่งไปอีกตัว | **channel** |
+| ส่งสัญญาณ "เสร็จแล้ว" หรือ "หยุดได้แล้ว" | **channel** / context |
+| ตัวเลขนับเดี่ยวๆ | **atomic** |
+
+ไม่ต้องยึดติดว่า channel ดีกว่าเสมอ — เลือกตัวที่ทำให้ code อ่านง่ายที่สุด
+
+## แบบฝึกหัด
+
+1. เขียน type `BankAccount` ที่มี method `Deposit(n int)`, `Withdraw(n int) bool` และ `Balance() int` ปลอดภัยเมื่อเรียกจากหลาย goroutine แล้วทดสอบด้วย 100 goroutine ฝากเงินคนละ 10
+2. เปลี่ยน `SafeCounter` ให้ใช้ `RWMutex` โดย `Get` ใช้ read lock
+3. เขียน `var getSecret = sync.OnceValues(...)` ที่อ่าน env `APP_SECRET` และคืน error ถ้าว่าง
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+type BankAccount struct {
+	mu      sync.Mutex
+	balance int
+}
+
+func (a *BankAccount) Deposit(n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.balance += n
+}
+
+func (a *BankAccount) Withdraw(n int) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if n > a.balance {
+		return false
+	}
+	a.balance -= n
+	return true
+}
+
+func (a *BankAccount) Balance() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.balance
+}
+
+// 2 — เปลี่ยน field เป็น mu sync.RWMutex แล้ว
+func (c *SafeCounter) Get(key string) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.m[key]
+}
+
+// 3
+var getSecret = sync.OnceValues(func() (string, error) {
+	s := os.Getenv("APP_SECRET")
+	if s == "" {
+		return "", errors.New("APP_SECRET is not set")
+	}
+	return s, nil
+})
+```
+
+</details>

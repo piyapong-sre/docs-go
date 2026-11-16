@@ -1,0 +1,182 @@
+---
+title: ติดตั้ง Go และเครื่องมือ
+description: ติดตั้ง Go บน Windows, macOS และ Linux พร้อมตั้งค่า VS Code ให้พร้อมเขียน Go
+sidebar:
+  order: 2
+---
+
+import { Aside, Code, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+import checkenvSrc from '../../../../examples/learn/start/checkenv/main.go?raw';
+
+ก่อนเขียน Go ได้ เราต้องมี 2 อย่าง คือ **Go toolchain** (compiler และเครื่องมือ command line ทั้งหมด) และ **editor** ที่รู้จัก Go ในบทนี้จะใช้ VS Code เพราะฟรีและมี extension ที่ทีม Go ดูแลเอง
+
+## 1. ติดตั้ง Go toolchain
+
+ดาวน์โหลดเวอร์ชันล่าสุดได้ที่ [go.dev/dl](https://go.dev/dl) แล้วเลือกตามระบบปฏิบัติการ
+
+<Tabs syncKey="os">
+<TabItem label="Windows">
+
+**วิธีที่ 1: ใช้ตัวติดตั้ง (แนะนำสำหรับมือใหม่)**
+
+<Steps>
+
+1. ดาวน์โหลดไฟล์ `.msi` (เช่น `go1.xx.x.windows-amd64.msi`) จาก [go.dev/dl](https://go.dev/dl)
+2. ดับเบิลคลิกแล้วกด Next ไปจนจบ ตัวติดตั้งจะวาง Go ไว้ที่ `C:\Program Files\Go` และเพิ่ม `PATH` ให้อัตโนมัติ
+3. **ปิดแล้วเปิด** terminal (PowerShell หรือ Command Prompt) ใหม่ เพื่อให้ `PATH` ใหม่มีผล
+
+</Steps>
+
+**วิธีที่ 2: ใช้ package manager**
+
+```powershell
+# winget (มีมากับ Windows 10/11)
+winget install GoLang.Go
+
+# หรือ Scoop
+scoop install go
+```
+
+</TabItem>
+<TabItem label="macOS">
+
+**วิธีที่ 1: ใช้ตัวติดตั้ง**
+
+ดาวน์โหลดไฟล์ `.pkg` ให้ตรงกับเครื่อง — `darwin-arm64` สำหรับ Apple Silicon (M1 ขึ้นไป) หรือ `darwin-amd64` สำหรับ Mac ที่ใช้ Intel — แล้วติดตั้งตามขั้นตอน Go จะถูกวางไว้ที่ `/usr/local/go` และเพิ่ม `/usr/local/go/bin` เข้า `PATH` ให้
+
+**วิธีที่ 2: ใช้ Homebrew**
+
+```bash
+brew install go
+```
+
+อัปเดตภายหลังได้ด้วย `brew upgrade go`
+
+</TabItem>
+<TabItem label="Linux">
+
+ใช้ไฟล์ tarball ทางการ (package ใน `apt`/`dnf` ของบาง distro มักเป็นเวอร์ชันเก่า)
+
+```bash
+# เปลี่ยนเลขเวอร์ชันให้ตรงกับเวอร์ชันล่าสุดที่ go.dev/dl
+# ถ้าเป็น ARM (เช่น Raspberry Pi 64-bit) ให้ใช้ linux-arm64 แทน linux-amd64
+GO_VERSION=1.27.1
+curl -LO https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz
+
+# ลบเวอร์ชันเก่าออกก่อน แล้วแตกไฟล์ไปที่ /usr/local/go
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz
+```
+
+จากนั้นเพิ่ม `PATH` ในไฟล์ `~/.profile` (หรือ `~/.bashrc`, `~/.zshrc` ตาม shell ที่ใช้)
+
+```bash
+export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
+```
+
+แล้วโหลดค่าใหม่ด้วย `source ~/.profile` หรือเปิด terminal ใหม่
+
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="อย่าแตกไฟล์ทับของเดิม">
+บน Linux/macOS ถ้าติดตั้งแบบ tarball ต้อง **ลบ `/usr/local/go` เดิมก่อน** แล้วค่อยแตกไฟล์ใหม่ การแตกทับโฟลเดอร์เดิมจะทำให้ไฟล์ของสองเวอร์ชันปนกันและเกิด error แปลก ๆ ตอน build
+</Aside>
+
+## 2. ตรวจสอบการติดตั้ง
+
+เปิด terminal ใหม่แล้วรัน
+
+```bash
+go version
+```
+
+```text title="Output (ตัวอย่าง)"
+go version go1.27.1 darwin/arm64
+```
+
+ผลลัพธ์บอก 3 อย่าง: เวอร์ชันของ Go, ระบบปฏิบัติการ (`darwin` = macOS) และสถาปัตยกรรม CPU (`arm64`) ของคุณอาจต่างออกไปได้
+
+ถ้าขึ้นว่า `command not found` หรือ `'go' is not recognized` แปลว่า `PATH` ยังไม่ถูกตั้ง ให้ลองปิดเปิด terminal ใหม่ หรือตรวจสอบขั้นตอนตั้ง `PATH` อีกครั้ง
+
+### ดูค่า environment ด้วย `go env`
+
+`go env` แสดงค่าตั้งค่าทั้งหมดของ Go ถ้าระบุชื่อตัวแปรจะแสดงเฉพาะค่านั้น
+
+```bash
+go env GOROOT GOPATH GOOS GOARCH GOPROXY
+```
+
+```text title="Output (ตัวอย่างบน macOS)"
+/usr/local/go
+/Users/you/go
+darwin
+arm64
+https://proxy.golang.org,direct
+```
+
+| ตัวแปร | ความหมาย |
+| --- | --- |
+| `GOROOT` | โฟลเดอร์ที่ติดตั้ง Go (compiler + standard library) ปกติไม่ต้องแก้ |
+| `GOPATH` | โฟลเดอร์ทำงานของ Go ค่าเริ่มต้นคือ `$HOME/go` ใช้เก็บ module cache (`$GOPATH/pkg/mod`) และโปรแกรมที่ติดตั้งด้วย `go install` (`$GOPATH/bin`) |
+| `GOOS` / `GOARCH` | OS และ CPU เป้าหมายตอน build (เปลี่ยนได้เพื่อ cross-compile) |
+| `GOPROXY` | ที่ที่ Go ไปดาวน์โหลด module |
+
+ถ้าต้องการเปลี่ยนค่าถาวร ใช้ `go env -w` เช่น `go env -w GOPROXY=https://proxy.golang.org,direct`
+
+<Aside type="tip" title="ไม่ต้องเขียน code ไว้ใน GOPATH แล้ว">
+บทความเก่า ๆ อาจบอกให้วางโปรเจกต์ไว้ใน `$GOPATH/src` นั่นเป็นวิธีก่อนยุค Go modules (ก่อน Go 1.11) ปัจจุบันวางโปรเจกต์ **ไว้ที่ไหนก็ได้** แค่มีไฟล์ `go.mod` ซึ่งจะอธิบายในบท [Modules และ toolchain](/start/modules-and-toolchain/)
+</Aside>
+
+### ลองรันโปรแกรมแรกเพื่อตรวจสอบ
+
+โปรแกรมเล็ก ๆ นี้ใช้ package `runtime` แสดงข้อมูลของเครื่องที่รันอยู่
+
+<Code code={checkenvSrc} lang="go" title="examples/learn/start/checkenv/main.go" />
+
+```text title="Output (ตัวอย่าง ค่าจะต่างไปตามเครื่อง)"
+Go version: go1.27.1
+OS: darwin
+Arch: arm64
+CPUs: 12
+```
+
+ยังไม่ต้องกังวลว่าจะรันอย่างไร บทถัดไป [Hello World](/start/hello-world/) จะอธิบายทีละขั้น
+
+## 3. ตั้งค่า VS Code
+
+<Steps>
+
+1. ติดตั้ง [Visual Studio Code](https://code.visualstudio.com/)
+2. เปิดแท็บ Extensions (`Ctrl+Shift+X` หรือ `Cmd+Shift+X` บน macOS) ค้นหา **Go** แล้วติดตั้งตัวที่ผู้พัฒนาคือ **Go Team at Google** (extension id: `golang.go`)
+3. เปิด Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) พิมพ์ **Go: Install/Update Tools** เลือกทั้งหมดแล้วกด OK เพื่อติดตั้งเครื่องมือเสริม
+4. ลองสร้างไฟล์ `.go` สักไฟล์ ถ้ามี autocomplete และขีดเส้นใต้ error ได้ แปลว่าพร้อมใช้งาน
+
+</Steps>
+
+เครื่องมือสำคัญที่ extension ใช้:
+
+- **gopls** (อ่านว่า "go please") — language server ทางการของ Go ทำหน้าที่ autocomplete, go to definition, rename, แสดง error แบบ real-time และจัด import ให้อัตโนมัติ
+- **dlv** (Delve) — debugger สำหรับตั้ง breakpoint และดูค่าตัวแปร
+- **staticcheck** — linter ที่ช่วยหาจุดผิดพลาดที่ compiler ไม่เตือน
+
+<Aside type="tip" title="เปิด format on save">
+extension ของ Go จะจัดรูปแบบ code (gofmt) และจัด import ให้ทุกครั้งที่ save โดยค่าเริ่มต้นอยู่แล้ว ถ้าไม่ทำงาน ให้ตรวจว่า `editor.formatOnSave` เปิดอยู่ใน settings การปล่อยให้เครื่องมือจัดรูปแบบให้ทำให้ไม่ต้องเถียงกันเรื่อง tab/space อีกเลย
+</Aside>
+
+<Aside>
+ถ้าใช้ editor อื่น เช่น GoLand (JetBrains), Neovim, Zed หรือ Sublime Text ก็ใช้ได้ทั้งหมด editor ส่วนใหญ่รองรับ Go ผ่าน gopls ตัวเดียวกัน
+</Aside>
+
+## แบบฝึกหัด
+
+1. รัน `go version` และ `go env GOPATH` บนเครื่องของคุณ แล้วตอบว่า Go ติดตั้งอยู่เวอร์ชันอะไร และ `GOPATH` อยู่ที่ไหน
+2. รัน `go env` (ไม่ใส่ชื่อตัวแปร) แล้วหาค่า `GOMODCACHE` ว่าชี้ไปที่ไหน มีความสัมพันธ์กับ `GOPATH` อย่างไร
+3. ใน VS Code สร้างไฟล์ `test.go` พิมพ์ `package main` แล้วลองพิมพ์ `fmt.` ดูว่า gopls เสนอ autocomplete และเพิ่ม `import "fmt"` ให้อัตโนมัติหรือไม่
+
+<details>
+<summary>เฉลยข้อ 2</summary>
+
+ค่าเริ่มต้นของ `GOMODCACHE` คือ `$GOPATH/pkg/mod` — เป็นที่เก็บ source code ของ module ที่ดาวน์โหลดมา (cache กลางที่ทุกโปรเจกต์บนเครื่องใช้ร่วมกัน)
+
+</details>

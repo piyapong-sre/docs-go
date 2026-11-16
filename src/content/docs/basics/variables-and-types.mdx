@@ -1,0 +1,201 @@
+---
+title: ตัวแปรและชนิดข้อมูล
+description: ประกาศตัวแปรด้วย var และ :=, zero value, ชนิดข้อมูลพื้นฐาน, type conversion, ค่าคงที่ และ iota
+sidebar:
+  order: 1
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import variablesSrc from '../../../../examples/learn/basics/variables/main.go?raw';
+
+Go เป็นภาษาแบบ **statically typed** — ทุกตัวแปรมี type ที่แน่นอนตั้งแต่ตอน compile และเปลี่ยนไม่ได้ ข้อดีคือ compiler จับ bug ให้ได้เยอะมาก แต่ Go ก็ไม่ได้บังคับให้เขียน type ทุกที่ เพราะอนุมาน (infer) type จากค่าได้
+
+## ตัวอย่างรวม
+
+<Code code={variablesSrc} lang="go" title="examples/learn/basics/variables/main.go" />
+
+```text title="Output"
+Gopher 15 Bangkok
+int=0 float64=0 bool=false string="" pointer=<nil>
+3 1
+float64 3.3333333333333335
+99
+44
+int32 uint8 float64 complex128
+go-th 0 1 2
+1024 1048576 1073741824
+```
+
+## การประกาศตัวแปร
+
+### `var`
+
+```go
+var name string = "Gopher" // ระบุ type และค่าเริ่มต้น
+var age = 15               // ไม่ระบุ type: compiler อนุมานเป็น int
+var count int              // ไม่ระบุค่า: ได้ zero value (0)
+
+// ประกาศเป็นกลุ่ม
+var (
+	host = "localhost"
+	port = 8080
+)
+```
+
+`var` ใช้ได้ทั้ง **ระดับ package** (นอก function) และภายใน function
+
+### Short declaration `:=`
+
+```go
+city := "Bangkok"     // เท่ากับ var city = "Bangkok"
+x, y := 10, 3         // ประกาศหลายตัวพร้อมกัน
+```
+
+`:=` ใช้ได้ **เฉพาะภายใน function** และเป็นวิธีที่นิยมที่สุด ส่วน `=` คือการ **กำหนดค่าใหม่** ให้ตัวแปรที่มีอยู่แล้ว
+
+```go
+n := 1   // ประกาศ + กำหนดค่า
+n = 2    // กำหนดค่าใหม่
+n := 3   // compile error: no new variables on left side of :=
+```
+
+ข้อยกเว้น: ถ้าด้านซ้ายมี **ตัวแปรใหม่อย่างน้อยหนึ่งตัว** ก็ใช้ `:=` ได้ ซึ่งพบบ่อยกับ `err`
+
+```go
+a, err := strconv.Atoi("1")
+b, err := strconv.Atoi("2") // OK: b เป็นตัวแปรใหม่ ส่วน err ถูกกำหนดค่าใหม่
+```
+
+<Aside type="tip" title="ควรใช้แบบไหน">
+- ภายใน function ใช้ `:=` เป็นหลัก
+- ใช้ `var x T` เมื่อต้องการ zero value ชัด ๆ เช่น `var total int` หรือ `var buf bytes.Buffer`
+- ระดับ package ต้องใช้ `var` เท่านั้น
+</Aside>
+
+## Zero value
+
+ใน Go **ไม่มีตัวแปรที่ "ยังไม่ได้กำหนดค่า"** ทุกตัวแปรจะได้ค่าเริ่มต้นตาม type เสมอ เรียกว่า zero value
+
+| Type | Zero value |
+| --- | --- |
+| ตัวเลขทุกชนิด (`int`, `float64`, ...) | `0` |
+| `bool` | `false` |
+| `string` | `""` (string ว่าง) |
+| pointer, slice, map, channel, function, interface | `nil` |
+| struct | ทุก field เป็น zero value ของ field นั้น |
+
+แนวคิดนี้ทำให้ type ที่ออกแบบดี ๆ "ใช้ได้ทันทีโดยไม่ต้อง initialize" เช่น `var sb strings.Builder` หรือ `var mu sync.Mutex`
+
+## ชนิดข้อมูลพื้นฐาน
+
+| กลุ่ม | Type | หมายเหตุ |
+| --- | --- | --- |
+| จำนวนเต็ม | `int`, `int8`, `int16`, `int32`, `int64` | `int` มีขนาด 64 bit บนเครื่อง 64-bit (32 bit บนเครื่อง 32-bit) |
+| จำนวนเต็มไม่ติดลบ | `uint`, `uint8`, `uint16`, `uint32`, `uint64`, `uintptr` | |
+| ทศนิยม | `float32`, `float64` | ค่า literal อย่าง `1.5` จะเป็น `float64` |
+| จำนวนเชิงซ้อน | `complex64`, `complex128` | ใช้น้อยมาก |
+| ข้อความ | `string` | เป็น byte ที่เข้ารหัส UTF-8 และแก้ไขไม่ได้ (immutable) |
+| ตรรกะ | `bool` | `true` / `false` |
+| alias | `byte` = `uint8`, `rune` = `int32` | `rune` ใช้แทน Unicode code point หนึ่งตัว |
+
+ใน output ข้างบน `'ก'` เป็น `int32` เพราะ character literal ในเครื่องหมาย `'...'` มี type เริ่มต้นเป็น `rune` ซึ่งก็คือ `int32` (เรื่องนี้สำคัญมากกับภาษาไทย ดูบท [String และ rune](/basics/strings-and-runes/))
+
+<Aside type="tip">
+ใช้ `int` สำหรับตัวเลขทั่วไป และ `float64` สำหรับทศนิยม เลือก type ที่ระบุขนาด (`int32`, `uint8` ...) เมื่อมีเหตุผลจริง ๆ เช่น ต้องตรงกับ format ของไฟล์/protocol หรือประหยัดหน่วยความจำใน slice ขนาดใหญ่
+</Aside>
+
+## Type conversion
+
+Go **ไม่แปลง type ให้อัตโนมัติ** แม้แต่ระหว่าง `int` กับ `float64` ต้องเขียนเองในรูป `T(value)`
+
+```go
+x, y := 10, 3
+avg := x / y                    // 3 (int หาร int)
+avg2 := float64(x) / float64(y) // 3.3333333333333335
+var f float64 = x               // compile error: cannot use x (variable of type int) as float64 value in variable declaration
+```
+
+<Aside type="caution" title="conversion อาจทำข้อมูลหาย">
+- `int(99.95)` จากตัวแปร float ได้ `99` — **ตัดทศนิยมทิ้ง ไม่ปัดเศษ** (ถ้าต้องการปัดใช้ `math.Round`)
+- `uint8(300)` จากตัวแปร int ได้ `44` — ค่าล้นจะวนรอบ (300 − 256) โดยไม่มี error
+- แปลงตัวเลขเป็น string ต้องใช้ `strconv.Itoa(42)` ได้ `"42"` **ห้ามใช้ `string(42)`** เพราะจะได้ตัวอักษรที่มี code point 42 คือ `"*"` (และ `go vet` จะเตือน)
+</Aside>
+
+## ค่าคงที่ (constants)
+
+```go
+const Pi = 3.14159
+const AppName = "go-th"
+
+const (
+	MaxRetry = 3
+	Timeout  = 30 // วินาที
+)
+```
+
+- ค่าของ `const` ต้องรู้ได้ตั้งแต่ตอน compile (ตัวเลข, string, bool) เรียก function ที่คำนวณตอน runtime ไม่ได้
+- ไม่มี `const` สำหรับ slice, map หรือ struct
+- ค่าคงที่ที่ไม่ระบุ type (untyped constant) มีความแม่นยำสูงและปรับ type ตามที่ถูกใช้ เช่น `const Big = 1 << 40` ใช้กับ `float64` หรือ `int64` ได้ทั้งคู่
+
+### `iota`
+
+`iota` เป็นตัวนับที่เริ่มจาก 0 ในแต่ละ `const ( ... )` block และเพิ่มขึ้นทีละ 1 ทุกบรรทัด บรรทัดที่ไม่เขียนค่าจะ "ทำซ้ำ" นิพจน์ของบรรทัดก่อนหน้า
+
+```go
+type Weekday int
+
+const (
+	Sunday  Weekday = iota // 0
+	Monday                 // 1
+	Tuesday                // 2
+)
+```
+
+ใช้ `_` เพื่อข้ามค่า และใช้ร่วมกับนิพจน์ได้ เช่น `KB = 1 << (10 * iota)` ซึ่งใน block ตัวอย่างได้ 1024, 1048576 และ 1073741824
+
+<Aside type="tip" title="enum ใน Go">
+Go ไม่มี keyword `enum` วิธีที่นิยมคือประกาศ type ใหม่ (`type Weekday int`) แล้วใช้ `const` + `iota` แบบตัวอย่างข้างบน เมื่อเรียน [method](/intermediate/methods/) แล้วจะเพิ่ม method `String()` ให้พิมพ์เป็นชื่อวันได้
+</Aside>
+
+## Scope และ shadowing
+
+ตัวแปรมี scope ตาม block `{ }` ที่ประกาศ ถ้าประกาศชื่อซ้ำใน block ด้านใน จะ **บัง (shadow)** ตัวแปรด้านนอก
+
+```go
+x := 1
+if true {
+	x := 2         // ตัวแปรใหม่ บัง x ด้านนอก
+	fmt.Println(x) // 2
+}
+fmt.Println(x)     // 1 — ค่าด้านนอกไม่เปลี่ยน
+```
+
+<Aside type="caution">
+shadowing มักเกิดโดยไม่ตั้งใจเมื่อใช้ `:=` ใน block ด้านใน (โดยเฉพาะกับ `err`) ถ้าตั้งใจจะแก้ตัวแปรด้านนอก ให้ใช้ `=` แทน
+</Aside>
+
+## แบบฝึกหัด
+
+1. ประกาศตัวแปรเก็บ ชื่อ (string), อายุ (int), ส่วนสูงเป็นเมตร (float64) และสถานะเป็นนักเรียนหรือไม่ (bool) แล้วพิมพ์ทั้งหมดพร้อม type ด้วย `%v` และ `%T`
+2. เขียนโปรแกรมแปลงอุณหภูมิ 37 องศาเซลเซียส (เก็บเป็น `int`) เป็นฟาเรนไฮต์ ด้วยสูตร `F = C*9/5 + 32` ให้ได้ผลเป็น `float64` ที่ถูกต้อง (98.6)
+3. ใช้ `iota` สร้างค่าคงที่ระดับ log: `Debug`, `Info`, `Warn`, `Error` โดยให้ `Debug` เริ่มที่ 1
+
+<details>
+<summary>เฉลยข้อ 2 และ 3</summary>
+
+```go
+c := 37
+f := float64(c)*9/5 + 32 // แปลงก่อนคำนวณ ไม่อย่างนั้น 37*9/5 จะถูกหารแบบ int
+fmt.Println(f)           // 98.6
+
+type Level int
+
+const (
+	Debug Level = iota + 1 // 1
+	Info                   // 2
+	Warn                   // 3
+	Error                  // 4
+)
+```
+
+</details>

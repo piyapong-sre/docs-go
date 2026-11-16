@@ -1,0 +1,172 @@
+---
+title: ฝังไฟล์ใน Binary ด้วย embed
+description: ใช้ //go:embed ฝังไฟล์ static, template และ migration ไว้ใน binary เดียว deploy ง่ายไม่ต้องพกไฟล์ตามไป
+sidebar:
+  order: 3
+---
+
+import { Aside, Code, FileTree } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/advanced/embed/main.go?raw';
+
+## ทำไมต้อง embed
+
+จุดเด่นของ Go คือ build ออกมาเป็น binary ไฟล์เดียว copy ไปวางที่ไหนก็รันได้ แต่ถ้าแอปต้องใช้ไฟล์อื่นด้วย เช่น HTML, CSS, template, SQL migration เราก็ต้องพกไฟล์เหล่านั้นตามไปและระวังเรื่อง path ให้ถูก
+
+ตั้งแต่ Go 1.16 มี directive `//go:embed` ให้ compiler **อ่านไฟล์ตอน build แล้วฝังลงใน binary** ทำให้ยังคงเป็นไฟล์เดียวเหมือนเดิม
+
+## โครงสร้างตัวอย่าง
+
+<FileTree>
+- examples/learn/advanced/embed/
+  - main.go
+  - static/
+    - hello.txt
+    - index.html
+  - templates/
+    - greet.tmpl
+</FileTree>
+
+## ตัวอย่าง code
+
+<Code code={src} lang="go" title="examples/learn/advanced/embed/main.go" />
+
+```text title="Output"
+string: สวัสดีจากไฟล์ที่ฝังอยู่ใน binary!
+[]byte: 22 bytes
+file: static/hello.txt
+file: static/index.html
+Hello, Gopher!
+HTTP 200 text/plain; charset=utf-8
+body: สวัสดีจากไฟล์ที่ฝังอยู่ใน binary!
+```
+
+## อธิบายทีละส่วน
+
+### ชนิดตัวแปรที่ embed ได้ 3 แบบ
+
+| ชนิด | ใช้เมื่อ | จำนวนไฟล์ |
+| --- | --- | --- |
+| `string` | ไฟล์ข้อความเดียว เช่น version, SQL schema | 1 |
+| `[]byte` | ไฟล์ binary เดียว เช่น รูป, font | 1 |
+| `embed.FS` | หลายไฟล์หรือทั้งโฟลเดอร์ | หลายไฟล์ |
+
+กฎที่ต้องจำ
+
+- `//go:embed` ต้องอยู่**บรรทัดติดกัน**เหนือการประกาศ `var` ระดับ package (ใช้ใน function ไม่ได้)
+- ต้อง `import "embed"` เสมอ ถ้าใช้แค่ `string` หรือ `[]byte` ให้ import แบบ blank: `import _ "embed"`
+- ห้ามมีช่องว่างระหว่าง `//` กับ `go:embed`
+- path เป็น**แบบ relative จากโฟลเดอร์ของไฟล์ .go นั้น** และห้ามใช้ `..` หรือ path ที่ออกนอก module
+
+### Pattern
+
+| Directive | ความหมาย |
+| --- | --- |
+| `//go:embed static` | ทั้งโฟลเดอร์ (recursive) |
+| `//go:embed templates/*.tmpl` | glob |
+| `//go:embed a.txt b.txt` | หลายไฟล์ในบรรทัดเดียว (หรือเขียนหลายบรรทัด `//go:embed` ซ้อนกันก็ได้) |
+| `//go:embed all:static` | รวมไฟล์ที่ขึ้นต้นด้วย `.` หรือ `_` ด้วย |
+
+ห้ามเขียน comment ต่อท้ายบรรทัด `//go:embed` เพราะทุกคำหลัง directive จะถูกตีความเป็น pattern
+
+<Aside type="caution">
+ถ้า embed ทั้งโฟลเดอร์โดยไม่ใส่ `all:` ไฟล์ที่ชื่อขึ้นต้นด้วย `.` หรือ `_` (เช่น `.env`, `_draft.html`) จะถูกข้าม ในทางกลับกัน ถ้าใส่ `all:` ให้ระวังว่าจะไม่เผลอฝังไฟล์ลับอย่าง `.env` เข้าไปใน binary เพราะใครได้ binary ไปก็ดึงออกมาอ่านได้
+</Aside>
+
+### `embed.FS` คือ `fs.FS`
+
+`embed.FS` implement interface `fs.FS` จึงใช้ร่วมกับ API มาตรฐานได้ทันที เช่น `fs.WalkDir`, `fs.ReadFile`, `template.ParseFS` และ `http.FileServerFS`
+
+สังเกตว่า path ใน `embed.FS` **ยังมี prefix ของโฟลเดอร์** (`static/hello.txt`) ถ้าอยากให้ root เป็นโฟลเดอร์นั้นเลย ใช้ `fs.Sub(staticFS, "static")`
+
+### เสิร์ฟ static file
+
+```go
+sub, _ := fs.Sub(staticFS, "static")
+mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(sub)))
+```
+
+- `http.FileServerFS` (Go 1.22+) รับ `fs.FS` ตรง ๆ ไม่ต้องแปลงด้วย `http.FS` แบบเดิม
+- `http.StripPrefix` ตัด `/static/` ออกจาก URL ก่อนไปหาไฟล์ใน `sub`
+- Content-Type ถูกเดาจากนามสกุลไฟล์ให้อัตโนมัติ
+
+ในตัวอย่างเราใช้ `httptest.NewServer` เพื่อทดสอบโดยไม่ต้องเปิด port จริง ในแอปจริงก็แค่ `http.ListenAndServe(":8080", mux)`
+
+## ใช้กับ template และ migration
+
+### HTML template
+
+```go
+//go:embed templates/*.html
+var templateFS embed.FS
+
+var pages = template.Must(template.ParseFS(templateFS, "templates/*.html"))
+```
+
+(ใช้ `html/template` สำหรับ HTML เพื่อให้ escape ป้องกัน XSS อัตโนมัติ)
+
+### SQL migration
+
+library migration หลายตัวรับ `fs.FS` ได้ หรือจะเขียนตัวรันอย่างง่ายเองก็ได้
+
+```go
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+func migrate(ctx context.Context, db *sql.DB) error {
+	// fs.Glob คืนชื่อไฟล์เรียงตามตัวอักษร จึงตั้งชื่อ 0001_, 0002_ ...
+	files, err := fs.Glob(migrationsFS, "migrations/*.sql")
+	if err != nil {
+		return err
+	}
+	for _, name := range files {
+		sqlText, err := migrationsFS.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx, string(sqlText)); err != nil {
+			return fmt.Errorf("migrate %s: %w", name, err)
+		}
+	}
+	return nil
+}
+```
+
+ตัวอย่างนี้ย่อให้เห็นแนวคิด ของจริงต้องมีตารางจดว่ารัน migration ไหนไปแล้ว
+
+<Aside type="tip">
+ช่วงพัฒนา frontend อาจอยากแก้ไฟล์แล้วเห็นผลทันทีโดยไม่ต้อง build ใหม่ เทคนิคที่ใช้กันคือรับ `fs.FS` เป็น parameter แล้วเลือกใน `main` ว่าจะใช้ `os.DirFS("static")` (อ่านจาก disk ตอน dev) หรือ `embed.FS` (ตอน production)
+</Aside>
+
+## ข้อควรรู้
+
+- ไฟล์ที่ embed เป็น **read-only** แก้ตอนรันไม่ได้
+- ขนาด binary เพิ่มตามขนาดไฟล์ ไม่ควรฝังไฟล์ใหญ่มาก ๆ เช่น วิดีโอ
+- ไฟล์ใน `embed.FS` ไม่มี modification time จริง `http.FileServerFS` จึงไม่ส่ง `Last-Modified` ถ้าต้องการ cache ฝั่ง browser ให้ใส่ hash ในชื่อไฟล์หรือตั้ง header เอง
+- เมื่อแก้ไฟล์ที่ embed ต้อง build ใหม่ถึงจะเห็นผล
+
+เมื่อนำไปทำ Docker image ดูต่อได้ที่ [Docker และการ Deploy](/web-api/docker-deploy/) ซึ่ง binary เดียวแบบนี้ทำให้ image เล็กมาก
+
+## แบบฝึกหัด
+
+1. เพิ่มไฟล์ `static/style.css` แล้วแก้ตัวอย่างให้ request `/static/style.css` และพิมพ์ Content-Type ที่ได้
+2. เขียน `//go:embed` ให้ได้ตัวแปร `version string` จากไฟล์ `VERSION` และตัดช่องว่างท้ายบรรทัดออกก่อนใช้
+3. ถ้าเขียน `//go:embed ../README.md` จะเกิดอะไรขึ้น
+
+<details>
+<summary>เฉลย</summary>
+
+1. ไม่ต้องแก้ directive เพราะ `//go:embed static` ฝังทั้งโฟลเดอร์อยู่แล้ว แค่เปลี่ยน URL เป็น `/static/style.css` จะได้ `text/css; charset=utf-8`
+2. ```go
+   import (
+   	_ "embed"
+   	"strings"
+   )
+
+   //go:embed VERSION
+   var rawVersion string
+
+   var version = strings.TrimSpace(rawVersion)
+   ```
+3. build error `invalid pattern syntax` เพราะ pattern ห้ามมี `..` ไฟล์ที่ embed ต้องอยู่ในโฟลเดอร์ของ package หรือโฟลเดอร์ย่อยเท่านั้น
+
+</details>

@@ -1,0 +1,289 @@
+---
+title: Modules และ toolchain
+description: รู้จัก Go modules, go.mod, go.sum และคำสั่งสำคัญใน Go toolchain ที่ใช้ทุกวัน
+sidebar:
+  order: 4
+---
+
+import { Aside, FileTree, Steps } from '@astrojs/starlight/components';
+
+คำสั่ง `go` ไม่ได้เป็นแค่ compiler แต่เป็น **ชุดเครื่องมือครบวงจร** ตั้งแต่จัดการ dependency, format code, ตรวจหา bug, รัน test ไปจนถึงอ่านเอกสาร การเข้าใจ module และ toolchain ตั้งแต่ต้นจะช่วยให้ทำงานกับโปรเจกต์จริงได้อย่างมั่นใจ
+
+## Package กับ Module ต่างกันอย่างไร
+
+- **Package** = โฟลเดอร์หนึ่งโฟลเดอร์ที่มีไฟล์ `.go` ซึ่งประกาศ `package` ชื่อเดียวกัน เป็นหน่วยของการ import
+- **Module** = กลุ่มของ package ที่มีเวอร์ชันร่วมกัน มีไฟล์ `go.mod` อยู่ที่ root เป็นหน่วยของการแจกจ่ายและจัดการ dependency
+
+<FileTree>
+- myapp/
+  - go.mod            module github.com/you/myapp
+  - go.sum
+  - main.go           package main
+  - internal/
+    - store/
+      - store.go      package store
+  - greet/
+    - greet.go        package greet
+</FileTree>
+
+**import path** ของแต่ละ package คือ **module path + path ของโฟลเดอร์** เช่น ไฟล์ใน `greet/` จะถูก import ด้วย `"github.com/you/myapp/greet"`
+
+```go title="main.go"
+package main
+
+import (
+	"fmt"
+
+	"github.com/you/myapp/greet" // package ภายใน module เดียวกัน
+)
+
+func main() {
+	fmt.Println(greet.Hello("Gopher"))
+}
+```
+
+<Aside type="tip" title="โฟลเดอร์ internal">
+package ที่อยู่ใต้โฟลเดอร์ชื่อ `internal/` จะถูก import ได้เฉพาะจาก code ภายใน module เดียวกัน (พูดให้ละเอียดคือ จาก code ที่อยู่ใต้โฟลเดอร์แม่ของ `internal/`) เป็นวิธีซ่อน code ที่ไม่อยากให้คนนอกใช้ ซึ่ง compiler บังคับให้จริง ๆ
+</Aside>
+
+## สร้าง module ด้วย `go mod init`
+
+```bash
+mkdir myapp && cd myapp
+go mod init github.com/you/myapp
+```
+
+ได้ไฟล์ `go.mod` หน้าตาแบบนี้
+
+```txt title="go.mod"
+module github.com/you/myapp
+
+go 1.27.1
+```
+
+- `module` — **module path** ชื่อที่ใช้อ้างอิง module นี้ ถ้าจะเผยแพร่ให้คนอื่น `go get` ได้ ควรตั้งให้ตรงกับที่อยู่ของ repository (เช่น `github.com/you/myapp`) ถ้าเป็นโปรเจกต์ส่วนตัวจะตั้งเป็นอะไรก็ได้ เช่น `myapp` หรือ `example.com/myapp`
+- `go` — **เวอร์ชันขั้นต่ำของ Go** ที่ module นี้ต้องการ และยังเป็นตัวกำหนดว่าใช้ feature ของภาษาเวอร์ชันไหนได้ ตอน `go mod init` ค่านี้จะอ้างอิงจากเวอร์ชัน Go ที่ติดตั้งอยู่ ของคุณจึงอาจต่างจากตัวอย่าง
+
+<Aside>
+ถ้า `go.mod` ระบุเวอร์ชันที่ใหม่กว่า Go ที่ติดตั้งอยู่ (เช่น clone โปรเจกต์ของคนอื่นมา) ตามค่าเริ่มต้น (`GOTOOLCHAIN=auto`) คำสั่ง `go` จะ **ดาวน์โหลด toolchain เวอร์ชันที่ต้องการมาใช้ให้อัตโนมัติ** โปรเจกต์อาจมีบรรทัด `toolchain go1.x.y` เพิ่มเพื่อระบุเวอร์ชันที่แนะนำให้ใช้ build ด้วย
+</Aside>
+
+## เพิ่ม dependency ด้วย `go get`
+
+สมมติว่าต้องการใช้ package สร้าง UUID จาก [github.com/google/uuid](https://pkg.go.dev/github.com/google/uuid)
+
+<Steps>
+
+1. เขียน code ที่ import package นั้น
+
+   ```go title="main.go"
+   package main
+
+   import (
+   	"fmt"
+
+   	"github.com/google/uuid"
+   )
+
+   func main() {
+   	fmt.Println(uuid.NewString())
+   }
+   ```
+
+2. ดาวน์โหลดและบันทึกลง `go.mod`
+
+   ```bash
+   go get github.com/google/uuid
+   ```
+
+3. รันได้ตามปกติ
+
+   ```bash
+   go run .
+   ```
+
+</Steps>
+
+`go.mod` จะมีบรรทัด `require` เพิ่มขึ้นมา (เลขเวอร์ชันขึ้นกับวันที่คุณรัน)
+
+```txt title="go.mod"
+module github.com/you/myapp
+
+go 1.27.1
+
+require github.com/google/uuid v1.6.0
+```
+
+รูปแบบอื่นของ `go get` ที่ใช้บ่อย
+
+```bash
+go get github.com/google/uuid@v1.5.0   # ระบุเวอร์ชัน
+go get github.com/google/uuid@latest   # อัปเดตเป็นเวอร์ชันล่าสุด
+go get -u ./...                        # อัปเดต dependency ทั้งหมดของ module
+go get github.com/google/uuid@none     # เอา dependency ออก
+```
+
+Go ใช้ **Semantic Versioning** (`vMAJOR.MINOR.PATCH`) และถ้า major version ตั้งแต่ 2 ขึ้นไป module path จะต้องมี suffix เช่น `github.com/foo/bar/v2`
+
+## `go.sum` คืออะไร
+
+หลัง `go get` จะมีไฟล์ `go.sum` เกิดขึ้น เก็บ **checksum (hash)** ของทุก module ที่ใช้
+
+```txt title="go.sum"
+github.com/google/uuid v1.6.0 h1:...
+github.com/google/uuid v1.6.0/go.mod h1:...
+```
+
+ทุกครั้งที่ดาวน์โหลด module Go จะตรวจว่า hash ตรงกับที่บันทึกใน `go.sum` ส่วน module ที่เพิ่มเข้ามาใหม่จะถูกตรวจกับฐานข้อมูลกลาง `sum.golang.org` ก่อนบันทึก เพื่อให้มั่นใจว่า code ไม่ถูกแก้ไขระหว่างทาง (supply-chain security)
+
+<Aside type="caution" title="commit ทั้ง go.mod และ go.sum">
+ต้อง commit **ทั้งสองไฟล์** เข้า git เสมอ และไม่ควรแก้ `go.sum` ด้วยมือ ถ้าไฟล์ไม่ตรงกันให้รัน `go mod tidy` แทน
+</Aside>
+
+## จัดระเบียบด้วย `go mod tidy`
+
+```bash
+go mod tidy
+```
+
+คำสั่งนี้จะสแกน import ทั้งหมดใน code แล้ว:
+
+- **เพิ่ม** dependency ที่ใช้แต่ยังไม่มีใน `go.mod`
+- **ลบ** dependency ที่ไม่ได้ใช้แล้ว
+- อัปเดต `go.sum` ให้ครบถ้วน
+
+ควรรันก่อน commit ทุกครั้งที่แก้ import และใน `go.mod` อาจเห็น comment `// indirect` ซึ่งหมายถึง dependency ทางอ้อม (dependency ของ dependency) ที่ต้องบันทึกไว้
+
+## คำสั่งดูแลคุณภาพ code
+
+### `go fmt` — จัดรูปแบบ code
+
+```bash
+go fmt ./...
+```
+
+`./...` หมายถึง "ทุก package ในโฟลเดอร์นี้และโฟลเดอร์ย่อย" `go fmt` จะเรียก `gofmt` จัดย่อหน้า (ใช้ tab), เว้นวรรค และจัดเรียงให้เป็นรูปแบบมาตรฐานเดียวทั้งโลก
+
+ถ้าอยากแค่ตรวจโดยไม่แก้ไฟล์ (เช่นใน CI) ใช้ `gofmt -l .` ซึ่งจะพิมพ์รายชื่อไฟล์ที่ยังไม่ได้ format
+
+### `go vet` — ตรวจหา bug ที่ compiler ไม่จับ
+
+code ด้านล่าง compile ผ่าน แต่มี bug: ใช้ `%d` กับ string
+
+```go title="main.go"
+package main
+
+import "fmt"
+
+func main() {
+	name := "Gopher"
+	age := 15
+	fmt.Printf("ชื่อ %d อายุ %d\n", name, age)
+}
+```
+
+```bash
+go vet ./...
+```
+
+```text title="Output"
+main.go:8:27: fmt.Printf format %d has arg name of wrong type string
+```
+
+ถ้ารันโดยไม่สนใจคำเตือน จะได้ผลลัพธ์ผิด ๆ แบบนี้
+
+```text title="Output"
+ชื่อ %!d(string=Gopher) อายุ 15
+```
+
+`go vet` ตรวจได้อีกหลายอย่าง เช่น copy ค่าที่มี mutex, struct tag ผิดรูปแบบ, code ที่ไม่มีทางทำงานถึง ฯลฯ (`go test` ก็รัน vet บางส่วนให้อัตโนมัติด้วย)
+
+### `go doc` — อ่านเอกสารจาก terminal
+
+```bash
+go doc strings.ToUpper
+```
+
+```text title="Output"
+package strings // import "strings"
+
+func ToUpper(s string) string
+    ToUpper returns s with all Unicode letters mapped to their upper case.
+```
+
+ใช้ `go doc fmt` เพื่อดูภาพรวมของทั้ง package หรือเปิด [pkg.go.dev](https://pkg.go.dev) บน browser ก็ได้เนื้อหาเดียวกัน
+
+## ติดตั้งโปรแกรมด้วย `go install`
+
+`go install` จะ build แล้ววางไฟล์ executable ไว้ที่ `$GOPATH/bin` (หรือ `$GOBIN` ถ้าตั้งไว้) ใช้ติดตั้ง CLI tool ที่เขียนด้วย Go
+
+```bash
+go install honnef.co/go/tools/cmd/staticcheck@latest
+staticcheck ./...
+```
+
+<Aside type="caution">
+ถ้ารันโปรแกรมที่ติดตั้งแล้วขึ้น `command not found` แปลว่ายังไม่ได้เพิ่ม `$GOPATH/bin` (ปกติคือ `~/go/bin`) เข้า `PATH`
+</Aside>
+
+`go install` กับ `go get` ต่างกันชัดเจน: **`go get` จัดการ dependency ใน `go.mod`** ส่วน **`go install pkg@version` ติดตั้งโปรแกรม** โดยไม่แตะ `go.mod` ของโปรเจกต์
+
+## ภาพรวม toolchain
+
+| คำสั่ง | หน้าที่ |
+| --- | --- |
+| `go run .` | compile แล้วรันทันที |
+| `go build` | compile เป็นไฟล์ executable |
+| `go test ./...` | รัน test (ดูบท [Testing](/intermediate/testing/)) |
+| `go fmt ./...` | จัดรูปแบบ code |
+| `go vet ./...` | ตรวจหาจุดที่น่าจะเป็น bug |
+| `go mod init <path>` | สร้าง module ใหม่ |
+| `go mod tidy` | เพิ่ม/ลบ dependency ให้ตรงกับ code |
+| `go get <module>@<ver>` | เพิ่ม/อัปเดต/ลบ dependency |
+| `go install <pkg>@<ver>` | ติดตั้งโปรแกรมไปที่ `$GOPATH/bin` |
+| `go doc <pkg>.<name>` | อ่านเอกสาร |
+| `go env` | ดู/ตั้งค่า environment ของ Go |
+| `go version` | ดูเวอร์ชัน |
+| `go clean -modcache` | ล้าง module cache ที่ดาวน์โหลดไว้ |
+| `go help <command>` | ดูวิธีใช้ของแต่ละคำสั่ง |
+
+<Aside type="tip" title="Workflow ที่แนะนำก่อน commit">
+```bash
+go mod tidy && go fmt ./... && go vet ./... && go test ./...
+```
+ตั้งเป็น script หรือใส่ใน CI จะช่วยกันปัญหาพื้นฐานได้เกือบทั้งหมด
+</Aside>
+
+## แบบฝึกหัด
+
+1. สร้าง module ชื่อ `example.com/greeter` ที่มี package `greet` (โฟลเดอร์ `greet/`) ซึ่งมี function `Hello(name string) string` แล้วให้ `main.go` เรียกใช้
+2. เพิ่ม dependency `github.com/google/uuid` ด้วย `go get` จากนั้นลบ code ที่ใช้มันออก แล้วรัน `go mod tidy` สังเกตว่า `go.mod` เปลี่ยนไปอย่างไร
+3. เขียน code ที่ `fmt.Printf("%s\n")` โดยไม่ส่ง argument แล้วรัน `go vet` ดูว่าได้คำเตือนอะไร
+
+<details>
+<summary>เฉลยข้อ 1</summary>
+
+```go title="greet/greet.go"
+package greet
+
+// Hello คืนข้อความทักทาย (ขึ้นต้นตัวพิมพ์ใหญ่จึง export ได้)
+func Hello(name string) string {
+	return "สวัสดี " + name
+}
+```
+
+```go title="main.go"
+package main
+
+import (
+	"fmt"
+
+	"example.com/greeter/greet"
+)
+
+func main() {
+	fmt.Println(greet.Hello("Gopher"))
+}
+```
+
+</details>

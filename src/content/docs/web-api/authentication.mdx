@@ -1,0 +1,308 @@
+---
+title: Authentication ด้วย JWT
+description: เก็บรหัสผ่านด้วย bcrypt ออก access token แบบ JWT ตรวจ token ใน middleware และจำกัดให้ผู้ใช้เห็นเฉพาะข้อมูลของตัวเอง
+sidebar:
+  order: 10
+---
+
+import { Code, Aside, Steps } from '@astrojs/starlight/components';
+import passwordSrc from '../../../../examples/tasks-api/internal/auth/password.go?raw';
+import tokenSrc from '../../../../examples/tasks-api/internal/auth/token.go?raw';
+import middlewareSrc from '../../../../examples/tasks-api/internal/auth/middleware.go?raw';
+
+## ภาพรวม
+
+ต้องแยกให้ออกก่อนว่ามี 2 เรื่อง
+
+- **Authentication (authn)** คุณคือใคร: ตรวจรหัสผ่านแล้วออก token, ตรวจ token ในทุก request
+- **Authorization (authz)** คุณทำอะไรได้บ้าง: ใน tasks-api คือ "ดู/แก้ได้เฉพาะ task ของตัวเอง"
+
+flow ของ tasks-api
+
+<Steps>
+
+1. `POST /v1/auth/register` สมัคร: hash รหัสผ่านด้วย bcrypt แล้วเก็บลง `users`
+2. `POST /v1/auth/login` ตรวจรหัสผ่าน ถ้าถูกออก **access token** (JWT อายุ 15 นาที)
+3. client ส่ง `Authorization: Bearer <token>` มากับทุก request
+4. middleware `RequireAuth` ตรวจ token แล้วใส่ user ID ลงใน `context`
+5. handler และ query ใช้ user ID นั้นกรองข้อมูลเสมอ
+
+</Steps>
+
+## เก็บรหัสผ่านด้วย bcrypt
+
+<Code code={passwordSrc} lang="go" title="internal/auth/password.go" />
+
+- **ห้ามเก็บรหัสผ่านตรง ๆ หรือ hash ด้วย SHA-256 เฉย ๆ** hash ที่เร็วทำให้ brute force ได้หลายพันล้านครั้งต่อวินาทีด้วย GPU bcrypt ถูกออกแบบมาให้ "ช้าโดยตั้งใจ" และใส่ salt สุ่มให้ทุก hash อัตโนมัติ
+- `bcrypt.DefaultCost` มีค่า `10` (cost เพิ่ม 1 = ช้าลง 2 เท่า) ปรับให้ hash หนึ่งครั้งใช้เวลาราว 100 ms บนเครื่อง production ก็กำลังดี
+- ผลลัพธ์เป็น string เดียวที่มี algorithm, cost, salt และ hash อยู่ครบ เช่น `$2a$10$...` จึงเก็บใน column `password_hash` column เดียวได้
+- `CheckPassword` แยก "รหัสผิด" (`false, nil`) ออกจาก "hash เสีย" (`error`) เพื่อไม่ให้ hash ที่เสียถูกตีความว่าแค่รหัสผิด
+
+### ข้อจำกัด 72 bytes
+
+bcrypt ใช้รหัสผ่านได้ยาวสุด 72 **bytes** (ไม่ใช่ 72 ตัวอักษร ภาษาไทยหนึ่งตัวใช้ 3 bytes ใน UTF-8) `golang.org/x/crypto/bcrypt` version ใหม่จะคืน `ErrPasswordTooLong` ถ้ายาวเกิน handler จึงตรวจไว้ก่อนเพื่อให้ client ได้ 422 ที่อ่านรู้เรื่อง แทน 500
+
+```go title="internal/user/handler.go"
+	v.Check(utf8.RuneCountInString(req.Password) >= 8, "password", "ต้องยาวอย่างน้อย 8 ตัวอักษร")
+	v.Check(len(req.Password) <= auth.MaxPasswordBytes, "password", "ยาวได้ไม่เกิน 72 bytes")
+```
+
+<Aside type="tip">
+bcrypt ยังใช้ได้ดีและอยู่ในรายการที่ OWASP ยอมรับ แต่ถ้าเริ่มระบบใหม่และอยากได้ตัวที่ทนทาน GPU มากกว่า ลองดู **Argon2id** ใน `golang.org/x/crypto/argon2` ซึ่งไม่มีข้อจำกัด 72 bytes
+</Aside>
+
+## JWT access token
+
+JWT (JSON Web Token) มี 3 ส่วนคั่นด้วยจุด `header.payload.signature` แต่ละส่วนเป็น base64url
+
+- **header** บอก algorithm เช่น `{"alg":"HS256","typ":"JWT"}`
+- **payload** คือ claims เช่น `sub` (user ID), `exp` (หมดอายุ)
+- **signature** คือ HMAC ของสองส่วนแรกด้วย secret ที่มีแค่ server รู้
+
+payload **ไม่ได้เข้ารหัส** ใครก็ decode อ่านได้ แต่แก้ไม่ได้เพราะ signature จะไม่ตรง ห้ามใส่ข้อมูลลับลงใน token
+
+<Code code={tokenSrc} lang="go" title="internal/auth/token.go" />
+
+### ตอนออก token (`Issue`)
+
+ใช้ `jwt.RegisteredClaims` ซึ่งเป็น claim มาตรฐานตาม RFC 7519
+
+| claim | ค่าใน tasks-api | ความหมาย |
+| --- | --- | --- |
+| `sub` | user ID | token นี้เป็นของใคร |
+| `iss` | `JWT_ISSUER` (default `tasks-api`) | ใครออก token |
+| `aud` | `tasks-api` (กำหนดใน `main.go`) | token นี้ใช้กับระบบไหน |
+| `iat` / `nbf` | เวลาตอนออก | ออกเมื่อไร / ใช้ได้ตั้งแต่เมื่อไร |
+| `exp` | ตอนนี้ + `JWT_TTL` (default `15m`) | หมดอายุเมื่อไร |
+
+### ตอนตรวจ token (`Verify`)
+
+ทุก option ใน `ParseWithClaims` มีหน้าที่ของมัน
+
+- `jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()})` (คือ `"HS256"`) **ปักหมุด algorithm** ไม่ให้ token เป็นคนเลือกเองว่าจะถูกตรวจด้วยวิธีไหน
+- `jwt.WithIssuer` / `jwt.WithAudience` ปฏิเสธ token ที่ออกโดยระบบอื่น หรือออกให้ใช้กับระบบอื่น แม้จะ sign ด้วย secret เดียวกัน
+- `jwt.WithExpirationRequired()` ตามค่า default `exp` เป็น optional ถ้าไม่ใส่ option นี้ token ที่ไม่มี `exp` จะใช้ได้ตลอดไป
+- `jwt.WithTimeFunc(tm.now)` ให้ test ปลอมเวลาได้ (ดู [Testing](/web-api/testing/))
+- error ทุกแบบถูกรวมเป็น `ErrInvalidToken` ตัวเดียว ไม่บอก client ว่าพังเพราะอะไร
+
+### ทำไมต้องปักหมุด algorithm
+
+ช่องโหว่ JWT ที่โด่งดังมาจากการที่ library "เชื่อ" ค่า `alg` ใน header
+
+- **`alg: none`** ผู้โจมตีส่ง token ที่ header เป็น `{"alg":"none"}` และไม่มี signature library ที่ไม่ระวังจะถือว่า "ไม่ต้องตรวจ signature" แล้วยอมรับ payload อะไรก็ได้
+- **Algorithm confusion** ระบบที่ใช้ RS256 (public/private key) ถ้า library ยอมให้ token เปลี่ยน `alg` เป็น HS256 ผู้โจมตีจะเอา **public key** (ซึ่งใครก็รู้) มาเป็น HMAC secret แล้ว sign token เองได้
+
+`golang-jwt/jwt/v5` ปฏิเสธ `none` อยู่แล้วเว้นแต่จะส่ง key พิเศษ `jwt.UnsafeAllowNoneSignatureType` แต่การใส่ `WithValidMethods` ทำให้ปลอดภัยแบบชัดเจนในโค้ดของเราเอง ไม่ต้องพึ่งค่า default ของ library และ test `alg none` ใน `token_test.go` ช่วยยืนยันพฤติกรรมนี้
+
+<Aside type="caution">
+HS256 ใช้ secret เดียวกันทั้ง sign และ verify ความปลอดภัยทั้งหมดขึ้นอยู่กับ secret ทั้ง `config.Load` และ `NewTokenManager` จึงบังคับว่าต้องยาวอย่างน้อย **32 bytes** สร้างด้วย `openssl rand -base64 48` เก็บใน secret manager ของ platform และห้าม commit ลง Git (ค่าใน `.env.example` ใช้ได้แค่บนเครื่อง dev)
+</Aside>
+
+## Middleware `RequireAuth`
+
+<Code code={middlewareSrc} lang="go" title="internal/auth/middleware.go" />
+
+อธิบายทีละส่วน
+
+- `strings.Cut(header, " ")` แยก `Bearer` ออกจาก token และเทียบ scheme แบบไม่สนตัวพิมพ์ด้วย `strings.EqualFold` ตาม RFC 9110 ที่บอกว่า auth scheme เป็น case-insensitive
+- ตอบ 401 พร้อม header `WWW-Authenticate` ตามมาตรฐาน (RFC 6750) ถ้า token เสียจะบอก `error="invalid_token"` เพิ่ม
+- `Verifier` เป็น interface เล็ก ๆ method เดียว middleware จึงไม่ผูกกับ `*TokenManager` และ test ได้ง่าย (หลักเดียวกับ [interfaces](/intermediate/interfaces/))
+- user ID ถูกเก็บใน context ด้วย key ชนิด `userIDKey struct{}` ที่ **unexported** package อื่นสร้าง key ชนิดนี้ไม่ได้ จึงไม่มีทางเขียนทับหรือชนกัน (ทบทวน [context](/concurrency/context/))
+- `UserID(ctx)` เป็นทางเดียวที่โค้ดอื่นอ่านค่าได้ ส่วน `WithUserID` มีไว้ให้ test จำลอง request ที่ login แล้ว
+
+การผูกกับ route อยู่ใน `server.go`
+
+```go title="internal/server/server.go"
+	requireAuth := auth.RequireAuth(d.Tokens)
+	// ...
+	mux.Handle("GET /v1/me", requireAuth(httpx.HandlerFunc(d.Users.Me)))
+
+	// Tasks: every route requires a logged-in user.
+	mux.Handle("GET /v1/tasks", requireAuth(httpx.HandlerFunc(d.Tasks.List)))
+```
+
+## Register และ Login ใน user service
+
+```go title="internal/user/user.go"
+// NormalizeEmail trims spaces and lower-cases an email address.
+func NormalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// ...
+
+func (s *Service) Login(ctx context.Context, email, password string) (Token, error) {
+	u, err := s.repo.GetByEmail(ctx, NormalizeEmail(email))
+	switch {
+	case errors.Is(err, ErrNotFound):
+		_, _ = auth.CheckPassword(s.dummyHash, password) // equalize timing
+		return Token{}, ErrInvalidCredentials
+	case err != nil:
+		return Token{}, fmt.Errorf("get user: %w", err)
+	}
+
+	ok, err := auth.CheckPassword(u.PasswordHash, password)
+	if err != nil {
+		return Token{}, fmt.Errorf("check password: %w", err)
+	}
+	if !ok {
+		return Token{}, ErrInvalidCredentials
+	}
+
+	tok, exp, err := s.tokens.Issue(u.ID)
+	if err != nil {
+		return Token{}, err
+	}
+	return Token{AccessToken: tok, ExpiresAt: exp}, nil
+}
+```
+
+- **`NormalizeEmail`** ใช้ทั้งตอน register และ login `Somchai@Example.com` กับ `somchai@example.com` จึงเป็นบัญชีเดียวกัน และ unique index `users_email_key` กันการสมัครซ้ำได้จริง
+- **ป้องกัน user enumeration** ถ้าอีเมลไม่มีในระบบแล้วตอบทันที request นั้นจะเร็วกว่าการตรวจ bcrypt (~ หลายสิบ ms) อย่างเห็นได้ชัด ผู้โจมตีวัดเวลาแล้วรู้ได้ว่าอีเมลไหนสมัครไว้ service จึงเทียบกับ `dummyHash` (สร้างตอน `NewService`) ให้ใช้เวลาใกล้เคียงกัน
+- ทั้งสองกรณีคืน `ErrInvalidCredentials` ตัวเดียวกัน handler แปลงเป็นข้อความเดียว "อีเมลหรือรหัสผ่านไม่ถูกต้อง"
+- service ขึ้นกับ interface `TokenIssuer` ไม่ใช่ `*auth.TokenManager` ตรง ๆ
+
+<Aside type="caution">
+`POST /v1/auth/register` ยังบอกได้ว่าอีเมลถูกใช้แล้ว (409) ซึ่งเลี่ยงยากถ้าไม่มีขั้นตอนยืนยันอีเมล tasks-api จึงจำกัดทั้ง register และ login ด้วย rate limit `AUTH_RATE_LIMIT` ครั้งต่อนาทีต่อ IP (ดู [Middleware](/web-api/middleware/))
+</Aside>
+
+## Login response
+
+```go title="internal/user/handler.go"
+	// Tokens must never be cached by browsers or proxies.
+	w.Header().Set("Cache-Control", "no-store")
+	httpx.OK(w, r, http.StatusOK, tokenResponse{
+		AccessToken: tok.AccessToken,
+		TokenType:   "Bearer",
+		ExpiresIn:   int(time.Until(tok.ExpiresAt).Round(time.Second).Seconds()),
+		ExpiresAt:   tok.ExpiresAt.UTC(),
+	})
+```
+
+รูปแบบ `access_token` / `token_type` / `expires_in` ตามแบบ OAuth 2.0 (RFC 6749) client ส่วนใหญ่คุ้นเคยอยู่แล้ว ส่วน `Cache-Control: no-store` กันไม่ให้ browser หรือ proxy เก็บ token ไว้ใน cache
+
+## Authorization ระดับ resource
+
+authn บอกแค่ว่าคุณคือใคร ส่วนการกันไม่ให้ alice อ่าน task ของ bob ทำที่ **query** ทุกตัวมี `user_id` อยู่ใน `WHERE`
+
+```sql title="internal/postgres/queries/tasks.sql"
+-- name: GetTask :one
+-- Always filter by user_id so a user can never read another user's task.
+SELECT * FROM tasks
+WHERE id = $1 AND user_id = $2;
+```
+
+- user ID มาจาก token (ผ่าน `mustUserID(r)` ใน handler) **ไม่เคยรับจาก body หรือ query string**
+- ถ้า task เป็นของคนอื่น query ไม่เจอแถว คืน `ErrNotFound` แล้วกลายเป็น **404** ไม่ใช่ 403 เพื่อไม่บอกว่า id นั้นมีอยู่จริง
+- การกรองใน query ปลอดภัยกว่า "ดึงมาก่อนแล้วค่อยเช็กเจ้าของใน Go" เพราะลืมเช็กไม่ได้
+
+## ทดลอง
+
+```bash
+curl -s -X POST localhost:8080/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"Somchai@Example.com","name":"สมชาย","password":"correct-horse-battery"}'
+```
+
+```json title="201 Created"
+{"data":{"id":"01a1e2a2-dcdf-75b9-bffa-9c931750b95f","email":"somchai@example.com","name":"สมชาย","created_at":"2026-11-16T04:34:46.623252Z"},"meta":{"request_id":"req_db1527789dace41d771aee91"}}
+```
+
+อีเมลถูกแปลงเป็นตัวเล็กแล้ว และ response ไม่มี `password_hash` เพราะ `userResponse` ไม่มี field นั้น
+
+```bash
+curl -s -i -X POST localhost:8080/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"somchai@example.com","password":"correct-horse-battery"}'
+```
+
+```text title="200 OK"
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Content-Type: application/json; charset=utf-8
+X-Ratelimit-Limit: 10
+X-Ratelimit-Remaining: 8
+...
+
+{"data":{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ0YXNrcy1hcGkiLCJzdWIiOiIwMWExZTJhMi1kY2RmLTc1YjktYmZmYS05YzkzMTc1MGI5NWYiLCJhdWQiOlsidGFza3MtYXBpIl0sImV4cCI6MTc5NDgwNDU4NiwibmJmIjoxNzk0ODAzNjg2LCJpYXQiOjE3OTQ4MDM2ODZ9.OZsjJ_o-qkWnWJDOnyn4tm3PiOa3Oew4gizp0ZZNTT4","token_type":"Bearer","expires_in":900,"expires_at":"2026-11-16T04:49:46Z"},"meta":{"request_id":"req_5b579cc056ff324fa32c43b4"}}
+```
+
+ลอง decode ส่วน payload (ส่วนที่สอง) จะเห็นว่าอ่านได้โดยไม่ต้องรู้ secret
+
+```json
+{"iss":"tasks-api","sub":"01a1e2a2-dcdf-75b9-bffa-9c931750b95f","aud":["tasks-api"],"exp":1794804586,"nbf":1794803686,"iat":1794803686}
+```
+
+เก็บ token ไว้ในตัวแปรแล้วเรียก endpoint ที่ต้อง login
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"somchai@example.com","password":"correct-horse-battery"}' | jq -r .data.access_token)
+
+curl -s localhost:8080/v1/me -H "Authorization: Bearer $TOKEN"
+```
+
+กรณีผิดพลาด
+
+```text title="ไม่ส่ง token"
+HTTP/1.1 401 Unauthorized
+Www-Authenticate: Bearer
+{"error":{"code":"UNAUTHENTICATED","message":"ต้องส่ง Authorization: Bearer <token>","request_id":"req_07bf0df2f6ade1e617c2a926"}}
+```
+
+```text title="token ปลอม"
+HTTP/1.1 401 Unauthorized
+Www-Authenticate: Bearer error="invalid_token"
+{"error":{"code":"UNAUTHENTICATED","message":"token ไม่ถูกต้องหรือหมดอายุ","request_id":"req_14b0b6e72d600e70eb25b71a"}}
+```
+
+```text title="อีเมลที่ไม่มีในระบบ (ข้อความเดียวกับรหัสผิด)"
+HTTP/1.1 401 Unauthorized
+{"error":{"code":"UNAUTHENTICATED","message":"อีเมลหรือรหัสผ่านไม่ถูกต้อง","request_id":"req_ced64afa27abee430c3e8def"}}
+```
+
+```text title="ผู้ใช้อีกคนขอดู task ของสมชาย"
+HTTP/1.1 404 Not Found
+{"error":{"code":"NOT_FOUND","message":"ไม่พบ task","request_id":"req_12f56da32bf5ab4c77d7ca75"}}
+```
+
+## เรื่องที่ต้องคิดต่อ
+
+### Access token ต้องอายุสั้น
+
+JWT เป็น **stateless** server ไม่ได้จำว่าออก token อะไรไปบ้าง ข้อดีคือตรวจได้เร็วโดยไม่ต้องถาม database แต่ข้อเสียคือ **ยกเลิก token ก่อนหมดอายุไม่ได้** ถ้า token หลุด ผู้โจมตีใช้ได้จนกว่าจะถึง `exp` จึงควรตั้ง `JWT_TTL` สั้น ๆ (tasks-api ใช้ 15 นาที)
+
+### Refresh token (tasks-api ยังไม่ได้ทำ)
+
+อายุสั้นแปลว่าผู้ใช้ต้อง login ใหม่บ่อย ทางแก้มาตรฐานคือ refresh token แนวทางที่แนะนำ
+
+- ตอน login ออก refresh token เป็น **ค่าสุ่มยาว ๆ (opaque)** ไม่ใช่ JWT เก็บ **hash** ของมันในตาราง เช่น `refresh_tokens(id, user_id, token_hash, expires_at, revoked_at)`
+- `POST /v1/auth/refresh` รับ refresh token ตรวจกับ database แล้วออก access token ใหม่ พร้อม **หมุน (rotate)** refresh token ใหม่ทุกครั้ง และ revoke ตัวเก่า
+- ถ้ามีคนใช้ refresh token ที่ถูก revoke ไปแล้ว แปลว่ามันหลุด ให้ revoke ทั้งตระกูลของ token นั้น (reuse detection)
+- `POST /v1/auth/logout` revoke refresh token
+- web app ควรเก็บ refresh token ใน cookie `HttpOnly; Secure; SameSite` ส่วน mobile เก็บใน Keychain / Keystore
+
+### ส่ง token ใน header เท่านั้น
+
+ห้ามรับ token จาก query string เช่น `?token=...` เพราะ URL ถูกบันทึกใน access log ของ proxy, browser history และอาจหลุดไปกับ header `Referer` tasks-api อ่านจาก `Authorization` อย่างเดียว และ logger middleware ก็ log แค่ `r.URL.Path` ไม่ log query string
+
+### เมื่อไรควรใช้ Identity Provider (OIDC)
+
+การทำ auth เองเหมาะกับการเรียนรู้และระบบเล็ก ถ้าต้องการสิ่งเหล่านี้ ให้พิจารณา IdP ที่รองรับ OpenID Connect เช่น Keycloak, ZITADEL, Auth0 หรือ Amazon Cognito
+
+- Single Sign-On หลายแอป, login ด้วย Google / Microsoft / Active Directory
+- MFA, passkey, ลืมรหัสผ่าน, ยืนยันอีเมล, ล็อกบัญชี
+- audit log และ compliance
+
+เมื่อใช้ IdP ฝั่ง API จะไม่ออก token เองอีกต่อไป แค่ **ตรวจ** token ที่ IdP ออกให้ (มักเป็น RS256 / ES256) ด้วย public key จาก JWKS endpoint ของ IdP หลักการเดิมยังใช้ได้ทั้งหมด คือ ปักหมุด algorithm, ตรวจ `iss` / `aud` / `exp` และใส่ user ID ลง context ผ่าน interface `Verifier` ตัวเดิม
+
+## สรุป
+
+- hash รหัสผ่านด้วย bcrypt (`DefaultCost`) และ validate ความยาวไม่เกิน 72 bytes ก่อน hash
+- JWT HS256 ใช้ registered claims (`sub`, `iss`, `aud`, `exp`, ...) และ secret อย่างน้อย 32 bytes
+- ตอนตรวจต้องปักหมุด algorithm ด้วย `WithValidMethods` และตรวจ issuer, audience และบังคับ `exp`
+- `RequireAuth` อ่าน `Authorization: Bearer`, ตอบ 401 พร้อม `WWW-Authenticate` และเก็บ user ID ใน context ด้วย key ที่ unexported
+- login ใช้ข้อความ error เดียวกันและเทียบกับ dummy hash เพื่อกัน user enumeration, response ใส่ `Cache-Control: no-store`
+- authorization ทำใน query ด้วย `user_id` เสมอ ของคนอื่นได้ 404
+- access token อายุสั้น, refresh token แบบ rotate เป็นงานต่อยอด และถ้าต้องการ SSO / MFA ให้ใช้ IdP

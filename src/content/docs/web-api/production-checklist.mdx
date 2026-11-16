@@ -1,0 +1,155 @@
+---
+title: Production Checklist
+description: รายการตรวจสอบก่อนปล่อย API ขึ้น production พร้อมบอกว่าแต่ละข้ออยู่ตรงไหนใน tasks-api และข้อไหนที่ยังต้องทำต่อเอง
+sidebar:
+  order: 16
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+หน้านี้รวบรวมทุกเรื่องในส่วน "สร้าง Web API" ให้เป็น checklist ใช้ตรวจ API ของคุณเองก่อน merge หรือก่อนขึ้น production
+
+- **tasks-api:** บอกว่าข้อนั้นอยู่ที่ไฟล์ไหนในโปรเจกต์ตัวอย่าง
+- **ทำต่อเอง:** tasks-api ยังไม่ได้ทำ เป็นไอเดียสำหรับต่อยอด
+
+## Naming และ Versioning
+
+- [ ] ทุก endpoint อยู่ใต้ version prefix `/v1` เปลี่ยนแบบ breaking เมื่อไรขึ้น `/v2` และให้ `/v1` อยู่ต่อช่วงหนึ่ง
+  - tasks-api: route ทั้งหมดใน `internal/server/server.go` ส่วน `/healthz`, `/readyz`, `/openapi.yaml` ไม่มี version เพราะเป็นของฝั่ง operation
+- [ ] path เป็น **คำนามพหูพจน์ตัวพิมพ์เล็ก** ใช้ kebab-case ถ้ามีหลายคำ (`/v1/tasks`, `/v1/tasks/{id}`) ไม่ใส่คำกริยาใน path ให้ HTTP method บอกการกระทำแทน
+- [ ] สร้างสำเร็จตอบ **201 Created** พร้อม header `Location` ชี้ไปที่ resource ใหม่
+  - tasks-api: `task.Handler.Create` ตั้ง `Location: /v1/tasks/{id}`, `user.Handler.Register` ตั้ง `Location: /v1/me`
+- [ ] `DELETE` สำเร็จตอบ **204 No Content** ไม่มี body
+  - tasks-api: `httpx.NoContent`
+- [ ] แก้บางส่วนใช้ `PATCH` และแยก "ไม่ส่ง field" ออกจาก "ส่งค่าว่าง" ด้วย pointer
+  - tasks-api: `updateRequest` ใน `internal/task/handler.go`
+- [ ] (ทำต่อเอง) รองรับ header `Idempotency-Key` สำหรับ `POST` ที่ client อาจ retry เช่นการจ่ายเงิน เพื่อไม่ให้สร้างซ้ำเมื่อ network หลุด
+
+## Response และ Error
+
+- [ ] response สำเร็จอยู่ใน **envelope เดียวกันทั้ง API** `{"data": ..., "meta": {"request_id": ...}}` และ list มี `pagination`
+  - tasks-api: `httpx.OK`, `httpx.List` ใน `internal/httpx/respond.go`
+- [ ] error อยู่ในรูปเดียวกันทั้ง API `{"error": {"code", "message", "details", "request_id"}}`
+  - tasks-api: `httpx.Error`
+- [ ] JSON field เป็น **snake_case** ทุกตัว
+- [ ] เวลาเป็น **ISO 8601 / RFC 3339 ใน UTC** เช่น `2026-11-16T04:34:56.811655Z`
+  - tasks-api: DTO เรียก `.UTC()` ก่อนส่งทุกครั้ง
+- [ ] `error.code` เป็น **ค่าคงที่ที่ client ใช้ switch ได้** (`VALIDATION_ERROR`, `NOT_FOUND`, ...) ส่วน `message` มีไว้ให้คนอ่าน เปลี่ยนได้
+  - tasks-api: ค่าคงที่ใน `internal/httpx/errors.go`
+- [ ] validation error ตอบ **422** พร้อม `details` บอก field และสาเหตุ **ทุก field ในครั้งเดียว**
+  - tasks-api: `httpx.Validator`
+- [ ] error ที่ไม่รู้จักกลายเป็น 500 ข้อความกลาง ๆ **ไม่ส่ง error ภายใน / SQL / stack trace ให้ client** แต่ log ไว้ฝั่ง server พร้อม `request_id`
+  - tasks-api: กรณี `default` ใน `httpx.Error` และ `middleware.Recoverer`
+- [ ] ใช้ **DTO แยกจาก domain model และ database model** field ภายใน (เช่น `password_hash`, `user_id`) จึงไม่หลุดออกไปโดยไม่ตั้งใจ
+  - tasks-api: `taskResponse`, `userResponse`
+- [ ] list ว่างคืน `[]` ไม่ใช่ `null`
+
+## Pagination
+
+- [ ] ทุก list endpoint มี **limit ที่ server บังคับ** (default และ max)
+  - tasks-api: `DefaultPageSize = 20`, `MaxPageSize = 100`, `clampLimit` ใน `internal/task/service.go`
+- [ ] ลำดับไม่กำกวม (มี tie-breaker เช่น `id`)
+- [ ] cursor เป็น **opaque** client ไม่ต้องรู้ว่าข้างในคืออะไร
+  - tasks-api: `internal/task/cursor.go`
+- [ ] มี **index** ที่ตรงกับ `WHERE` + `ORDER BY` ของ query แบ่งหน้า
+  - tasks-api: `tasks_user_created_idx` ใน migration `00002`
+- [ ] validate `limit` / `cursor` / filter แล้วตอบ 422 แทนที่จะปล่อยให้ไปพังที่ database
+
+## Security
+
+- [ ] รับ token ทาง header `Authorization: Bearer` **เท่านั้น** ไม่รับจาก query string
+  - tasks-api: `internal/auth/middleware.go`
+- [ ] JWT: ปักหมุด algorithm, ตรวจ `iss` / `aud`, บังคับ `exp`, secret อย่างน้อย 32 bytes, access token อายุสั้น
+  - tasks-api: `internal/auth/token.go`, `JWT_TTL=15m`
+- [ ] (ทำต่อเอง) refresh token แบบ rotate + revoke หรือย้ายไปใช้ IdP ที่รองรับ OIDC
+- [ ] รหัสผ่าน hash ด้วย bcrypt / Argon2id, login ตอบข้อความเดียวกันทั้งอีเมลไม่มีและรหัสผิด
+  - tasks-api: `internal/auth/password.go`, `user.Service.Login` (dummy hash)
+- [ ] **authorization ระดับ resource** ทุก query กรองด้วยเจ้าของ ของคนอื่นตอบ 404
+  - tasks-api: `WHERE id = $1 AND user_id = $2` ใน `internal/postgres/queries/tasks.sql`
+- [ ] **rate limit** endpoint ที่เสี่ยงโดน brute force (login, register) ส่ง header `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` และตอบ **429** พร้อม `Retry-After`
+  - tasks-api: `internal/middleware/ratelimit.go`, `AUTH_RATE_LIMIT=10` ต่อนาทีต่อ IP
+- [ ] (ทำต่อเอง) เมื่อมีหลาย instance ย้าย counter ของ rate limit ไปไว้ใน **shared store** เช่น Redis หรือใช้ API gateway
+- [ ] (ทำต่อเอง) อยู่หลัง proxy แล้วอ่าน IP จาก `X-Forwarded-For` **เฉพาะเมื่อมาจาก proxy ที่ไว้ใจ**
+- [ ] validate input ทุกตัว: ความยาว, enum, รูปแบบ, ปฏิเสธ field ที่ไม่รู้จัก
+  - tasks-api: `validate()` ของแต่ละ request, `DisallowUnknownFields` ใน `httpx.DecodeJSON`
+- [ ] จำกัดขนาด body และ header
+  - tasks-api: `http.MaxBytesReader` 1 MB, `MaxHeaderBytes` 1 MB
+- [ ] บังคับ `Content-Type: application/json` สำหรับ request ที่มี body (415)
+  - tasks-api: `middleware.ContentTypeJSON`
+- [ ] **secure headers** (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Content-Security-Policy`)
+  - tasks-api: `middleware.SecureHeaders` (เพิ่ม `Strict-Transport-Security` ที่ proxy เมื่อใช้ HTTPS)
+- [ ] **CORS อนุญาตเฉพาะ origin ที่ระบุชัด** ไม่ใช้ `*` บน production
+  - tasks-api: `middleware.CORS` + `CORS_ALLOWED_ORIGINS`
+- [ ] secret ทุกตัวมาจาก environment / secret manager ไม่อยู่ใน Git หรือ Docker image
+  - tasks-api: `internal/config/config.go`, `.env` อยู่ใน `.gitignore`
+- [ ] ตรวจช่องโหว่ของ dependency ด้วย `govulncheck` เป็นประจำ (ใน CI)
+  - tasks-api: `make lint`
+
+## Reliability
+
+- [ ] `http.Server` ตั้ง `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`
+  - tasks-api: `server.New` ใน `internal/server/server.go`
+- [ ] ทุก request มี **context timeout** และส่ง `ctx` ต่อไปถึง database
+  - tasks-api: `middleware.Timeout` (`REQUEST_TIMEOUT=10s`), timeout กลายเป็น 503 `TIMEOUT`
+- [ ] **graceful shutdown** เมื่อได้รับ SIGTERM และ grace period ของ orchestrator นานกว่า shutdown timeout
+  - tasks-api: `run()` ใน `cmd/api/main.go`, `SHUTDOWN_TIMEOUT=15s`
+- [ ] มี **liveness** (`/healthz`) และ **readiness** (`/readyz` ping database) แยกกัน
+- [ ] recover panic แล้วตอบ 500 แทนการทำ connection หลุด
+  - tasks-api: `middleware.Recoverer`
+- [ ] config ผิดต้อง **fail fast ตอน start** และบอกทุกปัญหาพร้อมกัน
+  - tasks-api: `config.Load` ใช้ `errors.Join`
+- [ ] migration รันเป็นขั้นตอนแยกบน production และเปลี่ยน schema แบบ backward-compatible
+  - tasks-api: `DB_AUTO_MIGRATE` (ตั้งเป็น `false` บน production)
+- [ ] connection pool มีเพดาน (`MaxConns`) ที่รวมทุก replica แล้วไม่เกินที่ database รับได้
+
+## Observability
+
+- [ ] **structured log** แบบ JSON ด้วย `log/slog` หนึ่งบรรทัดต่อ request (method, path, status, bytes, duration)
+  - tasks-api: `middleware.Logger`, `LOG_FORMAT=json`
+- [ ] ทุก request มี **request ID** อยู่ใน log, header `X-Request-Id` และ error body ใช้โยง "error ที่ผู้ใช้เห็น" กับ "log ฝั่ง server" ได้
+  - tasks-api: `middleware.RequestID` (รับต่อจาก load balancer ถ้ารูปแบบถูกต้อง)
+- [ ] ไม่ log ข้อมูลลับ: รหัสผ่าน, token, query string
+  - tasks-api: logger บันทึกแค่ `r.URL.Path`
+- [ ] (ทำต่อเอง) **metrics** เช่น จำนวน request, latency percentile, error rate แยกตาม route ด้วย Prometheus หรือ OpenTelemetry
+- [ ] (ทำต่อเอง) **distributed tracing** ด้วย OpenTelemetry (`otelhttp` ครอบ handler, ส่ง trace ID ไปกับ log)
+- [ ] `net/http/pprof` ถ้าเปิดใช้ ต้อง **ไม่อยู่บน port สาธารณะ** ให้ฟังบน port ภายในแยกต่างหาก (ทบทวน [Profiling](/advanced/profiling/))
+
+## Testing และ CI
+
+- [ ] unit test ของ business rule ด้วย fake repository
+  - tasks-api: `internal/task/service_test.go`
+- [ ] handler test ด้วย `httptest` ครอบคลุม validation, status code และ error code
+  - tasks-api: `internal/task/handler_test.go`
+- [ ] test ด้าน security: token ปลอม / หมดอายุ / `alg none`, เข้าถึงข้อมูลคนอื่นได้ 404
+- [ ] integration test กับ database จริงอย่างน้อยหนึ่ง flow หลัก
+  - tasks-api: `internal/server/server_integration_test.go` (`make test-integration`)
+- [ ] CI รัน `go vet`, `go test -race ./...`, `govulncheck` ทุก PR
+- [ ] OpenAPI spec อัปเดตใน PR เดียวกับโค้ด และ lint ใน CI
+  - tasks-api: `api/openapi.yaml`
+- [ ] (ทำต่อเอง) contract test ตรวจ response จริงกับ OpenAPI schema
+- [ ] (ทำต่อเอง) `golangci-lint` สำหรับ linter เพิ่มเติม และ build Docker image ใน CI เพื่อจับ Dockerfile พังก่อน deploy
+
+<Aside type="tip">
+ไม่จำเป็นต้องทำครบทุกข้อตั้งแต่วันแรก เรียงลำดับความสำคัญจาก **ความปลอดภัยของข้อมูล** (authz, validation, secret) → **ความเสถียร** (timeout, shutdown, health check) → **การมองเห็น** (log, request ID, metrics) แล้วค่อยเก็บที่เหลือ
+</Aside>
+
+## ต่อจากนี้ไปไหน
+
+tasks-api เป็นฐานที่ดีสำหรับต่อยอด ลองเลือกทำทีละข้อ
+
+- **Refresh token และ logout** ตามแนวทางในหน้า [Authentication](/web-api/authentication/) จะได้ฝึกออกแบบตาราง, transaction และ test เพิ่ม
+- **Rate limit ด้วย Redis** แทน map ใน memory เปลี่ยน `RateLimiter` ให้ขึ้นกับ interface แล้วเขียน implementation สองแบบ
+- **OpenTelemetry** เพิ่ม metrics และ tracing แล้วดูผลใน Grafana / Jaeger
+- **Idempotency-Key** สำหรับ `POST /v1/tasks`
+- **Feature ใหม่** เช่น tag ของ task, แชร์ task ให้ผู้ใช้อื่น (authorization จะซับซ้อนขึ้น), ค้นหาด้วย full-text search ของ PostgreSQL
+- **Spec-first** ย้ายไปใช้ oapi-codegen แล้วให้ compiler บังคับว่า handler ตรงกับ `openapi.yaml`
+- **Deploy จริง** บน Kubernetes, Cloud Run, Fly.io หรือ VM พร้อม CI/CD ที่รัน test, migration และ deploy อัตโนมัติ
+- **อ่านโค้ดจริงของ library ที่ใช้** เช่น `net/http`, `pgx`, `goose` จะเข้าใจ Go ลึกขึ้นอีกระดับ
+
+กลับไปทบทวนภาพรวมได้ที่ [ภาพรวมโปรเจกต์](/web-api/overview/) หรือ [โครงสร้างโปรเจกต์](/web-api/project-structure/)
+
+## สรุป
+
+- checklist ครอบคลุม 7 หมวด: naming, response / error, pagination, security, reliability, observability และ testing
+- tasks-api ทำข้อพื้นฐานที่สำคัญครบ และบอกตรง ๆ ว่ายังขาด Idempotency-Key, refresh token, rate limit แบบ shared store, การอ่าน IP หลัง proxy, metrics / tracing และ contract test
+- ใช้ checklist นี้ตอน review PR และก่อนขึ้น production ทุกครั้ง

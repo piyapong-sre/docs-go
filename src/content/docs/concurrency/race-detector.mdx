@@ -1,0 +1,211 @@
+---
+title: Race detector และ goroutine leak
+description: หา data race ด้วย go test -race และ go run -race วิธีแก้ และวิธีป้องกัน goroutine leak
+sidebar:
+  order: 7
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/concurrency/race-detector/main.go?raw';
+
+บั๊กของ concurrent code ที่อันตรายที่สุดคือบั๊กที่ **ไม่ได้เกิดทุกครั้ง** — test ผ่านบนเครื่องเรา แต่พังบน production ตอนโหลดสูง
+Go มีเครื่องมือในตัวช่วยจับบั๊กกลุ่มนี้ได้ คือ **race detector**
+
+## Data race คืออะไร
+
+**data race** เกิดเมื่อ
+
+1. มีอย่างน้อย 2 goroutine เข้าถึง **ตัวแปรเดียวกัน** พร้อมกัน
+2. อย่างน้อยหนึ่งตัว **เขียน**
+3. ไม่มีการ synchronize (Mutex, channel, atomic ฯลฯ)
+
+ผลคือ behavior ที่คาดเดาไม่ได้: ค่าหาย, ค่าเพี้ยน, หรือแม้แต่โปรแกรมล่ม
+
+## ตัวอย่าง code ที่มี race
+
+```go title="racy/main.go"
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	count := 0
+	var wg sync.WaitGroup
+	for range 1000 {
+		wg.Go(func() {
+			count++ // หลาย goroutine เขียนตัวแปรเดียวกันพร้อมกัน
+		})
+	}
+	wg.Wait()
+	fmt.Println("count:", count)
+}
+```
+
+รันปกติสองครั้งได้ผลไม่เท่ากัน และไม่ใช่ 1000
+
+```text title="go run . (ค่าจะต่างกันทุกครั้ง)"
+count: 933
+count: 958
+```
+
+## เปิด race detector
+
+เติม flag `-race` ให้คำสั่ง `go` ที่ใช้ประจำ
+
+```bash
+go run -race .
+go test -race ./...
+go build -race -o app-race .
+```
+
+```text title="go run -race ."
+==================
+WARNING: DATA RACE
+Read at 0x00c00019e038 by goroutine 14:
+  main.main.func1()
+      /path/to/racy/main.go:13 +0x2c
+
+Previous write at 0x00c00019e038 by goroutine 8:
+  main.main.func1()
+      /path/to/racy/main.go:13 +0x3c
+
+Goroutine 14 (running) created at:
+  sync.(*WaitGroup).Go()
+      /usr/local/go/src/sync/waitgroup.go:238 +0x6c
+...
+==================
+count: 898
+Found 2 data race(s)
+exit status 66
+```
+
+รายงานบอกครบว่า
+
+- **ตำแหน่งที่ชนกัน** (`main.go:13` คือ `count++`) ทั้งฝั่งอ่านและฝั่งเขียน
+- **goroutine ไหน** และถูกสร้างจากที่ใด
+- โปรแกรมยังทำงานจนจบ แต่ exit code เป็น 66 เมื่อเจอ race (ถ้าเป็น `go test` test จะ fail) จำนวน race ที่รายงานอาจต่างกันในแต่ละครั้ง
+
+<Aside type="caution" title="race detector เจอเฉพาะ race ที่เกิดขึ้นจริงตอนรัน">
+มันไม่ได้วิเคราะห์ code แบบ static แต่เฝ้าดูการเข้าถึง memory ระหว่างรัน ถ้า code path ที่มี race ไม่ถูกรัน ก็จะไม่เจอ
+ดังนั้นต้องมี test ที่ **รันส่วน concurrent จริงๆ** และไม่มีรายงาน ≠ ไม่มี race แน่นอน
+</Aside>
+
+<Aside type="tip" title="ใส่ -race ใน CI">
+race detector ทำให้โปรแกรมช้าลงประมาณ 2-20 เท่าและใช้ memory มากขึ้น 5-10 เท่า จึงไม่ใช้ใน production
+แต่ควรรัน `go test -race ./...` ใน CI **ทุกครั้ง** — เป็นวิธีที่คุ้มที่สุดในการจับ race ก่อนถึงผู้ใช้
+(ต้องเปิด cgo: บางระบบต้องตั้ง `CGO_ENABLED=1`)
+</Aside>
+
+## วิธีแก้ data race
+
+เลือกตามสถานการณ์ (รายละเอียดใน [sync และ atomic](/concurrency/sync/))
+
+| วิธี | เหมาะกับ |
+|---|---|
+| `sync.Mutex` | ป้องกัน state หลาย field หรือ map/slice |
+| `sync/atomic` | ตัวเลขหรือ flag เดี่ยวๆ |
+| channel | ส่งความเป็นเจ้าของข้อมูลให้ goroutine เดียวจัดการ |
+| ไม่แชร์เลย | ให้แต่ละ goroutine เขียนคนละ index ของ slice หรือมี state ของตัวเอง แล้วรวมตอนจบ |
+
+## Goroutine leak
+
+**goroutine leak** คือ goroutine ที่ **ไม่มีวันจบ** ค้างอยู่ใน memory ตลอด
+ไม่มี error ไม่มี panic แต่ memory และจำนวน goroutine โตขึ้นเรื่อยๆ จนวันหนึ่งระบบล่ม
+
+สาเหตุหลักมีสามแบบ
+
+```go
+// 1) ส่งเข้า channel ที่ไม่มีใครรับแล้ว
+func first(sources []string) string {
+	ch := make(chan string) // ❌ unbuffered
+	for _, s := range sources {
+		go func() { ch <- query(s) }() // ตัวที่ตอบช้ากว่าตัวแรกจะค้างที่นี่ตลอดไป
+	}
+	return <-ch // รับแค่ตัวเดียว
+}
+
+// 2) รอรับจาก channel ที่ไม่มีวันถูกส่งหรือปิด
+go func() {
+	for v := range jobs { ... } // ❌ ถ้าไม่มีใคร close(jobs) จะค้างตลอด
+}()
+
+// 3) loop ไม่มีทางออก
+go func() {
+	for {
+		out <- next() // ❌ ไม่มี case ให้หยุดเมื่อไม่มีใครต้องการแล้ว
+	}
+}()
+```
+
+## ตัวอย่างที่แก้แล้ว
+
+<Code code={src} lang="go" title="examples/learn/concurrency/race-detector/main.go" />
+
+```text title="go run -race ./concurrency/race-detector"
+mutex count: 1000
+atomic count: 1000
+leaked goroutines: 0
+```
+
+### อธิบายทีละส่วน
+
+- `Stats.Inc` ครอบ `count++` ด้วย Mutex และ `countAtomic` ใช้ `atomic.Int64` ทั้งคู่ได้ 1000 ตรงทุกครั้ง และ `-race` ไม่รายงานอะไร
+- `wg.Go(s.Inc)` ส่ง **method value** เข้าไปตรงๆ ได้ เพราะ `s.Inc` เป็น `func()` อยู่แล้ว
+- `firstResult` ใช้ **buffered channel ขนาดเท่าจำนวนผู้ส่ง** goroutine ที่ตอบช้าจึงส่งเข้า buffer แล้วจบได้ แม้ไม่มีใครรับ
+- `ticker` ใช้ `select` คู่กับ `ctx.Done()` ทำให้มีทางออกเสมอ เมื่อ `cancel()` ถูกเรียก goroutine ก็จบ
+- `runtime.NumGoroutine()` ก่อนและหลังเท่ากัน ยืนยันว่าไม่มี goroutine ค้าง
+
+## ตรวจจับ goroutine leak
+
+- **`runtime.NumGoroutine()`** — เปรียบเทียบก่อน/หลัง ใน test หรือ export เป็น metric แล้วดูกราฟว่าโตขึ้นเรื่อยๆ ไหม
+- **pprof** — `/debug/pprof/goroutine?debug=1` แสดงว่า goroutine ค้างอยู่ที่บรรทัดไหนบ้าง (ดู [Profiling](/advanced/profiling/))
+- **`go.uber.org/goleak`** — library ที่นิยมใช้ใน test เพื่อ fail ถ้ามี goroutine เหลือหลัง test จบ
+
+<Aside type="tip" title="checklist ก่อนเขียน go func()">
+1. goroutine นี้จะจบเมื่อไร?
+2. ถ้าส่งเข้า channel — มีคนรับแน่หรือเปล่า? ถ้าผู้รับเลิกกลางทางล่ะ?
+3. ถ้ารอรับจาก channel — ใครเป็นคนปิด?
+4. ถ้ามี loop — มี `ctx.Done()` เป็นทางออกหรือยัง?
+5. มีใครรอ (`WaitGroup`/`errgroup`) ให้มันจบไหม?
+</Aside>
+
+## แบบฝึกหัด
+
+1. ก๊อปตัวอย่าง `racy/main.go` ไปรันด้วย `go run -race .` แล้วแก้ให้ไม่มี race ด้วยวิธีที่ต่างกันสองวิธี (Mutex และ atomic)
+2. code นี้มี race หรือไม่
+
+   ```go
+   results := make([]int, 10)
+   var wg sync.WaitGroup
+   for i := range 10 {
+   	wg.Go(func() { results[i] = i * 2 })
+   }
+   wg.Wait()
+   ```
+
+3. แก้ตัวอย่าง goroutine leak แบบที่ 3 (loop ไม่มีทางออก) ให้รับ `ctx context.Context` และหยุดได้
+
+<details>
+<summary>เฉลย</summary>
+
+1. แบบ Mutex: ประกาศ `var mu sync.Mutex` แล้วครอบ `mu.Lock(); count++; mu.Unlock()`
+   แบบ atomic: เปลี่ยน `count` เป็น `var count atomic.Int64` แล้วใช้ `count.Add(1)` และ `count.Load()`
+2. ไม่มี race — แต่ละ goroutine เขียนคนละ index (คนละตำแหน่ง memory) และ `main` อ่านหลัง `wg.Wait()` ซึ่ง synchronize แล้ว
+3. ตัวอย่าง
+
+   ```go
+   go func() {
+   	for {
+   		select {
+   		case out <- next():
+   		case <-ctx.Done():
+   			return
+   		}
+   	}
+   }()
+   ```
+
+</details>

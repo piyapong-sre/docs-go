@@ -1,0 +1,165 @@
+---
+title: Reflection
+description: ใช้ package reflect ตรวจชนิดและค่าตอนรันไทม์ อ่าน struct tag สร้าง validator อย่างง่าย และรู้ว่าเมื่อไหร่ไม่ควรใช้
+sidebar:
+  order: 7
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/advanced/reflection/main.go?raw';
+
+## Reflection คืออะไร
+
+ปกติ Go รู้ชนิดของทุกตัวแปรตั้งแต่ตอน compile แต่บางงานต้องจัดการค่าที่ **ไม่รู้ชนิดล่วงหน้า** เช่น
+
+- `encoding/json` ต้อง encode struct อะไรก็ได้ที่ส่งเข้ามา
+- validator ต้องอ่าน tag `validate:"required"` ของทุก field
+- ORM ต้อง map field ของ struct ไปยัง column
+
+**Reflection** (package `reflect`) คือความสามารถในการตรวจดูชนิด อ่าน และแก้ค่าในตอนรันไทม์ เป็นเครื่องมือทรงพลังที่ library ใช้กันมาก แต่ในโค้ด application ทั่วไปควรใช้ให้น้อยที่สุด
+
+## สองตัวละครหลัก
+
+| ฟังก์ชัน | คืนค่า | ใช้ทำอะไร |
+| --- | --- | --- |
+| `reflect.TypeOf(x)` | `reflect.Type` | ข้อมูลของ**ชนิด**: ชื่อ, Kind, field, method, tag |
+| `reflect.ValueOf(x)` | `reflect.Value` | ข้อมูลของ**ค่า**: อ่านค่า, แก้ค่า, เรียก method |
+
+และอีกตัวที่ต้องเข้าใจคือ **Kind** ซึ่งเป็นหมวดพื้นฐานของชนิด เช่น `User` กับ `Order` เป็นคนละ Type แต่ Kind เดียวกันคือ `struct` โค้ด reflection ส่วนใหญ่จึง `switch` ด้วย Kind
+
+## ตัวอย่าง: validator จาก struct tag
+
+<Code code={src} lang="go" title="examples/learn/advanced/reflection/main.go" />
+
+```text title="Output"
+int                kind=int
+string             kind=string
+[]int              kind=slice
+map[string]int     kind=map
+main.SignupForm    kind=struct
+*main.SignupForm   kind=ptr
+json tag: email | validate tag: required,contains=@
+CanSet (by value): false
+CanSet (by pointer): true
+after SetString: Bob
+--- validate bad ---
+Name: required
+Email: ต้องมี "@"
+Age: ต้องไม่น้อยกว่า 18
+--- validate good ---
+<nil>
+```
+
+## อธิบายทีละส่วน
+
+### Type กับ Kind
+
+`reflect.TypeOf(SignupForm{})` ได้ Type ชื่อ `main.SignupForm` ซึ่งมี Kind เป็น `struct` ส่วน `*SignupForm` มี Kind เป็น pointer (แสดงเป็น `ptr` ในโค้ดใช้ค่าคงที่ `reflect.Pointer`)
+
+ถ้ารู้ชนิดตอน compile อยู่แล้ว ใช้ `reflect.TypeFor[T]()` (Go 1.22+) ได้เลย ไม่ต้องสร้างค่าขึ้นมาก่อน
+
+### อ่าน struct tag
+
+struct tag คือ string ใน backtick หลัง field ตามธรรมเนียมเขียนเป็น `key:"value"` คั่นด้วยช่องว่าง
+
+```go
+Email string `json:"email" validate:"required,contains=@"`
+```
+
+- `field.Tag.Get("json")` คืน `"email"` (ถ้าไม่มีคืน `""`)
+- `field.Tag.Lookup("validate")` คืนค่าและ `bool` บอกว่ามี tag นี้หรือไม่ ใช้แยกกรณี "ไม่มี tag" กับ "tag ว่าง" ได้
+
+<Aside type="caution">
+รูปแบบ tag ต้องเป๊ะ: `key:"value"` ห้ามมีช่องว่างรอบ `:` และค่าต้องอยู่ใน double quote ถ้าเขียนผิด `Get` จะคืน `""` เงียบ ๆ โชคดีที่ `go vet` (analyzer `structtag`) จับรูปแบบผิดให้ได้
+</Aside>
+
+### เดิน field ของ struct
+
+```go
+rt := rv.Type()
+for i := range rt.NumField() {
+	field := rt.Field(i) // reflect.StructField: Name, Type, Tag
+	value := rv.Field(i) // reflect.Value ของ field นั้น
+}
+```
+
+ข้อมูล**ของชนิด** (ชื่อ, tag) มาจาก `Type` ส่วน**ค่าจริง**มาจาก `Value` ต้องใช้ทั้งคู่ร่วมกัน
+
+`Validate` เริ่มด้วยการเช็ก `rv.Kind() == reflect.Pointer` แล้วเรียก `rv.Elem()` เพื่อให้รับได้ทั้ง `SignupForm` และ `*SignupForm` เป็นแพตเทิร์นที่เจอบ่อยมาก
+
+### อ่านค่าตาม Kind
+
+`reflect.Value` มี method อ่านค่าแยกตาม Kind เช่น `v.Int()`, `v.String()`, `v.Bool()`, `v.Float()` ถ้าเรียกผิด Kind (เช่น `Int()` กับ string) จะ **panic** จึงต้องเช็ก Kind ก่อนเสมอ อย่างที่ `check` ทำ
+
+`v.IsZero()` ใช้เช็กว่าเป็น zero value ของชนิดนั้นหรือไม่ เหมาะกับกฎ `required`
+
+### แก้ค่าได้เมื่อไหร่: `CanSet`
+
+`reflect.ValueOf(form)` ได้ **สำเนา** ของ `form` การแก้สำเนาไม่มีประโยชน์ reflect จึงไม่อนุญาต (`CanSet` เป็น `false`) ต้องส่ง pointer แล้ว `.Elem()` เพื่อเข้าถึงตัวจริง
+
+ค่าจะ set ได้เมื่อ
+
+1. เข้าถึงผ่าน pointer (addressable)
+2. field เป็น exported (ตัวพิมพ์ใหญ่)
+
+<Aside type="caution">
+เรียก `SetString`, `SetInt` ฯลฯ บนค่าที่ `CanSet()` เป็น `false` จะ panic ทันที ไม่ได้คืน error ให้เช็ก `CanSet()` ก่อนทุกครั้งในโค้ดที่รับค่าจากภายนอก
+</Aside>
+
+## ต้นทุนและเมื่อไหร่ไม่ควรใช้
+
+Reflection มีราคาที่ต้องจ่าย
+
+- **ช้ากว่า**: เข้าถึง field ผ่าน reflect ช้ากว่าเข้าถึงตรง ๆ หลายสิบเท่า และมัก allocate เพิ่ม
+- **compiler ช่วยไม่ได้**: ผิดชนิดไม่เจอตอน compile แต่ panic ตอนรัน
+- **อ่านยาก**: โค้ดยาวและเข้าใจยากกว่าโค้ดปกติมาก
+- **refactor ยาก**: IDE เปลี่ยนชื่อ field ได้ แต่ string ใน tag หรือ `FieldByName("Name")` ไม่เปลี่ยนตาม
+
+ทางเลือกที่ควรลองก่อน
+
+| ถ้าต้องการ | ใช้แทน |
+| --- | --- |
+| ทำงานกับหลายชนิดด้วย logic เดียวกัน | **Generics** |
+| เรียกพฤติกรรมที่ต่างกันตามชนิด | **Interface** หรือ type switch |
+| โค้ดซ้ำ ๆ ต่อ struct แต่ละตัว | **Code generation** (ดู [Code Generation](/advanced/code-generation/)) |
+| ตรวจ input | เขียน method `Validate() error` ตรง ๆ |
+
+<Aside type="tip">
+ถ้าจำเป็นต้องใช้ reflect ใน hot path ให้ cache ผลการวิเคราะห์ Type ไว้ (เช่น เก็บใน `sync.Map` โดยใช้ `reflect.Type` เป็น key) เพื่อไม่ต้องเดิน field และ parse tag ซ้ำทุกครั้ง `encoding/json` ก็ใช้เทคนิคนี้
+</Aside>
+
+## แบบฝึกหัด
+
+1. เพิ่มกฎ `max=N` ให้ validator สำหรับ field ชนิด `int` และทดสอบกับ `Age: 200`
+2. เขียนฟังก์ชัน `PrintFields(v any)` ที่พิมพ์ชื่อ field, ชนิด และค่าของ struct ใด ๆ เช่น `Name string = Ann`
+3. ทำไม `reflect.ValueOf(form).Field(0).SetString("x")` จึง panic และต้องแก้อย่างไร
+
+<details>
+<summary>เฉลย</summary>
+
+1. เพิ่ม case ใน `check`
+   ```go
+   case "max":
+   	n, _ := strconv.Atoi(arg)
+   	if v.Kind() == reflect.Int && v.Int() > int64(n) {
+   		return fmt.Errorf("%s: ต้องไม่เกิน %d", field, n)
+   	}
+   ```
+   แล้วแก้ tag เป็น `validate:"min=18,max=150"`
+2. ```go
+   func PrintFields(v any) {
+   	rv := reflect.Indirect(reflect.ValueOf(v)) // ถอด pointer ถ้ามี
+   	rt := rv.Type()
+   	for i := range rt.NumField() {
+   		f := rt.Field(i)
+   		if !f.IsExported() {
+   			continue
+   		}
+   		fmt.Printf("%s %s = %v\n", f.Name, f.Type, rv.Field(i).Interface())
+   	}
+   }
+   ```
+   ต้องข้าม field ที่ไม่ exported เพราะ `Interface()` กับ field แบบนั้นจะ panic
+3. เพราะ `ValueOf(form)` ได้สำเนาที่ไม่ addressable (`CanSet()` เป็น `false`) แก้โดยส่ง pointer: `reflect.ValueOf(&form).Elem().Field(0).SetString("x")`
+
+</details>

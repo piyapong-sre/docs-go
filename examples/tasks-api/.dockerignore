@@ -1,0 +1,7 @@
+# Keep secrets and junk out of the Docker build context.
+.env
+.git
+bin/
+*.out
+Dockerfile
+compose.yaml

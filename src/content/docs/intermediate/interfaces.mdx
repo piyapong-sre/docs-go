@@ -1,0 +1,246 @@
+---
+title: Interface
+description: เข้าใจ interface ของ Go ที่ implement แบบ implicit พร้อม type assertion, type switch และกับดัก nil interface
+sidebar:
+  order: 2
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/intermediate/interfaces/main.go?raw';
+
+**interface** คือการบอกว่า "ฉันต้องการของที่ทำ *สิ่งนี้* ได้" โดยไม่สนว่าเป็น type อะไร
+เป็นเครื่องมือหลักของ Go สำหรับเขียน code ที่ยืดหยุ่น ทดสอบง่าย และไม่ผูกติดกับ implementation
+
+## Implement แบบ implicit
+
+ใน Go **ไม่มีคำว่า `implements`** type ใดมี method ครบตามที่ interface กำหนด ก็ถือว่า implement แล้วทันที
+
+```go
+type Shape interface {
+	Area() float64
+}
+
+type Rect struct{ W, H float64 }
+
+func (r Rect) Area() float64 { return r.W * r.H } // แค่นี้ Rect ก็เป็น Shape แล้ว
+```
+
+ข้อดีคือ package ที่ประกาศ interface กับ package ที่ implement **ไม่ต้องรู้จักกัน**
+เราประกาศ interface ทีหลังเพื่อครอบ type ของ library คนอื่นได้ด้วย
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/intermediate/interfaces/main.go" />
+
+```text title="Output"
+total area: 15.14
+it's a rect, width = 2
+not a circle
+int 42
+string "สวัสดี" (len 18)
+Stringer Rect(1x2)
+error boom
+other float64
+nil
+HELLO, INTERFACES
+```
+
+### อธิบายทีละส่วน
+
+- `TotalArea(shapes []Shape)` ไม่รู้จัก `Rect` หรือ `Circle` เลย รู้แค่ว่าทุกตัวมี `Area()`
+- `upperWriter` มี method `Write([]byte) (int, error)` จึงเป็น `io.Writer` ส่งให้ `io.Copy` ได้ทันที
+- `describe(v any)` รับค่าอะไรก็ได้ แล้วใช้ **type switch** แยกว่าข้างในเป็น type อะไร
+- `len("สวัสดี")` ได้ 18 เพราะ `len` นับ byte ไม่ใช่ตัวอักษร (ภาษาไทยใช้ 3 byte ต่อตัวใน UTF-8)
+
+## Interface เล็กๆ ใน standard library
+
+interface ที่ดีของ Go มักมีแค่ 1-2 method และตั้งชื่อลงท้ายด้วย `-er`
+
+```go
+// package io
+type Reader interface {
+	Read(p []byte) (n int, err error)
+}
+type Writer interface {
+	Write(p []byte) (n int, err error)
+}
+
+// package fmt
+type Stringer interface {
+	String() string
+}
+
+// built-in
+type error interface {
+	Error() string
+}
+```
+
+เพราะมันเล็ก จึงมี type จำนวนมาก implement ได้ เช่น `*os.File`, `*bytes.Buffer`, `*strings.Reader`,
+`net.Conn`, `http.ResponseWriter` ล้วนเป็น `io.Writer` และ/หรือ `io.Reader`
+function เดียวที่รับ `io.Writer` จึงเขียนลงไฟล์ ลง buffer หรือส่งออก network ได้หมด
+
+interface ใหญ่สร้างจากการ **embed** interface เล็ก
+
+```go
+type ReadWriter interface {
+	Reader
+	Writer
+}
+```
+
+## `any` — interface ว่าง
+
+`any` คือ alias ของ `interface{}` หมายถึง interface ที่ไม่มี method เลย ทุก type จึง implement ได้
+
+```go
+var x any = 42
+x = "hello"
+x = []int{1, 2}
+```
+
+ใช้เมื่อจำเป็นจริงๆ เช่น `fmt.Println(a ...any)` หรือ JSON ที่ไม่รู้โครงสร้าง
+ถ้าแค่อยากให้ function ใช้ได้กับหลาย type ให้พิจารณา [generics](/intermediate/generics/) ก่อน เพราะยังคง type safety ไว้
+
+## Type assertion
+
+ดึงค่า type จริงออกจาก interface
+
+```go
+var s Shape = Rect{2, 5}
+
+r := s.(Rect)       // ถ้าไม่ใช่ Rect จะ panic
+r, ok := s.(Rect)   // แบบ comma-ok: ไม่ panic, ok = false ถ้าไม่ใช่
+w, ok := s.(fmt.Stringer) // assert เป็น interface อื่นก็ได้: "มี String() ไหม"
+```
+
+<Aside type="tip">
+ใช้แบบ comma-ok (`v, ok := x.(T)`) เสมอ ยกเว้นมั่นใจ 100% ว่า type ถูกต้อง
+</Aside>
+
+## Type switch
+
+เมื่อต้องแยกหลายกรณี type switch อ่านง่ายกว่าการ assert ทีละตัว
+
+```go
+switch x := v.(type) {
+case int:
+	// x เป็น int
+case string, []byte:
+	// หลาย type ใน case เดียว → x ยังเป็น any
+case fmt.Stringer:
+	// x เป็น fmt.Stringer
+case nil:
+	// v เป็น nil interface
+default:
+	// type อื่นๆ
+}
+```
+
+case ถูกเช็คจากบนลงล่าง ถ้า type ตรงกับหลาย case จะเข้า case แรกที่ตรง
+ในตัวอย่างข้างบน `Rect` เข้า `fmt.Stringer` เพราะมี `String()` ก่อนถึง case อื่น
+
+## กับดัก: nil interface ที่ไม่ nil
+
+ค่า interface ประกอบด้วยสองส่วน คือ **(type, value)** และจะเท่ากับ `nil` ก็ต่อเมื่อ **ทั้งสองส่วนเป็น nil**
+
+```go
+type MyErr struct{}
+
+func (*MyErr) Error() string { return "my error" }
+
+func doThing(fail bool) error {
+	var p *MyErr // p เป็น nil pointer
+	if fail {
+		p = &MyErr{}
+	}
+	return p // ❌ คืน interface ที่มี type = *MyErr, value = nil
+}
+
+err := doThing(false)
+fmt.Println(err == nil) // false (!!)
+```
+
+`err` ไม่เท่ากับ `nil` เพราะส่วน type ของมันคือ `*MyErr` ทำให้ `if err != nil` เป็นจริง ทั้งที่ไม่ได้มี error
+
+<Aside type="caution" title="วิธีแก้">
+คืน `nil` ตรงๆ เมื่อไม่มี error อย่าคืนตัวแปร pointer ที่บังเอิญเป็น nil
+
+```go
+func doThing(fail bool) error {
+	if fail {
+		return &MyErr{}
+	}
+	return nil // ✅
+}
+```
+
+กฎเดียวกันใช้กับทุก interface ไม่ใช่แค่ `error`
+</Aside>
+
+## Accept interfaces, return structs
+
+แนวทางที่ใช้กันทั่วไปใน Go
+
+- **รับ interface**: parameter เป็น interface ที่เล็กที่สุดที่ใช้จริง caller จะส่งอะไรมาก็ได้ และ test ง่ายเพราะส่ง fake มาแทนได้
+- **คืน struct (concrete type)**: caller ได้ใช้ method และ field ครบ และเราเพิ่ม method ใหม่ได้โดยไม่ทำให้ใครพัง
+
+```go
+// ✅ รับแค่ io.Reader ไม่ใช่ *os.File → ใช้กับไฟล์, HTTP body, string ได้หมด
+func CountLines(r io.Reader) (int, error) { ... }
+
+// ✅ คืน *Store ตัวจริง
+func NewStore(db *sql.DB) *Store { ... }
+```
+
+<Aside type="tip" title="ประกาศ interface ฝั่งคนใช้">
+ใน Go ไม่ต้องประกาศ interface ไว้ล่วงหน้าคู่กับ implementation ให้ประกาศใน package ที่ **ใช้งาน** มัน
+และใส่เฉพาะ method ที่ต้องใช้จริง เช่น service ที่ต้องการแค่ `GetUser` ก็ประกาศ interface ที่มี method เดียวพอ
+</Aside>
+
+## ตรวจตอน compile ว่า implement ครบ
+
+ถ้าอยากให้ compiler ช่วยยืนยันว่า type implement interface แน่ๆ ใช้ trick นี้
+
+```go
+var _ io.Writer = upperWriter{}   // ถ้าขาด method จะ compile ไม่ผ่าน
+var _ error = (*MyErr)(nil)
+```
+
+## แบบฝึกหัด
+
+1. เขียน type `Square` ที่มี field `Side float64` ให้ implement `Shape` แล้วส่งเข้า `TotalArea` พร้อม `Rect` และ `Circle`
+2. เขียน function `func Describe(v any) string` ที่คืน `"number"` ถ้าเป็น `int` หรือ `float64`, `"text"` ถ้าเป็น `string` และ `"unknown"` สำหรับอย่างอื่น
+3. เขียน `countingWriter` ที่ implement `io.Writer` และนับจำนวน byte ที่ถูกเขียนทั้งหมด
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+type Square struct{ Side float64 }
+
+func (s Square) Area() float64 { return s.Side * s.Side }
+
+// 2
+func Describe(v any) string {
+	switch v.(type) {
+	case int, float64:
+		return "number"
+	case string:
+		return "text"
+	default:
+		return "unknown"
+	}
+}
+
+// 3 — ต้องใช้ pointer receiver เพราะแก้ค่า n
+type countingWriter struct{ n int }
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.n += len(p)
+	return len(p), nil
+}
+```
+
+</details>

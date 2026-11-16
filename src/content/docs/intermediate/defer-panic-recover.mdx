@@ -1,0 +1,230 @@
+---
+title: defer, panic และ recover
+description: ใช้ defer เพื่อ cleanup อย่างปลอดภัย เข้าใจว่า panic คืออะไร และเมื่อไหร่ควรใช้ recover
+sidebar:
+  order: 4
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/intermediate/defer-panic-recover/main.go?raw';
+
+สามคำนี้มักมาด้วยกัน แต่ความถี่ในการใช้ต่างกันมาก
+**`defer` ใช้ทุกวัน** ส่วน `panic` และ `recover` ใช้น้อยมากและควรใช้อย่างระมัดระวัง
+
+## defer
+
+`defer` สั่งให้เรียก function **ตอนที่ function ปัจจุบันกำลังจะจบ** ไม่ว่าจะจบด้วย `return` ปกติหรือ panic
+
+```go
+f, err := os.Open(name)
+if err != nil {
+	return err
+}
+defer f.Close() // ปิดไฟล์แน่นอน ไม่ว่าจะ return ที่บรรทัดไหน
+
+// ... ใช้งาน f ต่อ
+```
+
+ข้อดีคือเขียน cleanup ไว้ **ติดกับ** ตอนที่ได้ resource มา ไม่ต้องไปตามปิดทุก `return`
+ใช้กับไฟล์, `mu.Unlock()`, `rows.Close()`, `resp.Body.Close()`, `cancel()` ของ context เป็นต้น
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/intermediate/defer-panic-recover/main.go" />
+
+```text title="Output"
+function body done
+defer 2
+defer 1
+defer 0
+current x = 2
+deferred x = 1
+double(4) = 10
+write ok
+5 <nil>
+0 recovered: runtime error: integer divide by zero
+recovered from: mustPositive: got -1
+program continues normally
+```
+
+## กฎของ defer
+
+### 1. ทำงานแบบ LIFO (เข้าทีหลัง ออกก่อน)
+
+`deferOrder` defer ไว้ 3 ครั้ง ผลลัพธ์ออกมาเป็น 2, 1, 0 เหมือน stack
+ซึ่งเป็นลำดับที่ถูกต้องสำหรับ cleanup เพราะ resource ที่เปิดทีหลังมักต้องปิดก่อน
+
+### 2. argument ถูกประเมินทันทีตอนเจอ defer
+
+ใน `argsEvaluatedEarly` ค่า `x` ถูกส่งเข้า `fmt.Println` ตั้งแต่บรรทัด `defer` (ตอนนั้น `x = 1`)
+ถ้าอยากได้ค่าล่าสุดให้ใช้ closure
+
+```go
+defer func() { fmt.Println("x =", x) }() // อ่าน x ตอนที่ defer ทำงานจริง
+```
+
+### 3. แก้ named result ได้
+
+`double` ใช้ named result `(result int)` คำสั่ง `return n + 1` จะเซ็ต `result = 5` ก่อน
+จากนั้น defer ทำงานคูณ 2 กลายเป็น 10 เทคนิคนี้ใช้จริงใน `writeFile` เพื่อไม่ทิ้ง error จาก `f.Close()`
+
+```go
+defer func() {
+	err = errors.Join(err, f.Close())
+}()
+```
+
+สำคัญกับไฟล์ที่ **เขียน** เพราะ `Close()` อาจเป็นจังหวะที่ข้อมูลถูก flush ลง disk และ error จริงๆ เกิดตรงนั้น
+
+<Aside type="caution" title="defer ใน loop">
+defer ทำงานตอน **function** จบ ไม่ใช่ตอนจบรอบ loop
+
+```go
+for _, name := range files {
+	f, _ := os.Open(name)
+	defer f.Close() // ❌ ไฟล์ทั้งหมดถูกเปิดค้างจนกว่า function จะจบ
+}
+```
+
+แก้โดยแยกเนื้อหาในรอบเป็น function ของตัวเอง แล้ว defer ข้างในนั้น
+</Aside>
+
+## panic
+
+`panic` หยุดการทำงานปกติของ goroutine ทันที แล้วไล่รัน defer ที่ค้างไว้ย้อนขึ้นไปทีละชั้น
+ถ้าไม่มีใคร recover โปรแกรมจะพิมพ์ stack trace แล้วจบด้วย exit code 2
+
+panic เกิดได้สองทาง
+
+- **runtime error** เช่น index out of range, nil pointer dereference, หารด้วยศูนย์
+- **เรียกเอง** ด้วย `panic(value)`
+
+```go
+panic("unreachable: unknown state")
+```
+
+### เมื่อไหร่ควร panic
+
+- สถานการณ์ที่ "เป็นไปไม่ได้" ถ้าเกิดแปลว่า **code มีบั๊ก** ไม่ใช่ input ผิด
+- ตอน initialize ที่ถ้าพังก็ไปต่อไม่ได้ เช่น `regexp.MustCompile` กับ pattern ที่เขียนตายตัวใน code
+  ธรรมเนียมคือตั้งชื่อ function ที่ panic ได้ให้ขึ้นต้นด้วย `Must`
+
+<Aside type="caution" title="อย่าใช้ panic แทน error">
+ไฟล์หาไม่เจอ, JSON ผิดรูปแบบ, database ล่ม — ทั้งหมดนี้ **คาดเดาได้** ให้คืน `error`
+(ดู [Error handling](/intermediate/errors/)) ผู้ใช้ library ของเราไม่ควรต้องมานั่ง recover
+</Aside>
+
+## recover
+
+`recover()` ใช้ "จับ" panic ให้โปรแกรมทำงานต่อได้ มีเงื่อนไขสำคัญ
+
+- ใช้ได้ผล **เฉพาะเมื่อเรียกตรงๆ ใน deferred function** เท่านั้น
+- คืนค่าที่ส่งเข้า `panic(...)` หรือ `nil` ถ้าไม่ได้ panic
+- จับได้เฉพาะ panic ใน **goroutine เดียวกัน** เท่านั้น
+
+```go
+func safeDivide(a, b int) (q int, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered: %v", r)
+		}
+	}()
+	return a / b, nil
+}
+```
+
+เมื่อ `b == 0` เกิด panic → defer ทำงาน → `recover()` ได้ค่า panic → แปลงเป็น `err`
+→ function คืนค่าตามปกติ (`q` เป็น 0 เพราะยังไม่ถูกกำหนด)
+
+### ใช้ recover ที่ไหนจริงๆ
+
+- **ขอบเขตของระบบ** เช่น HTTP server: `net/http` recover panic ใน handler ให้อยู่แล้ว
+  เพื่อไม่ให้ request เดียวทำ server ล่มทั้งตัว
+- library ที่ใช้ panic ภายในเพื่อออกจาก recursion ลึกๆ แล้วแปลงเป็น error ที่ API ขาออก
+  (เช่น `encoding/json` ทำแบบนี้)
+
+<Aside type="caution" title="panic ใน goroutine อื่น recover จาก main ไม่ได้">
+ถ้า goroutine ที่เราสร้างด้วย `go func()` panic แล้วไม่มี recover ใน goroutine นั้นเอง
+**ทั้งโปรแกรมจะล่ม** recover ใน `main` ช่วยไม่ได้ ถ้าจำเป็นต้องกันจริง ให้ใส่ defer/recover ไว้ใน goroutine นั้น
+</Aside>
+
+<Aside type="tip">
+ไม่ควรใช้ panic/recover เป็น try/catch ประจำวัน ถ้ารู้สึกว่าต้อง recover บ่อยๆ
+แปลว่าควรเปลี่ยน function นั้นให้คืน `error` แทน
+</Aside>
+
+## os.Exit ข้าม defer
+
+`os.Exit(1)` และ `log.Fatal(...)` จบโปรแกรม **ทันทีโดยไม่รัน defer**
+ถ้าใน `main` มี cleanup สำคัญ ให้แยก logic ไปไว้ใน `run() error` แล้วให้ `main` จัดการ exit
+
+```go
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	db, err := openDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close() // ทำงานแน่นอนเพราะ run() return ปกติ
+	// ...
+	return nil
+}
+```
+
+## แบบฝึกหัด
+
+1. code นี้พิมพ์อะไร
+
+   ```go
+   func f() (n int) {
+   	defer func() { n++ }()
+   	n = 10
+   	return n * 2
+   }
+   ```
+
+2. เขียน function `func SafeIndex(s []int, i int) (v int, err error)` ที่คืน error แทน panic เมื่อ index เกิน โดยใช้ recover (แล้วลองคิดว่ามีวิธีที่ดีกว่า recover ไหม)
+3. แก้ code ที่ defer ใน loop ให้ไฟล์ถูกปิดทุกรอบ
+
+<details>
+<summary>เฉลย</summary>
+
+1. พิมพ์ `21` — `return n * 2` เซ็ต `n = 20` แล้ว defer บวก 1
+2. ใช้ recover ได้ แต่วิธีที่ดีกว่าคือเช็คขอบเขตตรงๆ
+
+   ```go
+   func SafeIndex(s []int, i int) (int, error) {
+   	if i < 0 || i >= len(s) {
+   		return 0, fmt.Errorf("index %d out of range [0,%d)", i, len(s))
+   	}
+   	return s[i], nil
+   }
+   ```
+
+3. แยกเป็น function
+
+   ```go
+   for _, name := range files {
+   	if err := process(name); err != nil {
+   		return err
+   	}
+   }
+
+   func process(name string) error {
+   	f, err := os.Open(name)
+   	if err != nil {
+   		return err
+   	}
+   	defer f.Close() // ปิดเมื่อ process จบ = ทุกรอบ
+   	// ...
+   	return nil
+   }
+   ```
+
+</details>

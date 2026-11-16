@@ -1,0 +1,251 @@
+---
+title: Server Timeouts และ Graceful Shutdown
+description: ตั้ง timeout ของ http.Server ให้ปลอดภัย ปิด server อย่างนุ่มนวลเมื่อได้รับ SIGTERM และแยก health check เป็น liveness กับ readiness
+sidebar:
+  order: 12
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+## ปัญหาของ `http.ListenAndServe` แบบตรง ๆ
+
+ตัวอย่างใน tutorial ทั่วไปมักเขียนแค่
+
+```go
+http.ListenAndServe(":8080", mux)
+```
+
+ซึ่งมีปัญหาสองข้อเมื่อขึ้น production
+
+1. **ไม่มี timeout เลย** client ที่ช้า (หรือตั้งใจช้า) ถือ connection ค้างไว้ได้ตลอดไป
+2. **ตายทันทีเมื่อถูกสั่งหยุด** ตอน deploy version ใหม่ Docker / Kubernetes ส่ง `SIGTERM` มา process จบทันที request ที่กำลังทำงานอยู่ถูกตัดกลางทาง client ได้ connection reset
+
+หน้านี้แก้ทั้งสองข้อ
+
+## Timeout ของ `http.Server`
+
+```go title="internal/server/server.go"
+// New returns an *http.Server with production-safe timeouts.
+// The zero-value http.Server has NO timeouts, which lets slow clients
+// hold connections open forever.
+func New(addr string, h http.Handler, logger *slog.Logger) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
+}
+```
+
+| field | ค่า | ป้องกันอะไร |
+| --- | --- | --- |
+| `ReadHeaderTimeout` | 5s | เวลาอ่าน header ของ request กัน **Slowloris** |
+| `ReadTimeout` | 15s | เวลาอ่านทั้ง request (header + body) กัน client ที่ส่ง body ช้า ๆ |
+| `WriteTimeout` | 30s | นับจากอ่าน header เสร็จจนเขียน response เสร็จ |
+| `IdleTimeout` | 120s | connection แบบ keep-alive ที่ว่างอยู่ จะถูกปิดหลังจากนี้ |
+| `MaxHeaderBytes` | 1 MB | ขนาด header สูงสุด |
+| `ErrorLog` | slog | error ภายในของ `net/http` ออกเป็น structured log ระดับ WARN |
+
+**Slowloris** คือการโจมตีที่เปิด connection จำนวนมาก แล้วส่ง header ทีละไม่กี่ byte ไม่ให้จบ server ที่ไม่มี `ReadHeaderTimeout` จะรอไปเรื่อย ๆ จน connection หรือ memory หมด โดยผู้โจมตีใช้ bandwidth น้อยมาก (linter อย่าง gosec มีกฎ G112 เตือนเมื่อไม่ได้ตั้งค่านี้)
+
+ส่วน `ErrorLog` ใช้ `slog.NewLogLogger` แปลง `slog.Handler` เป็น `*log.Logger` แบบเก่าที่ `http.Server` ต้องการ ข้อความอย่าง `http: superfluous response.WriteHeader call` จึงออกมาเป็น JSON เหมือน log อื่น (ดู [logging ด้วย slog](/advanced/logging-slog/))
+
+<Aside type="caution">
+`WriteTimeout` แค่ปิด connection เมื่อหมดเวลา **ไม่ได้หยุด handler** handler ยังทำงานต่อจนเสร็จ การหยุดงานจริงต้องใช้ context tasks-api จึงมี middleware `Timeout` ที่ให้ทุก request มี deadline `REQUEST_TIMEOUT` (default 10s) ซึ่งตั้งให้ **น้อยกว่า** `WriteTimeout` เพื่อให้ handler ยังมีเวลาเขียน error 503 กลับไปได้ (ดู [Middleware](/web-api/middleware/))
+</Aside>
+
+## Graceful shutdown
+
+```go title="cmd/api/main.go"
+func main() {
+	// main only reports errors; all real work happens in run, which is
+	// easy to test and lets deferred cleanups run before the process exits.
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	// ctx is cancelled on Ctrl+C (SIGINT) or SIGTERM (docker stop, Kubernetes).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// ...
+
+	pool, err := postgres.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	// ...
+
+	authLimiter := mw.NewRateLimiter(cfg.AuthRateLimit, time.Minute)
+	go authLimiter.Cleanup(ctx, time.Minute)
+
+	// ...
+	srv := server.New(cfg.Addr, handler, logger)
+
+	// ---- Run until a signal arrives, then shut down gracefully ----
+	serverErr := make(chan error, 1)
+	go func() {
+		logger.Info("http server listening", "addr", cfg.Addr, "env", cfg.Env, "version", version)
+		serverErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErr:
+		// The server failed to start (e.g. port already in use).
+		return fmt.Errorf("http server: %w", err)
+	case <-ctx.Done():
+		logger.Info("shutdown signal received")
+	}
+
+	// Stop accepting new connections and wait for in-flight requests.
+	// Use a fresh context: ctx is already cancelled.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("graceful shutdown: %w", err)
+	}
+	if err := <-serverErr; !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	logger.Info("server stopped cleanly")
+	return nil
+}
+```
+
+### อธิบายทีละส่วน
+
+**1. `signal.NotifyContext`** สร้าง context ที่ถูก cancel เมื่อ process ได้รับ `SIGINT` (Ctrl+C) หรือ `SIGTERM` (สัญญาณที่ `docker stop` และ Kubernetes ส่งมา) ทั้งโปรแกรมจึงใช้ "การหยุด" เป็น context ตัวเดียว ส่งต่อให้ใครก็ได้ที่ต้องรู้ว่ากำลังจะปิด
+
+**2. รัน server ใน goroutine** `ListenAndServe` block จนกว่า server จะหยุด เราจึงรันมันใน goroutine แล้วส่งผลลัพธ์กลับทาง channel `serverErr` (buffer 1 เพื่อให้ goroutine ส่งค่าแล้วจบได้แม้ไม่มีใครรอรับ)
+
+**3. `select` รอสองเหตุการณ์**
+
+- `serverErr` มาก่อน แปลว่า start ไม่สำเร็จ เช่น port ถูกใช้อยู่ คืน error ออกไปเลย
+- `ctx.Done()` มาก่อน แปลว่าได้รับสัญญาณให้หยุด ไปขั้นตอน shutdown
+
+**4. `srv.Shutdown(shutdownCtx)`** ทำตามลำดับ
+
+<Steps>
+
+1. ปิด listener ทันที ไม่รับ connection ใหม่
+2. ปิด connection ที่ว่างอยู่ (idle keep-alive)
+3. รอให้ request ที่กำลังทำงานอยู่ตอบเสร็จ
+4. คืน `nil` เมื่อทุกอย่างเสร็จ หรือคืน error ของ context ถ้าเกิน `SHUTDOWN_TIMEOUT` (default 15s)
+
+</Steps>
+
+ต้องสร้าง context **ใหม่** จาก `context.Background()` เพราะ `ctx` เดิมถูก cancel ไปแล้ว ถ้าส่ง `ctx` เดิมเข้าไป `Shutdown` จะคืน error ทันทีโดยไม่รอใครเลย
+
+**5. `http.ErrServerClosed`** เมื่อเรียก `Shutdown` แล้ว `ListenAndServe` ใน goroutine จะคืน `http.ErrServerClosed` ทันที นี่คือ "การจบแบบปกติ" ไม่ใช่ error เราจึงอ่านค่าจาก `serverErr` อีกครั้งเพื่อยืนยัน
+
+**6. defer ทำงานครบ เพราะแยก `main` กับ `run`** ถ้าเรียก `os.Exit` หรือ `log.Fatal` ตรง ๆ defer จะไม่ทำงาน pattern `main` → `run() error` ทำให้ `run` return ปกติเสมอ `defer pool.Close()` จึงปิด connection กับ PostgreSQL อย่างสุภาพ แล้ว `main` ค่อยตัดสินใจ exit code ทีหลัง
+
+**7. goroutine อื่นหยุดตาม `ctx`** `authLimiter.Cleanup(ctx, time.Minute)` วน loop ลบ entry หมดอายุทุกนาที และออกจาก loop เมื่อ `ctx.Done()`
+
+```go title="internal/middleware/ratelimit.go"
+func (rl *RateLimiter) Cleanup(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// ... delete expired windows ...
+		}
+	}
+}
+```
+
+<Aside type="caution">
+ระวังเรื่องเวลาให้สอดคล้องกัน `docker stop` / `docker compose stop` รอ **10 วินาที** ตามค่า default แล้วส่ง `SIGKILL` ซึ่งน้อยกว่า `SHUTDOWN_TIMEOUT=15s` ของ tasks-api ถ้ามี request ช้าจริง ๆ อาจโดน kill ก่อน tasks-api จึงตั้ง `stop_grace_period: 20s` ไว้ใน `compose.yaml` หลักคือตั้ง grace period (หรือ `terminationGracePeriodSeconds` ใน Kubernetes ซึ่ง default 30 วินาที) ให้ **มากกว่า** `SHUTDOWN_TIMEOUT` เสมอ
+</Aside>
+
+<Aside type="tip">
+ใน tasks-api `stop()` ถูก defer ไว้จนจบ `run` ระหว่างกำลัง shutdown ถ้ากด Ctrl+C ซ้ำ สัญญาณจะถูกกลืนไป ถ้าอยากให้ Ctrl+C ครั้งที่สอง "บังคับปิด" ได้ทันที ให้เรียก `stop()` หลัง `<-ctx.Done()` เพื่อคืนพฤติกรรม default ของ signal
+</Aside>
+
+## ทดลอง
+
+รันด้วย Docker Compose แล้วสั่งหยุดเฉพาะ API
+
+```bash
+docker compose up --build -d
+docker compose stop api
+docker compose logs api
+```
+
+```text title="Output (ตัดบางบรรทัด)"
+{"time":"2026-11-16T04:34:42.781921833Z","level":"INFO","msg":"database migrated"}
+{"time":"2026-11-16T04:34:42.835529125Z","level":"INFO","msg":"http server listening","addr":":8080","env":"development","version":"dev"}
+...
+{"time":"2026-11-16T04:35:08.234703554Z","level":"INFO","msg":"shutdown signal received"}
+{"time":"2026-11-16T04:35:08.235127095Z","level":"INFO","msg":"server stopped cleanly"}
+```
+
+ไม่มี request ค้าง server จึงปิดเสร็จในไม่ถึง 1 ms ลองรันด้วย `make run` แล้วกด Ctrl+C ก็จะเห็นสองบรรทัดสุดท้ายแบบเดียวกัน
+
+## Health check: liveness vs readiness
+
+```go title="internal/server/server.go"
+	// Operational endpoints (not versioned).
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := d.DB.Ping(ctx); err != nil {
+			httpx.Logger(r.Context()).Warn("readiness check failed", "err", err)
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	})
+```
+
+| endpoint | คำถาม | ถ้าตอบไม่ผ่าน orchestrator จะ |
+| --- | --- | --- |
+| `/healthz` (liveness) | process ยังทำงานอยู่ไหม | **restart** container |
+| `/readyz` (readiness) | พร้อมรับ traffic ไหม (ต่อ database ได้) | **หยุดส่ง traffic** มาที่ instance นี้ชั่วคราว แต่ไม่ restart |
+
+ทำไมแยกกัน: ถ้า database ล่ม แล้ว liveness ไปเช็ก database ด้วย orchestrator จะ restart ทุก instance พร้อมกันวนไปเรื่อย ๆ ทั้งที่ restart ไม่ได้ช่วยอะไร liveness จึงควรตอบแค่ "process ยังไม่ค้าง" ส่วน readiness ค่อยเช็ก dependency
+
+- `/readyz` มี timeout ของตัวเอง 2 วินาที ไม่ให้ health check ค้างนาน
+- `DB` ใน `Deps` เป็น interface `Pinger` ที่มี method เดียว test จึงใส่ของปลอมได้
+- ทั้งสอง endpoint ไม่มี `/v1` เพราะเป็นของฝั่ง operation ไม่ใช่ API สำหรับ client
+
+ตัวอย่าง Kubernetes probe
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 8080 }
+  periodSeconds: 10
+readinessProbe:
+  httpGet: { path: /readyz, port: 8080 }
+  periodSeconds: 5
+```
+
+<Aside type="tip">
+ระบบที่ traffic สูงมักทำเพิ่มอีกขั้น คือเมื่อได้ SIGTERM ให้ `/readyz` เริ่มตอบ 503 ก่อน รอสักไม่กี่วินาทีให้ load balancer ถอด instance ออก แล้วค่อยเรียก `Shutdown` จะลด request ที่วิ่งเข้ามาช่วงปิดตัวได้ tasks-api ยังไม่ได้ทำส่วนนี้
+</Aside>
+
+## สรุป
+
+- `http.Server` ค่าว่างไม่มี timeout ต้องตั้ง `ReadHeaderTimeout` (กัน Slowloris), `ReadTimeout`, `WriteTimeout`, `IdleTimeout` และ `MaxHeaderBytes` เสมอ
+- `WriteTimeout` ไม่หยุด handler ต้องใช้ context timeout คู่กัน
+- `signal.NotifyContext` แปลง SIGINT / SIGTERM เป็น context ที่ใช้ทั้งโปรแกรม
+- รัน server ใน goroutine, `select` ระหว่าง error กับสัญญาณหยุด แล้ว `Shutdown` ด้วย context ใหม่ที่มี timeout
+- `http.ErrServerClosed` คือการปิดปกติ และ pattern `main` → `run` ทำให้ defer อย่าง `pool.Close()` ทำงานครบ
+- grace period ของ orchestrator ต้องนานกว่า `SHUTDOWN_TIMEOUT`
+- `/healthz` = liveness (process ยังอยู่), `/readyz` = readiness (ping database)

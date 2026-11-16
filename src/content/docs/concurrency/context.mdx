@@ -1,0 +1,218 @@
+---
+title: context
+description: ยกเลิกงาน กำหนด timeout/deadline และส่งค่าระดับ request ข้าม goroutine อย่างเป็นระบบด้วย package context
+sidebar:
+  order: 5
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/concurrency/context/main.go?raw';
+
+ลองนึกถึง HTTP request ที่ต้องเรียก database และ API ภายนอกอีกหลายตัว ถ้าผู้ใช้ปิดหน้าเว็บไปแล้ว
+หรือใช้เวลานานเกินกำหนด งานทั้งหมดที่แตกออกไปควร **หยุด** ไม่ใช่ทำต่อจนเสร็จแบบเปล่าประโยชน์
+package `context` คือวิธีมาตรฐานของ Go ในการส่งสัญญาณ **ยกเลิก**, **deadline** และ **ค่าระดับ request** ไปตามสายการเรียก
+
+## หน้าตาของ context.Context
+
+```go
+type Context interface {
+	Deadline() (deadline time.Time, ok bool) // มีกำหนดเวลาสิ้นสุดไหม
+	Done() <-chan struct{}                   // ถูกปิดเมื่อ context ถูกยกเลิก
+	Err() error                              // เหตุผล: Canceled หรือ DeadlineExceeded
+	Value(key any) any                       // ค่าที่แนบมา
+}
+```
+
+ส่วนที่ใช้บ่อยที่สุดคือ `Done()` — เป็น channel ที่ **ถูกปิด** เมื่อ context ถูกยกเลิก จึงใช้ใน `select` ได้
+
+## สร้าง context
+
+| function | ใช้เมื่อ |
+|---|---|
+| `context.Background()` | ราก (root) ของ context ใช้ใน `main`, init และ test |
+| `context.TODO()` | ยังไม่แน่ใจว่าจะใช้ context ไหน (placeholder ระหว่าง refactor) |
+| `context.WithCancel(parent)` | ต้องการยกเลิกเองด้วยมือ |
+| `context.WithTimeout(parent, d)` | ยกเลิกอัตโนมัติหลังเวลา `d` |
+| `context.WithDeadline(parent, t)` | ยกเลิกอัตโนมัติเมื่อถึงเวลา `t` |
+| `context.WithValue(parent, k, v)` | แนบค่าไปกับ context |
+| `context.WithCancelCause(parent)` | ยกเลิกพร้อมบอกสาเหตุ (Go 1.20+) |
+| `context.WithoutCancel(parent)` | ได้ค่าจาก parent แต่ไม่ถูกยกเลิกตาม (Go 1.21+) |
+
+ทุกตัวที่ขึ้นต้นด้วย `With...` (ยกเว้น `WithValue`/`WithoutCancel`) คืน **`cancel` function** มาด้วย
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/concurrency/context/main.go" />
+
+```text title="Output (ลำดับของ worker อาจสลับกัน)"
+timeout query: context deadline exceeded
+is DeadlineExceeded? true
+worker 1 stop: context canceled
+worker 2 stop: context canceled
+has deadline: true in future: true
+deadline ctx: context deadline exceeded
+request id: req-123
+err: context canceled
+cause: server shutting down
+```
+
+## อธิบายทีละส่วน
+
+### เคารพ ctx ในงานที่ใช้เวลา
+
+```go
+func slowQuery(ctx context.Context, d time.Duration) (string, error) {
+	select {
+	case <-time.After(d):
+		return "result", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+```
+
+context **ไม่ได้หยุด goroutine ให้เอง** มันแค่ส่งสัญญาณ function ต้องคอยเช็ค `ctx.Done()` แล้วเลิกทำเอง
+ใน library จริง เช่น `database/sql` หรือ `net/http` ทำส่วนนี้ให้แล้ว เราแค่ส่ง `ctx` ต่อไป
+
+```go
+row := db.QueryRowContext(ctx, "SELECT ...")
+req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+```
+
+### WithTimeout
+
+งานใช้ 500 ms แต่ timeout 100 ms → ได้ `context.DeadlineExceeded`
+ใช้ `errors.Is(err, context.DeadlineExceeded)` หรือ `errors.Is(err, context.Canceled)` เช็คสาเหตุ
+
+### การยกเลิกส่งต่อเป็นทอดๆ
+
+context เป็นโครงสร้างแบบ **tree** เมื่อยกเลิก parent ลูกทุกตัวจะถูกยกเลิกตาม
+ในตัวอย่าง worker ทั้งสองได้ `child` context แต่เมื่อเรียก `cancelParent()` ทั้งคู่หยุดพร้อมกัน
+
+```text
+Background
+ └── parent (WithCancel)   ← cancelParent()
+      ├── child 1          ← ถูกยกเลิกตาม
+      └── child 2          ← ถูกยกเลิกตาม
+```
+
+ในทางกลับกัน **ยกเลิกลูกไม่กระทบแม่** ลูกยังตั้ง timeout ที่ **สั้นกว่า** แม่ได้ แต่ยาวกว่าไม่ได้ (deadline ของแม่ยังมีผล)
+
+### WithDeadline
+
+เหมือน `WithTimeout` แต่ระบุเป็นเวลาจริง (`time.Time`) แทนระยะเวลา
+จริงๆ แล้ว `WithTimeout(ctx, d)` ก็คือ `WithDeadline(ctx, time.Now().Add(d))`
+
+### WithValue — ใช้อย่างประหยัด
+
+```go
+type ctxKey struct{} // key เป็น type ที่ไม่ export → ไม่ชนกับ package อื่น
+
+ctx = context.WithValue(ctx, ctxKey{}, "req-123")
+id, _ := ctx.Value(ctxKey{}).(string)
+```
+
+ใช้สำหรับ **ข้อมูลระดับ request** ที่ไหลผ่านหลายชั้น เช่น request ID, trace ID, ข้อมูลผู้ใช้ที่ login แล้ว
+
+<Aside type="caution" title="อย่าใช้ WithValue ส่ง parameter">
+- ห้ามใช้ส่ง dependency หรือ option ของ function (เช่น database connection, logger config) — ส่งเป็น parameter ตรงๆ
+- ห้ามใช้ `string` หรือ built-in type เป็น key เพราะชนกับ package อื่นได้ ให้สร้าง type ของตัวเอง
+- ค่าใน context ไม่มี type safety และมองไม่เห็นจาก signature ของ function ใช้มากไปจะทำให้ code อ่านยาก
+</Aside>
+
+### context.Cause
+
+`ctx.Err()` บอกได้แค่ `canceled` หรือ `deadline exceeded` ถ้าอยากรู้ **ว่าทำไม** ใช้ `WithCancelCause`
+
+```go
+ctx, cancel := context.WithCancelCause(parent)
+cancel(ErrShutdown)
+ctx.Err()            // context canceled
+context.Cause(ctx)   // server shutting down
+```
+
+มี `WithTimeoutCause` และ `WithDeadlineCause` (Go 1.21+) ให้ใช้ในแนวเดียวกัน
+
+## กฎการใช้ context
+
+<Aside type="tip" title="ข้อตกลงที่ทุกคนใน Go ใช้">
+1. **ctx เป็น parameter ตัวแรก** และตั้งชื่อว่า `ctx`: `func Fetch(ctx context.Context, id int) (*User, error)`
+2. **อย่าเก็บ ctx ไว้ใน struct** ให้ส่งผ่าน parameter ทุกครั้ง
+3. **อย่าส่ง nil** ถ้าไม่รู้จะใช้อะไร ใช้ `context.TODO()`
+4. **เรียก `cancel()` เสมอ** ด้วย `defer cancel()` ทันทีหลังสร้าง แม้งานจะเสร็จก่อน timeout ก็ตาม
+   ไม่งั้น resource ของ timer และ context จะค้างจนกว่า parent จะถูกยกเลิก (`go vet` มี check `lostcancel` ช่วยจับ)
+5. ใน HTTP handler ใช้ `r.Context()` ซึ่งจะถูกยกเลิกเมื่อ client ตัดการเชื่อมต่อ
+</Aside>
+
+```go
+func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	user, err := h.store.FindUser(ctx, r.PathValue("id"))
+	// ...
+}
+```
+
+### WithoutCancel
+
+บางครั้งต้องทำงานต่อแม้ request จบแล้ว เช่น เขียน audit log หลังตอบ client
+`context.WithoutCancel(ctx)` ให้ context ที่ยังมีค่า (Value) จาก parent แต่ **ไม่ถูกยกเลิกตาม**
+
+```go
+go writeAuditLog(context.WithoutCancel(r.Context()), event)
+```
+
+context ยังเป็นหัวใจของการปิด server อย่างนุ่มนวล ดูต่อที่ [Graceful shutdown](/web-api/graceful-shutdown/)
+
+## แบบฝึกหัด
+
+1. เขียน `func fetchWithTimeout(url string, d time.Duration) error` ที่ใช้ `http.NewRequestWithContext` กับ `context.WithTimeout`
+2. แก้ `worker` ในตัวอย่างให้ใช้ `time.NewTicker` แทน `time.After` ใน loop (ทำไมถึงดีกว่า)
+3. code นี้มีปัญหาอะไร
+
+   ```go
+   func process(ctx context.Context) {
+   	ctx, _ = context.WithTimeout(ctx, time.Second)
+   	doWork(ctx)
+   }
+   ```
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+func fetchWithTimeout(url string, d time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+// 2 — ticker ตัวเดียวใช้ซ้ำทุกรอบ ไม่ต้องสร้าง timer ใหม่ทุกรอบเหมือน time.After
+func worker(ctx context.Context, id int, done chan<- struct{}) {
+	defer func() { done <- struct{}{} }()
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+```
+
+3. ทิ้ง `cancel` ไป ทำให้ resource ของ context ไม่ถูกคืนจนกว่าจะหมดเวลา (`go vet` จะเตือน `lostcancel`)
+   ต้องเขียน `ctx, cancel := context.WithTimeout(ctx, time.Second)` แล้ว `defer cancel()`
+
+</details>

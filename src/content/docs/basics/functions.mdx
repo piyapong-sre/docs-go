@@ -1,0 +1,219 @@
+---
+title: Functions
+description: ประกาศ function, คืนค่าหลายค่า, named results, variadic, function เป็นค่า (first-class), closure และ defer
+sidebar:
+  order: 4
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import functionsSrc from '../../../../examples/learn/basics/functions/main.go?raw';
+
+function เป็นหน่วยหลักของการจัดโครงสร้าง code ใน Go จุดที่ทำให้ Go ต่างจากหลายภาษาคือ **คืนค่าได้หลายค่า** (ซึ่งเป็นพื้นฐานของการจัดการ error) และ **function เป็นค่า (first-class)** ที่ส่งต่อ เก็บในตัวแปร หรือสร้างขึ้นตอน runtime ได้
+
+## ตัวอย่างรวม
+
+<Code code={functionsSrc} lang="go" title="examples/learn/basics/functions/main.go" />
+
+```text title="Output"
+5
+10 / 4 = 2.5
+error: หารด้วยศูนย์ไม่ได้
+min: 2 max: 9
+0 3 10
+60
+HELLO GO!
+1 2 3
+1
+จบ main
+defer 2
+defer 1
+defer 0
+```
+
+## ประกาศ function
+
+```go
+func add(a, b int) int {
+	return a + b
+}
+```
+
+- `func` ชื่อ (parameter) type ที่คืน
+- parameter ที่ type เดียวกันติดกันเขียนรวบได้: `a, b int` แทน `a int, b int`
+- type อยู่ **หลัง** ชื่อตัวแปรเสมอ
+- Go ไม่มี default parameter และไม่มี function overloading (ชื่อซ้ำกันใน package เดียวกันไม่ได้)
+
+<Aside>
+Go ส่ง argument แบบ **pass by value** เสมอ คือ function ได้รับ **สำเนา** ของค่า ถ้าต้องการให้ function แก้ค่าต้นฉบับได้ ต้องส่ง pointer (ดูบท [Pointers](/basics/pointers/)) ส่วน slice และ map แม้จะถูก copy เช่นกัน แต่สำเนายังชี้ไปที่ข้อมูลชุดเดียวกัน
+</Aside>
+
+## คืนค่าหลายค่า
+
+```go
+func divide(a, b float64) (float64, error) {
+	if b == 0 {
+		return 0, errors.New("หารด้วยศูนย์ไม่ได้")
+	}
+	return a / b, nil
+}
+```
+
+รูปแบบ `(ผลลัพธ์, error)` คือหัวใจของ Go — ไม่มี exception ทุก function ที่อาจล้มเหลวจะคืน `error` เป็นค่าสุดท้าย และผู้เรียกต้องตรวจเอง
+
+```go
+q, err := divide(10, 4)
+if err != nil {
+	// จัดการ error
+}
+
+_, err = divide(1, 0) // ใช้ _ (blank identifier) ทิ้งค่าที่ไม่ต้องการ
+```
+
+รายละเอียดเรื่อง error จะอยู่ในบท [Error handling](/intermediate/errors/)
+
+## Named results
+
+ตั้งชื่อให้ค่าที่คืนได้ ชื่อเหล่านั้นจะเป็นตัวแปรที่เริ่มต้นด้วย zero value
+
+```go
+func minMax(nums []int) (lo, hi int) {
+	lo, hi = nums[0], nums[0]
+	for _, n := range nums[1:] {
+		lo = min(lo, n)
+		hi = max(hi, n)
+	}
+	return lo, hi
+}
+```
+
+ข้อดีหลักคือ **เป็นเอกสารในตัว** — เห็น signature `(lo, hi int)` ก็รู้ทันทีว่าค่าไหนคืออะไร
+
+<Aside type="caution" title="ระวัง naked return">
+ถ้ามี named results จะเขียน `return` เฉย ๆ (naked return) ก็ได้ ซึ่งจะคืนค่าตัวแปรเหล่านั้น แต่ทำให้ function ยาว ๆ อ่านยาก เพราะต้องย้อนไปดูว่าตอนนั้นตัวแปรมีค่าอะไร แนะนำให้ `return lo, hi` ระบุชัดเจน และใช้ naked return เฉพาะ function สั้นมาก ๆ
+</Aside>
+
+## Variadic function
+
+ใส่ `...` หน้า type ของ parameter **ตัวสุดท้าย** เพื่อรับ argument กี่ตัวก็ได้ (รวมถึง 0 ตัว) ภายใน function จะเห็นเป็น slice
+
+```go
+func sum(nums ...int) int { // nums มี type เป็น []int
+	total := 0
+	for _, n := range nums {
+		total += n
+	}
+	return total
+}
+
+sum()           // 0
+sum(1, 2, 3, 4) // 10
+
+scores := []int{10, 20, 30}
+sum(scores...)  // 60: ใส่ ... หลัง slice เพื่อ "กระจาย" เป็น argument
+```
+
+`fmt.Println(a ...any)` ที่ใช้มาตลอดก็เป็น variadic function
+
+## Function เป็นค่า (first-class)
+
+function มี type และใช้เหมือนค่าทั่วไปได้: เก็บในตัวแปร ส่งเป็น argument คืนจาก function อื่น หรือเก็บใน slice/map
+
+```go
+// function literal (anonymous function) เก็บใส่ตัวแปร
+shout := func(s string) string { return strings.ToUpper(s) + "!" }
+
+// ตั้งชื่อ function type เพื่อให้ signature อ่านง่าย
+type transform func(string) string
+
+func applyAll(s string, fns ...transform) string {
+	for _, fn := range fns {
+		s = fn(s)
+	}
+	return s
+}
+
+applyAll("  hello go  ", strings.TrimSpace, shout) // "HELLO GO!"
+```
+
+สังเกตว่าส่ง `strings.TrimSpace` ซึ่งเป็น function จาก standard library เข้าไปได้ตรง ๆ เพราะมี signature `func(string) string` ตรงกัน
+
+zero value ของ function type คือ `nil` การเรียก function ที่เป็น `nil` จะ panic
+
+## Closure
+
+function literal **จับ (capture) ตัวแปรจาก scope รอบนอก** ได้ และตัวแปรนั้นจะอยู่ต่อไปตราบที่ closure ยังถูกใช้งาน
+
+```go
+func counter() func() int {
+	count := 0
+	return func() int {
+		count++ // ใช้ count ของ counter() ที่จบไปแล้ว
+		return count
+	}
+}
+
+next := counter()
+fmt.Println(next(), next(), next()) // 1 2 3
+other := counter()
+fmt.Println(other())                // 1 — มี count เป็นของตัวเอง
+```
+
+closure ใช้บ่อยกับ callback, middleware ของ HTTP server, การสร้าง function ที่ตั้งค่าไว้ล่วงหน้า และ goroutine
+
+<Aside type="caution">
+closure จับ **ตัวแปร** ไม่ใช่ค่า ณ ขณะนั้น ถ้าตัวแปรถูกแก้ภายหลัง closure จะเห็นค่าใหม่ด้วย และถ้าหลาย goroutine ใช้ closure ที่แก้ตัวแปรเดียวกันพร้อมกันจะเกิด data race (เรียนในบท [Concurrency](/concurrency/goroutines/))
+</Aside>
+
+## `defer`
+
+`defer` เลื่อนการเรียก function ไปทำ **ตอนที่ function ปัจจุบันจบ** (ไม่ว่าจะจบด้วย `return` หรือ panic) ถ้ามีหลาย `defer` จะทำแบบ **LIFO** (เข้าหลังออกก่อน) ในตัวอย่างจึงพิมพ์ `defer 2`, `defer 1`, `defer 0` หลัง `จบ main`
+
+ใช้บ่อยที่สุดกับการคืน resource ให้ระบบ โดยวาง `defer` ไว้ติดกับจุดที่เปิด resource
+
+```go
+f, err := os.Open("data.txt")
+if err != nil {
+	return err
+}
+defer f.Close() // ปิดไฟล์แน่นอนเมื่อ function จบ
+```
+
+<Aside type="caution">
+argument ของ function ที่ `defer` จะถูกประเมินค่า **ทันทีตอนเจอ `defer`** ไม่ใช่ตอนที่ function ทำงานจริง เช่น `defer fmt.Println(x)` จะพิมพ์ค่า `x` ณ บรรทัดนั้น และอย่าใส่ `defer` ใน loop ที่วนหลายรอบ เพราะทุก defer จะค้างไว้จนกว่า function จะจบ
+</Aside>
+
+<Aside type="tip" title="ออกแบบ function ให้ดี">
+- ตั้งชื่อสั้นและชัด ไม่ต้องซ้ำกับชื่อ package (`strings.Split` ไม่ใช่ `strings.StringSplit`)
+- function ที่อาจล้มเหลวให้คืน `error` เป็นค่าสุดท้ายเสมอ
+- ถ้า parameter เยอะเกินไป (เกิน 4–5 ตัว) พิจารณารวมเป็น struct
+</Aside>
+
+## แบบฝึกหัด
+
+1. เขียน `func average(nums ...float64) (float64, error)` ที่คืน error เมื่อไม่มีตัวเลขส่งเข้ามา
+2. เขียน `func multiplier(n int) func(int) int` ที่คืน closure สำหรับคูณด้วย `n` เช่น `double := multiplier(2); double(5)` ได้ `10`
+3. เขียน `func filter(nums []int, keep func(int) bool) []int` แล้วใช้กรองเฉพาะเลขคู่จาก `[]int{1, 2, 3, 4, 5, 6}`
+
+<details>
+<summary>เฉลยข้อ 2 และ 3</summary>
+
+```go
+func multiplier(n int) func(int) int {
+	return func(x int) int { return x * n }
+}
+
+func filter(nums []int, keep func(int) bool) []int {
+	var out []int
+	for _, n := range nums {
+		if keep(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+evens := filter([]int{1, 2, 3, 4, 5, 6}, func(n int) bool { return n%2 == 0 })
+fmt.Println(evens) // [2 4 6]
+```
+
+</details>

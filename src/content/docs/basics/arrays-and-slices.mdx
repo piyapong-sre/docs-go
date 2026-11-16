@@ -1,0 +1,201 @@
+---
+title: Array และ Slice
+description: ความต่างระหว่าง array กับ slice, len/cap, append และการขยายขนาด, กับดักการแชร์ backing array, copy และ package slices
+sidebar:
+  order: 5
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import slicesSrc from '../../../../examples/learn/basics/slices/main.go?raw';
+
+slice คือโครงสร้างข้อมูลที่ใช้บ่อยที่สุดใน Go — แทบทุกครั้งที่ต้องเก็บ "รายการของสิ่งต่าง ๆ" เราใช้ slice แต่การจะใช้ slice ได้อย่างมั่นใจ ต้องเข้าใจว่ามันทำงานอยู่บน **array** อย่างไร เพราะ bug ที่เจอบ่อยหลายตัวมาจากตรงนี้
+
+## ตัวอย่างรวม
+
+<Code code={slicesSrc} lang="go" title="examples/learn/basics/slices/main.go" />
+
+```text title="Output"
+array: [1 2 3] [100 2 3] 3
+slice: [10 20 30 40 50] len: 5 cap: 5
+make: [] 0 3
+len=1  cap 0 -> 4
+len=5  cap 4 -> 8
+len=9  cap 8 -> 16
+part: [20 30] len: 2 cap: 4
+s after part[0]=999: [10 999 30 40 50]
+s after append(part): [10 999 30 777 50]
+s after append(safe): [10 999 30 777 50] safe: [999 30 555]
+copied 5 items: [-1 999 30 777 50] original: [10 999 30 777 50]
+sorted: [1 2 5 8 9] original: [5 2 8 1 9]
+contains 8: true index of 8: 2
+max: 9 min: 1
+binary search 8: 3 true
+odd only: [5 1 9]
+equal: true
+true false 0 0
+[ok]
+```
+
+## Array: ขนาดคงที่
+
+```go
+var a [3]int            // [0 0 0]
+b := [3]int{1, 2, 3}
+c := [...]string{"a", "b"} // ให้ compiler นับขนาดเอง: [2]string
+```
+
+- **ขนาดเป็นส่วนหนึ่งของ type** — `[3]int` กับ `[4]int` เป็นคนละ type กัน
+- array เป็น **value**: assign หรือส่งเข้า function = copy ทั้งก้อน (ในตัวอย่าง แก้ `b` แล้ว `a` ไม่เปลี่ยน)
+- เปรียบเทียบด้วย `==` ได้ถ้าสมาชิกเปรียบเทียบได้
+
+ในทางปฏิบัติ **ไม่ค่อยใช้ array ตรง ๆ** นอกจากกรณีที่ขนาดตายตัวจริง ๆ เช่น hash (`[32]byte`) หรือพิกัด `[2]float64`
+
+## Slice: มุมมองไปยัง array
+
+slice ประกอบด้วย 3 ส่วน (เรียกว่า slice header)
+
+| ส่วน | ความหมาย |
+| --- | --- |
+| pointer | ชี้ไปยังสมาชิกตัวแรกของ slice ใน array เบื้องหลัง (backing array) |
+| `len` | จำนวนสมาชิกที่ใช้อยู่ |
+| `cap` | จำนวนสมาชิกที่รองรับได้ นับจากจุดเริ่มต้นไปถึงท้าย backing array |
+
+```go
+s := []int{10, 20, 30}      // slice literal (ไม่ระบุขนาดใน [])
+m := make([]int, 0, 10)     // len 0, cap 10
+z := make([]int, 3)         // len 3, cap 3: [0 0 0]
+var n []int                 // nil slice: len 0, cap 0
+```
+
+<Aside type="tip" title="จอง cap ล่วงหน้า">
+ถ้ารู้จำนวนสมาชิกโดยประมาณ ให้ใช้ `make([]T, 0, n)` แล้ว `append` จะช่วยลดการจองหน่วยความจำใหม่และการ copy ซ้ำ ๆ
+</Aside>
+
+## `append` และการขยายขนาด
+
+```go
+s = append(s, 40)
+s = append(s, 50, 60)
+s = append(s, other...) // ต่อ slice อีกตัว
+```
+
+`append` ทำงานแบบนี้
+
+1. ถ้า `cap` ยังพอ → เขียนสมาชิกใหม่ลงใน backing array **เดิม** แล้วคืน slice ที่ `len` เพิ่มขึ้น
+2. ถ้า `cap` ไม่พอ → จอง array **ใหม่** ที่ใหญ่ขึ้น copy ข้อมูลเดิมไป แล้วคืน slice ที่ชี้ไป array ใหม่
+
+ในตัวอย่าง จะเห็นว่า `cap` ขยายแบบก้าวกระโดด (ไม่ได้เพิ่มทีละ 1) เพื่อให้ `append` เฉลี่ยแล้วเร็ว
+
+<Aside type="caution" title="ต้องรับค่าที่ append คืนเสมอ">
+เขียน `s = append(s, x)` ทุกครั้ง ห้ามเขียน `append(s, x)` เฉย ๆ (compile ไม่ผ่านอยู่แล้ว) และห้ามคิดว่า slice เดิมจะเปลี่ยนตาม เพราะ slice ที่คืนมาอาจชี้ไปยัง array ใหม่
+
+ตัวเลข `cap` ที่ได้หลังขยาย **ขึ้นกับเวอร์ชันของ Go และ runtime** (output ข้างบนมาจาก Go 1.27 เวอร์ชันอื่นอาจได้ 1, 2, 4, 8, 16) อย่าเขียน code ที่พึ่งพาตัวเลขเหล่านี้
+</Aside>
+
+## Slicing และกับดัก "แชร์ backing array"
+
+`s[low:high]` สร้าง slice ใหม่ที่มีสมาชิกตั้งแต่ index `low` ถึง `high-1` ละ `low` ได้ (`s[:3]`) ละ `high` ได้ (`s[2:]`)
+
+**slice ใหม่ไม่ได้ copy ข้อมูล** แต่ชี้ไปที่ backing array เดียวกัน
+
+```go
+s := []int{10, 20, 30, 40, 50}
+part := s[1:3]   // [20 30], len 2, cap 4 (นับจาก index 1 ถึงท้าย array)
+
+part[0] = 999    // s กลายเป็น [10 999 30 40 50]
+```
+
+ที่อันตรายกว่าคือ `append` บน sub-slice ที่ยังมี `cap` เหลือ — มันจะเขียนทับข้อมูลของ slice ต้นทางโดยไม่มีใครรู้ตัว
+
+```go
+part = append(part, 777) // cap ยังเหลือ → เขียนลง s[3]
+// s กลายเป็น [10 999 30 777 50]  ← 40 หายไป!
+```
+
+### แก้ด้วย full slice expression หรือ copy
+
+`s[low:high:max]` จำกัด `cap` ของ slice ใหม่ให้เท่ากับ `max-low` เมื่อ `append` เกินจะถูกบังคับให้จอง array ใหม่ ไม่ทับข้อมูลเดิม
+
+```go
+safe := s[1:3:3]          // len 2, cap 2
+safe = append(safe, 555)  // จอง array ใหม่, s ไม่เปลี่ยน
+```
+
+หรือถ้าต้องการสำเนาที่อิสระจริง ๆ ใช้ `slices.Clone(s)` หรือ `copy`
+
+<Aside type="caution" title="ส่ง slice เข้า function">
+slice ถูกส่งแบบ value ก็จริง แต่ที่ถูก copy คือ **header** (pointer, len, cap) ไม่ใช่ข้อมูล ดังนั้น function ที่แก้ `s[i]` จะกระทบ slice ของผู้เรียก แต่ถ้า function `append` จนเกิน cap ผู้เรียกจะไม่เห็นสมาชิกใหม่ — ถ้า function ต้องเพิ่มสมาชิก ให้คืน slice ใหม่ออกมา (แบบเดียวกับ `append`)
+</Aside>
+
+## `copy`
+
+```go
+dst := make([]int, len(s))
+n := copy(dst, s) // คืนจำนวนสมาชิกที่ copy = min(len(dst), len(src))
+```
+
+`copy` คัดลอกข้อมูลจริง ได้ slice ที่ไม่แชร์ข้อมูลกับต้นทาง ต้องจอง `dst` ให้มี `len` พอ (ถ้า `dst` มี len 0 จะ copy ได้ 0 ตัว)
+
+## Package `slices`
+
+ตั้งแต่ Go 1.21 มี package `slices` ใน standard library ที่ใช้ได้กับ slice ทุก type (ใช้ [generics](/intermediate/generics/))
+
+| Function | ทำอะไร |
+| --- | --- |
+| `slices.Sort(s)` | เรียงจากน้อยไปมาก (แก้ slice เดิม) |
+| `slices.SortFunc(s, cmp)` | เรียงตามเงื่อนไขที่กำหนด |
+| `slices.Contains(s, v)` | มี `v` หรือไม่ |
+| `slices.Index(s, v)` | index ของ `v` ตัวแรก หรือ `-1` |
+| `slices.Max(s)` / `slices.Min(s)` | ค่ามากสุด/น้อยสุด (panic ถ้า slice ว่าง) |
+| `slices.BinarySearch(s, v)` | ค้นหาใน slice ที่เรียงแล้ว คืน index และ found |
+| `slices.Clone(s)` | สร้างสำเนา |
+| `slices.Equal(a, b)` | เปรียบเทียบทีละสมาชิก |
+| `slices.Reverse(s)` | กลับลำดับ |
+| `slices.DeleteFunc(s, f)` | ลบสมาชิกที่ `f` คืน `true` (คืน slice ใหม่) |
+| `slices.Insert(s, i, v...)` | แทรกที่ index `i` |
+
+<Aside type="tip">
+ก่อนเขียน loop เอง ลองดูก่อนว่า `slices` มี function ที่ต้องการหรือไม่ — code จะสั้นลงและถูกต้องกว่า เอกสารเต็มอยู่ที่ [pkg.go.dev/slices](https://pkg.go.dev/slices)
+</Aside>
+
+## nil slice กับ empty slice
+
+```go
+var a []string   // nil slice: a == nil เป็น true
+b := []string{}  // empty slice: b == nil เป็น false
+```
+
+ทั้งคู่มี `len` เป็น 0, ใช้ `range` และ `append` ได้เหมือนกัน จึง **ควรเช็คว่าว่างด้วย `len(s) == 0`** ไม่ใช่ `s == nil`
+
+ข้อแตกต่างที่เห็นได้คือเวลาแปลงเป็น JSON: nil slice ได้ `null` ส่วน empty slice ได้ `[]`
+
+## Slice หลายมิติ
+
+```go
+grid := make([][]int, 3)
+for i := range grid {
+	grid[i] = make([]int, 4) // แต่ละแถวต้อง make แยก
+}
+grid[1][2] = 7
+```
+
+## แบบฝึกหัด
+
+1. เขียน function `reverse(s []int) []int` ที่คืน slice ใหม่ที่กลับลำดับ **โดยไม่แก้ slice เดิม** แล้วเทียบกับการใช้ `slices.Clone` + `slices.Reverse`
+2. ทำนายผลลัพธ์ของ code นี้ก่อนรัน แล้วอธิบายว่าทำไม
+
+   ```go
+   a := []int{1, 2, 3, 4}
+   b := a[:2]
+   b = append(b, 99)
+   fmt.Println(a, b)
+   ```
+
+3. เขียน function `removeAt(s []string, i int) []string` ที่ลบสมาชิกตำแหน่ง `i` (ลองใช้ `slices.Delete`)
+
+<details>
+<summary>เฉลยข้อ 2</summary>
+
+ได้ `[1 2 99 4] [1 2 99]` เพราะ `b` มี len 2 แต่ cap 4 การ `append` จึงเขียนลง backing array เดิมที่ index 2 ทำให้ค่า `3` ใน `a` ถูกทับ ถ้าต้องการกันไม่ให้ทับ ใช้ `b := a[:2:2]`
+
+</details>

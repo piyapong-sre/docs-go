@@ -1,0 +1,200 @@
+---
+title: Method
+description: ผูก function เข้ากับ type ด้วย method และเลือกใช้ value receiver หรือ pointer receiver ให้ถูกที่
+sidebar:
+  order: 1
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/intermediate/methods/main.go?raw';
+
+Go ไม่มี class แต่เราผูก function เข้ากับ type ได้ด้วย **method** ทำให้ data กับพฤติกรรมอยู่ด้วยกัน
+และเป็นพื้นฐานของ [interface](/intermediate/interfaces/) ที่จะเรียนบทถัดไป
+
+## Method คืออะไร
+
+method คือ function ที่มี **receiver** อยู่ระหว่างคำว่า `func` กับชื่อ function
+
+```go
+type Rect struct {
+	Width, Height float64
+}
+
+//   receiver
+//   ↓↓↓↓↓↓
+func (r Rect) Area() float64 {
+	return r.Width * r.Height
+}
+
+r := Rect{Width: 3, Height: 4}
+r.Area() // 12
+```
+
+- receiver `r` ทำหน้าที่คล้าย `this` หรือ `self` ในภาษาอื่น แต่ตั้งชื่อเองได้ ธรรมเนียมคือใช้ตัวอักษร 1-2 ตัวแรกของชื่อ type (เช่น `r` สำหรับ `Rect`) ไม่ใช้ `this`/`self`
+- ประกาศ method ได้กับ type ที่ **อยู่ใน package เดียวกัน** เท่านั้น จะไปเพิ่ม method ให้ `int` หรือ `time.Time` ตรงๆ ไม่ได้
+- ไม่จำกัดแค่ struct: named type อะไรก็ได้ เช่น `type Celsius float64` ก็มี method ได้
+
+## Value receiver vs Pointer receiver
+
+นี่คือเรื่องที่สำคัญที่สุดของบทนี้
+
+| | Value receiver `(c Counter)` | Pointer receiver `(c *Counter)` |
+|---|---|---|
+| receiver ที่ได้รับ | **สำเนา** ของค่า | pointer ชี้ไปที่ค่าตัวจริง |
+| แก้ field แล้วมีผลกับตัวจริงไหม | ไม่มีผล | มีผล |
+| ต้นทุนการ copy | copy ทั้ง struct ทุกครั้งที่เรียก | copy แค่ pointer (8 bytes) |
+
+ดูตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/intermediate/methods/main.go" />
+
+```text title="Output"
+area: 12
+visits=2
+clicks=1
+36.6°C = 97.88°F
+visits=4
+```
+
+### อธิบายทีละส่วน
+
+- `Inc()` ใช้ pointer receiver จึงเพิ่ม `count` ของตัวจริง ส่วน `IncWrong()` ใช้ value receiver ได้แค่สำเนา เรียกไปก็ไม่มีผล ผลลัพธ์จึงเป็น `visits=2` ไม่ใช่ 3
+- `c.Inc()` ทั้งที่ `c` ไม่ใช่ pointer — Go แปลงเป็น `(&c).Inc()` ให้อัตโนมัติ เพราะ `c` เป็นตัวแปรที่หา address ได้ ในทางกลับกัน ถ้ามี pointer `p` แล้วเรียก method ที่เป็น value receiver Go ก็แปลงเป็น `(*p).Area()` ให้เช่นกัน
+- `fmt.Println(p)` พิมพ์ `clicks=1` เพราะ `*Counter` มี method `String() string` จึงเป็น `fmt.Stringer` (ดูเพิ่มใน [Interface](/intermediate/interfaces/))
+- `inc := c.Inc` เรียกว่า **method value** คือผูก method กับ receiver ไว้เป็น function ปกติ ส่งต่อหรือเรียกทีหลังได้ เนื่องจาก `Inc` เป็น pointer receiver ตัวที่ผูกไว้คือ `&c` การเรียก `inc()` จึงแก้ `c` ตัวจริง
+
+## เลือกใช้แบบไหนดี
+
+ใช้ **pointer receiver** เมื่อ
+
+1. method ต้อง **แก้ไข** receiver
+2. struct **ใหญ่** การ copy ทุกครั้งเปลือง
+3. struct มี field ที่ห้าม copy เช่น `sync.Mutex` (ดู [sync](/concurrency/sync/))
+4. method อื่นของ type นี้ใช้ pointer receiver อยู่แล้ว — **ให้ใช้แบบเดียวกันทั้ง type**
+
+ใช้ **value receiver** เมื่อ
+
+- type เล็กและ immutable เช่น `Point`, `Celsius`, `time.Time`
+- เป็น map, func, chan หรือ slice ที่ไม่ต้อง reslice/append (ข้างในเป็น reference อยู่แล้ว)
+
+<Aside type="tip" title="กฎง่ายๆ">
+ถ้าลังเล ให้ใช้ **pointer receiver** และใช้แบบเดียวกันทุก method ของ type นั้น
+การผสมสองแบบทำให้ method set สับสนและเป็นต้นเหตุของบั๊กเวลา implement interface
+</Aside>
+
+## Method set
+
+**method set** คือชุดของ method ที่ type หนึ่ง "มี" ซึ่งเป็นตัวตัดสินว่า type นั้น implement interface ได้หรือไม่
+
+| Type | method set ประกอบด้วย |
+|---|---|
+| `T` | method ที่เป็น value receiver `(t T)` เท่านั้น |
+| `*T` | method ทั้ง `(t T)` และ `(t *T)` |
+
+ผลที่ตามมาคือ
+
+```go
+type Stringer interface{ String() string }
+
+// String ใช้ pointer receiver
+func (c *Counter) String() string { ... }
+
+var s1 Stringer = &Counter{} // ✅ *Counter มี String()
+var s2 Stringer = Counter{}  // ❌ compile error:
+// Counter does not implement Stringer (method String has pointer receiver)
+```
+
+เหตุผลคือค่าที่อยู่ใน interface อาจเป็นค่าที่หา address ไม่ได้ Go จึงไม่ยอมแอบสร้าง pointer ให้ในกรณีนี้
+(ต่างจากการเรียก `c.Inc()` กับตัวแปรตรงๆ ที่ Go แปลงให้ได้)
+
+<Aside type="caution" title="value receiver แก้ค่าไม่ได้ และไม่มี error เตือน">
+บั๊กที่เจอบ่อยมากคือเขียน setter ด้วย value receiver
+
+```go
+func (u User) SetName(n string) { u.Name = n } // แก้แค่สำเนา!
+```
+
+code compile ผ่าน รันได้ แต่ค่าไม่เปลี่ยน `go vet` ก็ไม่เตือน ต้องระวังเอง
+</Aside>
+
+## Method บน type ที่ไม่ใช่ struct
+
+named type ทุกแบบมี method ได้ ใช้บ่อยกับ enum หรือหน่วยวัด
+
+```go
+type Status int
+
+const (
+	Active Status = iota
+	Suspended
+)
+
+func (s Status) String() string {
+	switch s {
+	case Active:
+		return "active"
+	case Suspended:
+		return "suspended"
+	default:
+		return "unknown"
+	}
+}
+
+fmt.Println(Suspended) // suspended
+```
+
+## Embedding กับ method promotion
+
+ถ้า embed struct หนึ่งไว้ในอีก struct method ของตัวที่ถูก embed จะถูก "promote" ขึ้นมาให้เรียกได้ตรงๆ
+(ทบทวนเรื่อง embedding ได้ที่ [Struct](/basics/structs/))
+
+```go
+type Logger struct{ prefix string }
+
+func (l *Logger) Log(msg string) { fmt.Println(l.prefix + msg) }
+
+type Service struct {
+	*Logger // embed
+	name string
+}
+
+s := Service{Logger: &Logger{prefix: "[svc] "}, name: "api"}
+s.Log("started") // [svc] started — เรียก method ของ Logger ได้เลย
+```
+
+นี่ไม่ใช่ inheritance: `Service` ไม่ได้ "เป็น" `Logger` แค่ forward การเรียกไปให้เท่านั้น
+
+## แบบฝึกหัด
+
+1. สร้าง type `BankAccount` ที่มี field `balance float64` และ method `Deposit(amount float64)`, `Withdraw(amount float64) error` (คืน error ถ้าเงินไม่พอ) และ `Balance() float64` ควรใช้ receiver แบบไหน
+2. code นี้พิมพ์อะไร เพราะอะไร
+
+   ```go
+   type P struct{ X int }
+   func (p P) Move() { p.X++ }
+   p := P{}
+   p.Move()
+   fmt.Println(p.X)
+   ```
+
+3. ทำไม `var s fmt.Stringer = Counter{}` compile ไม่ผ่าน ถ้า `String()` ใช้ pointer receiver
+
+<details>
+<summary>เฉลย</summary>
+
+1. ใช้ pointer receiver ทุก method (รวม `Balance()` ด้วยเพื่อความสม่ำเสมอ) เพราะ `Deposit`/`Withdraw` ต้องแก้ `balance`
+
+   ```go
+   func (a *BankAccount) Withdraw(amount float64) error {
+   	if amount > a.balance {
+   		return errors.New("insufficient funds")
+   	}
+   	a.balance -= amount
+   	return nil
+   }
+   ```
+
+2. พิมพ์ `0` เพราะ `Move` ใช้ value receiver จึงแก้แค่สำเนา
+3. method set ของ `Counter` (ไม่ใช่ pointer) ไม่รวม method ที่เป็น pointer receiver ต้องใช้ `&Counter{}` แทน
+
+</details>

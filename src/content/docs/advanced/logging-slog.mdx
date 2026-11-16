@@ -1,0 +1,197 @@
+---
+title: Structured Logging ด้วย slog
+description: ใช้ log/slog เขียน log แบบมีโครงสร้าง ทั้ง level, attribute, group, context และการซ่อนข้อมูลลับ
+sidebar:
+  order: 2
+---
+
+import { Aside, Code, Tabs, TabItem } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/advanced/logging/main.go?raw';
+
+## ทำไมต้อง structured logging
+
+package `log` แบบเดิมเขียนข้อความเป็นบรรทัดอิสระ เช่น `user 7 login from 10.0.0.1` ซึ่งคนอ่านเข้าใจ แต่เครื่องค้นหาหรือกรองยาก
+
+**Structured logging** เก็บ log เป็นคู่ key/value เช่น `{"msg":"login","user_id":7,"ip":"10.0.0.1"}` ทำให้ระบบอย่าง Loki, Elasticsearch, CloudWatch หรือ Datadog query ได้ทันที เช่น "ขอ log ทั้งหมดของ `user_id=7`"
+
+ตั้งแต่ Go 1.21 มี `log/slog` ใน standard library แล้ว จึงไม่จำเป็นต้องพึ่ง library ภายนอกสำหรับงานส่วนใหญ่
+
+## แนวคิดหลัก
+
+| ส่วนประกอบ | หน้าที่ |
+| --- | --- |
+| `*slog.Logger` | ตัวที่เราเรียก `Info`, `Warn`, `Error` |
+| `slog.Handler` | ตัดสินว่าจะเขียน log ออกไปรูปแบบไหน ที่ไหน |
+| `slog.Attr` | คู่ key/value หนึ่งคู่ |
+| `slog.Level` | `Debug` (-4), `Info` (0), `Warn` (4), `Error` (8) |
+
+## ตัวอย่างครบในไฟล์เดียว
+
+<Code code={src} lang="go" title="examples/learn/advanced/logging/main.go" />
+
+```text title="Output"
+level=DEBUG msg="กำลังโหลด config" path=config.yaml
+level=INFO msg="server started" port=8080
+{"level":"WARN","msg":"disk usage high","percent":91}
+{"level":"INFO","msg":"handling request","request_id":"req-42","method":"GET","path":"/users"}
+{"level":"INFO","msg":"db query","db":{"table":"users","took":150000000}}
+{"level":"INFO","msg":"user login","user":{"id":7,"email":"a@example.com"},"password":"[REDACTED]"}
+{"level":"ERROR","msg":"payment failed","order_id":"o-1001","err":"i/o timeout"}
+{"level":"INFO","msg":"ใช้ default logger แล้ว"}
+```
+
+<Aside type="note">
+ในตัวอย่างนี้ใช้ `ReplaceAttr` ลบ field `time` ออกเพื่อให้ output คงที่ ของจริงควรเก็บเวลาไว้ ซึ่งจะได้ `time=2026-...` หรือ `"time":"2026-..."` นำหน้าทุกบรรทัด
+</Aside>
+
+## อธิบายทีละส่วน
+
+### TextHandler vs JSONHandler
+
+<Tabs>
+<TabItem label="TextHandler">
+```go
+slog.New(slog.NewTextHandler(os.Stdout, nil))
+```
+ได้รูปแบบ `key=value` (logfmt) อ่านง่ายใน terminal เหมาะกับตอนพัฒนา
+</TabItem>
+<TabItem label="JSONHandler">
+```go
+slog.New(slog.NewJSONHandler(os.Stdout, nil))
+```
+ได้ JSON หนึ่ง object ต่อบรรทัด เหมาะกับ production ที่ส่ง log เข้าระบบรวม log
+</TabItem>
+</Tabs>
+
+ทั้งสองตัวรับ `*slog.HandlerOptions` ซึ่งมี field สำคัญคือ
+
+- `Level` กำหนด level ต่ำสุดที่จะเขียน (ค่าเริ่มต้นคือ `Info` จึงไม่เห็น `Debug`)
+- `AddSource: true` แนบชื่อไฟล์และบรรทัดที่เรียก log
+- `ReplaceAttr` แก้ไขหรือลบ attribute ก่อนเขียน เช่น เปลี่ยนชื่อ key หรือ format เวลา
+
+ถ้าอยากเปลี่ยน level ระหว่างแอปทำงาน ใช้ `slog.LevelVar` แทนค่าคงที่
+
+```go
+var level slog.LevelVar // ค่าเริ่มต้น Info
+h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &level})
+// ภายหลัง เช่น จาก env หรือ admin endpoint
+level.Set(slog.LevelDebug)
+```
+
+### Attribute สองแบบ
+
+```go
+logger.Info("msg", "port", 8080)               // แบบ key, value สลับกัน สั้น
+logger.Info("msg", slog.Int("port", 8080))     // แบบ typed Attr ปลอดภัยกว่า
+logger.LogAttrs(ctx, slog.LevelInfo, "msg",    // เร็วที่สุด allocate น้อยสุด
+	slog.Int("port", 8080))
+```
+
+แบบ key/value สะดวก แต่ถ้าลืมใส่ value สักตัว จะได้ key แปลก ๆ ชื่อ `!BADKEY` โชคดีที่ `go vet` มี analyzer ชื่อ `slog` คอยตรวจให้
+
+### `slog.With` สำหรับ attribute ที่ใช้ซ้ำ
+
+`logger.With(...)` คืน logger ตัวใหม่ที่แนบ attribute ไว้ทุกบรรทัด เหมาะกับข้อมูลระดับ request เช่น `request_id`, `user_id` สร้างครั้งเดียวที่ต้น handler แล้วส่งต่อ
+
+### Group
+
+`slog.Group("db", ...)` รวม attribute เป็นกลุ่ม JSONHandler จะออกเป็น object ซ้อน ส่วน TextHandler จะออกเป็น `db.table=users` นอกจากนี้ `logger.WithGroup("db")` จะทำให้ attribute ทุกตัวหลังจากนั้นอยู่ใต้กลุ่มเดียวกัน
+
+<Aside type="note">
+JSONHandler เขียน `time.Duration` เป็นจำนวน nanoseconds (`150000000`) ส่วน TextHandler เขียนเป็น `150ms` ถ้าอยากได้ string ใน JSON ให้ใช้ `slog.String("took", d.String())`
+</Aside>
+
+### ซ่อนข้อมูลลับด้วย `LogValuer`
+
+type ใดก็ตามที่มี method `LogValue() slog.Value` handler จะเรียก method นี้แทนการใช้ค่าตรง ๆ เราจึงใช้มันเพื่อ
+
+- แทนรหัสผ่าน token หรือเลขบัตรด้วย `[REDACTED]`
+- เลือกเฉพาะบาง field ของ struct (เช่น `User` ข้างบนไม่ log `Password` เลย)
+
+ข้อดีคือป้องกันที่ระดับ type ใครก็ตามที่เผลอ log `User` ทั้งก้อนก็ไม่ทำให้ข้อมูลรั่ว
+
+<Aside type="caution">
+อย่า log ข้อมูลลับหรือข้อมูลส่วนบุคคล (password, token, API key, เลขบัตรประชาชน) ตรง ๆ เด็ดขาด log มักถูกเก็บนาน ถูก copy ไปหลายระบบ และคนเข้าถึงได้มากกว่า database ใช้ `LogValuer` หรือ `ReplaceAttr` กรองไว้ตั้งแต่ต้นทาง
+</Aside>
+
+### Context
+
+ทุก method มีคู่แบบ `...Context` เช่น `InfoContext(ctx, ...)` ซึ่งส่ง `ctx` ให้ handler ตัว built-in ไม่ได้อ่านอะไรจาก context แต่เราห่อ handler เองเพื่อดึงค่า เช่น request id หรือ trace id ได้
+
+```go
+type ctxKey struct{}
+
+// ContextHandler ห่อ handler เดิม แล้วดึง request_id จาก context มาใส่ทุก record
+type ContextHandler struct {
+	slog.Handler
+}
+
+func (h ContextHandler) Handle(ctx context.Context, r slog.Record) error {
+	if id, ok := ctx.Value(ctxKey{}).(string); ok {
+		r.AddAttrs(slog.String("request_id", id))
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+// ใช้งาน
+logger := slog.New(ContextHandler{slog.NewJSONHandler(os.Stdout, nil)})
+ctx := context.WithValue(context.Background(), ctxKey{}, "req-42")
+logger.InfoContext(ctx, "fetch user", "user_id", 7)
+```
+
+```text title="Output"
+{"time":"...","level":"INFO","msg":"fetch user","user_id":7,"request_id":"req-42"}
+```
+
+เรื่อง `context.Context` อ่านเพิ่มที่ [Context](/concurrency/context/) และการใส่ logger ลงใน HTTP middleware ดูที่ [Middleware](/web-api/middleware/)
+
+### ตั้งเป็น default
+
+`slog.SetDefault(logger)` ทำให้
+
+- ฟังก์ชันระดับ package อย่าง `slog.Info(...)` ใช้ logger นี้
+- `log.Printf` ของ package `log` แบบเดิมก็ถูกส่งต่อเข้า handler นี้ด้วย (ที่ level Info) ทำให้ library เก่าที่ยังใช้ `log` ได้ log รูปแบบเดียวกัน
+
+<Aside type="tip">
+แนวทางที่ใช้กันบ่อย: อ่าน env เช่น `APP_ENV` ถ้าเป็น `production` ใช้ JSONHandler level Info ถ้าเป็น dev ใช้ TextHandler level Debug แล้ว `SetDefault` ครั้งเดียวใน `main` ส่วนใน test ใช้ `slog.New(slog.DiscardHandler)` (Go 1.24+) เพื่อปิด log
+</Aside>
+
+## แบบฝึกหัด
+
+1. เขียน `type APIKey string` ที่เวลา log จะแสดงแค่ 4 ตัวอักษรท้าย เช่น `****abcd`
+2. ใช้ `ReplaceAttr` เปลี่ยนชื่อ key `msg` เป็น `message` (บางระบบรวม log ต้องการชื่อนี้)
+3. สร้าง logger ที่เปลี่ยน level ได้ตอนรันด้วย `slog.LevelVar` แล้วทดลองสลับระหว่าง Info กับ Debug
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+type APIKey string
+
+func (k APIKey) LogValue() slog.Value {
+	if len(k) <= 4 {
+		return slog.StringValue("****")
+	}
+	return slog.StringValue("****" + string(k[len(k)-4:]))
+}
+
+// 2
+opts := &slog.HandlerOptions{
+	ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.MessageKey && len(groups) == 0 {
+			a.Key = "message"
+		}
+		return a
+	},
+}
+
+// 3
+var lv slog.LevelVar
+logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: &lv}))
+logger.Debug("ไม่แสดง")
+lv.Set(slog.LevelDebug)
+logger.Debug("แสดงแล้ว")
+```
+
+</details>

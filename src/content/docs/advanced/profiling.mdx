@@ -1,0 +1,222 @@
+---
+title: Profiling ด้วย pprof
+description: วัดก่อนแก้ ใช้ benchmark, pprof, net/http/pprof, trace และ PGO หาจุดที่ช้าหรือกิน memory จริง ๆ
+sidebar:
+  order: 5
+---
+
+import { Aside, Code, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/advanced/profiling/main.go?raw';
+import testSrc from '../../../../examples/learn/advanced/profiling/main_test.go?raw';
+
+## วัดก่อน แล้วค่อยแก้
+
+เดาว่าโค้ดช้าตรงไหนมักผิด **Profiling** คือการเก็บข้อมูลจริงระหว่างโปรแกรมทำงานว่า CPU หรือ memory ไปหมดที่ฟังก์ชันไหน Go มีเครื่องมือครบใน toolchain
+
+| เครื่องมือ | ตอบคำถาม |
+| --- | --- |
+| Benchmark (`go test -bench`) | ฟังก์ชันนี้เร็วแค่ไหน allocate กี่ครั้ง |
+| CPU profile | เวลา CPU หมดไปที่ฟังก์ชันไหน |
+| Heap / alloc profile | memory ถูกจองที่บรรทัดไหน |
+| Goroutine / block / mutex profile | goroutine ค้างหรือรอ lock ที่ไหน |
+| Execution trace | timeline ของ goroutine, GC, scheduler |
+
+## ทวน benchmark
+
+benchmark คือฟังก์ชัน `BenchmarkXxx(b *testing.B)` ในไฟล์ `_test.go` (ทวนได้ที่ [Testing](/intermediate/testing/)) ตั้งแต่ Go 1.24 ใช้ `for b.Loop()` ได้เลย ไม่ต้องจัดการ `b.N` และ `b.ResetTimer()` เอง
+
+ตัวอย่างนี้เปรียบเทียบฟังก์ชันนับคำสองแบบ
+
+<Code code={src} lang="go" title="examples/learn/advanced/profiling/main.go" />
+
+<Code code={testSrc} lang="go" title="examples/learn/advanced/profiling/main_test.go" />
+
+```sh
+cd examples/learn/advanced/profiling
+go test -run '^$' -bench . -benchmem
+```
+
+```text title="Output"
+goos: darwin
+goarch: arm64
+pkg: learn/advanced/profiling
+cpu: Apple M4 Pro
+BenchmarkWordFreqSlow-12    	    2400	    473860 ns/op	  481805 B/op	    8003 allocs/op
+BenchmarkWordFreqFast-12    	    3890	    324203 ns/op	   85464 B/op	       5 allocs/op
+PASS
+ok  	learn/advanced/profiling	2.870s
+```
+
+- `-run '^$'` ไม่รัน test ปกติ รันแต่ benchmark
+- `-benchmem` (หรือ `b.ReportAllocs()`) แสดง `B/op` และ `allocs/op`
+- ตัวเลขแต่ละเครื่องต่างกัน ให้ดู**อัตราส่วน**ระหว่างสองเวอร์ชัน ในที่นี้แบบ Fast allocate น้อยกว่าเกือบ 6 เท่าและเร็วขึ้นราว 30%
+
+<Aside type="tip">
+ตัวเลข benchmark แกว่งได้ ให้รันหลายรอบด้วย `-count=10` แล้วเปรียบเทียบด้วย `benchstat` (`go install golang.org/x/perf/cmd/benchstat@latest`) ซึ่งบอกได้ว่าความต่างมีนัยสำคัญทางสถิติหรือไม่
+</Aside>
+
+## CPU และ memory profile จาก test
+
+เพิ่ม flag ให้ `go test` เขียน profile ออกมา
+
+```sh
+go test -run '^$' -bench . -cpuprofile cpu.out -memprofile mem.out
+```
+
+ได้ไฟล์ `cpu.out`, `mem.out` และ test binary `profiling.test` (ใช้สำหรับอ่าน symbol) จากนั้นเปิดด้วย `go tool pprof`
+
+<Tabs>
+<TabItem label="top">
+```sh
+go tool pprof -top -sample_index=alloc_space mem.out
+```
+
+```text title="Output (ตัดบางส่วน)"
+Type: alloc_space
+      flat  flat%   sum%        cum   cum%
+  750.57MB 50.99% 50.99%   750.57MB 50.99%  strings.Fields
+  546.23MB 37.11% 88.10%   546.23MB 37.11%  internal/bytealg.MakeNoZero
+  155.32MB 10.55% 98.65%   155.32MB 10.55%  strings.genSplit
+   13.54MB  0.92% 99.57%   319.23MB 21.69%  learn/advanced/profiling.wordFreqFast
+       2MB  0.14% 99.70%  1147.89MB 77.98%  learn/advanced/profiling.wordFreqSlow
+```
+</TabItem>
+<TabItem label="list">
+```sh
+go tool pprof -list 'wordFreqSlow' mem.out
+```
+
+```text title="Output (ตัดบางส่วน)"
+ROUTINE ======================== learn/advanced/profiling.wordFreqSlow in .../profiling/main.go
+       2MB     1.12GB (flat, cum) 77.98% of Total
+         .          .     14:func wordFreqSlow(text string) map[string]int {
+       1MB        1MB     15:	counts := map[string]int{}
+         .   155.32MB     16:	for _, line := range strings.Split(text, "\n") {
+         .   990.57MB     17:		for _, w := range strings.Fields(strings.ToLower(line)) {
+       1MB        1MB     18:			counts[w]++
+```
+</TabItem>
+<TabItem label="web UI">
+```sh
+go tool pprof -http=:8080 cpu.out
+```
+
+เปิด browser ให้ดูได้ทั้ง flame graph, graph, source และ top ในหน้าเดียว (มุมมอง graph ต้องติดตั้ง Graphviz)
+</TabItem>
+</Tabs>
+
+### อ่านค่า flat กับ cum
+
+- **flat** เวลา/memory ที่ใช้**ในฟังก์ชันนั้นเอง**
+- **cum** (cumulative) รวมฟังก์ชันที่มันเรียกต่อด้วย
+
+`wordFreqSlow` มี flat แค่ 2MB แต่ cum 1.12GB แปลว่าตัวมันเองไม่ได้จองอะไร แต่ไปเรียก `strings.Fields` และ `strings.ToLower` ที่จองเยอะ และ `list` ชี้ชัดว่าบรรทัด 17 คือตัวการ
+
+คำสั่งที่ใช้บ่อยในโหมด interactive (`go tool pprof cpu.out`) ได้แก่ `top`, `top -cum`, `list <regex>`, `peek <regex>` และ `web`
+
+Heap profile มี sample index หลายแบบ: `inuse_space` (ค่าเริ่มต้น memory ที่ยังใช้อยู่ ใช้หา memory leak) และ `alloc_space` (ยอดจองสะสม ใช้หาจุดที่สร้างขยะให้ GC เยอะ)
+
+## เก็บ profile จากโปรแกรมเอง
+
+ฟังก์ชัน `main` ในตัวอย่างใช้ `runtime/pprof` เก็บ profile ตรง ๆ เหมาะกับ CLI หรือ batch job
+
+```text title="Output"
+unique words: 6
+wrote cpu.pprof and mem.pprof to temp dir
+ดูผลด้วย: go tool pprof -top <temp dir>/cpu.pprof
+```
+
+ขั้นตอนคือ `pprof.StartCPUProfile(f)` → ทำงาน → `pprof.StopCPUProfile()` ส่วน heap ใช้ `pprof.WriteHeapProfile(f)` ณ จุดที่อยากได้ snapshot
+
+## Profile service ที่รันอยู่ด้วย net/http/pprof
+
+สำหรับ web service การ import `net/http/pprof` จะลงทะเบียน endpoint `/debug/pprof/` ให้ แต่แนะนำให้แยก mux และฟังเฉพาะ localhost
+
+```go
+import (
+	"log"
+	"net/http"
+	"net/http/pprof"
+)
+
+func main() {
+	app := http.NewServeMux()
+	// ... route ของแอป
+
+	// mux สำหรับ debug แยกต่างหาก ฟังเฉพาะ localhost
+	debug := http.NewServeMux()
+	debug.HandleFunc("/debug/pprof/", pprof.Index)
+	debug.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	debug.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	debug.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	debug.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	go func() {
+		log.Println(http.ListenAndServe("127.0.0.1:6060", debug))
+	}()
+	log.Fatal(http.ListenAndServe(":8080", app))
+}
+```
+
+แล้วดึง profile จากเครื่องที่รันอยู่
+
+```sh
+go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30   # CPU 30 วินาที
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap                 # heap
+go tool pprof http://127.0.0.1:6060/debug/pprof/goroutine            # goroutine ทั้งหมด
+```
+
+<Aside type="caution">
+**ห้ามเปิด `/debug/pprof` สู่ internet** endpoint เหล่านี้เปิดเผย command line, โครงสร้างโค้ด, และ memory ของโปรเซส อีกทั้ง CPU profile/trace เป็นงานหนักที่คนนอกยิงซ้ำเพื่อทำ DoS ได้
+
+ระวังเป็นพิเศษกับ `import _ "net/http/pprof"` เพราะมันลงทะเบียนเข้า `http.DefaultServeMux` แบบเงียบ ๆ ถ้าแอปเสิร์ฟด้วย `DefaultServeMux` (เช่น `http.ListenAndServe(":8080", nil)`) endpoint จะโผล่บน port สาธารณะทันที ให้ใช้ mux แยก ฟัง `127.0.0.1` หรือวางหลัง authentication / network ภายในเท่านั้น
+</Aside>
+
+## Execution trace
+
+profile บอกว่า "อะไรใช้ทรัพยากรเยอะ" แต่ trace บอกว่า "เกิดอะไรขึ้นเมื่อไหร่" เช่น goroutine ถูก block นานเพราะอะไร GC หยุดโลกตอนไหน เหมาะกับปัญหา latency และ concurrency
+
+```sh
+go test -run TestSomething -trace trace.out
+go tool trace trace.out    # เปิด web UI
+```
+
+หรือเก็บจาก service ผ่าน `/debug/pprof/trace?seconds=5` ส่วน Go 1.25 มี `trace.FlightRecorder` ใน `runtime/trace` ที่เก็บ trace ช่วงล่าสุดไว้ใน memory ตลอดเวลา แล้วเขียนออกเมื่อเกิดเหตุการณ์ผิดปกติ เช่น request ช้ากว่าเกณฑ์
+
+## Profile-Guided Optimization (PGO)
+
+PGO ให้ compiler ใช้ CPU profile จาก production มาช่วยตัดสินใจ optimize เช่น inline ฟังก์ชันที่ถูกเรียกบ่อย โดยไม่ต้องแก้โค้ดเลย
+
+<Steps>
+
+1. เก็บ CPU profile ตัวแทนจาก production (เช่น ผ่าน `/debug/pprof/profile?seconds=30`)
+2. ตั้งชื่อไฟล์ว่า `default.pgo` แล้ววางในโฟลเดอร์ของ `package main` เช่น `cmd/api/default.pgo`
+3. `go build` ตามปกติ ค่าเริ่มต้น `-pgo=auto` จะหยิบ `default.pgo` มาใช้เอง
+4. commit `default.pgo` ไว้ใน repo และอัปเดตเป็นระยะ
+
+</Steps>
+
+ทีม Go รายงานว่าโปรแกรมทั่วไปเร็วขึ้นราว 2-7% เป็นการได้ประสิทธิภาพเพิ่ม "ฟรี" ที่คุ้มค่าสำหรับ service ที่ใช้ CPU เยอะ
+
+<Aside type="tip">
+ลำดับที่แนะนำ: benchmark เพื่อยืนยันว่ามีปัญหา → profile หาจุด → แก้ทีละจุด → benchmark อีกครั้งเพื่อยืนยันว่าดีขึ้นจริง ถ้าเกี่ยวกับ memory อ่านต่อที่ [Memory และ GC](/advanced/memory/)
+</Aside>
+
+<Aside type="note">
+ไฟล์ `*.test`, `*.out`, `*.pprof` ที่ได้จากการ profile ไม่ควร commit (ยกเว้น `default.pgo`) เพิ่มลง `.gitignore` ไว้
+</Aside>
+
+## แบบฝึกหัด
+
+1. รัน benchmark ในตัวอย่างด้วย `-cpuprofile` แล้วใช้ `go tool pprof -top -cum` หาว่าฟังก์ชันไหนของ standard library กิน CPU มากที่สุดใน `wordFreqFast`
+2. ลองเขียน `wordFreqFast` ให้เร็วขึ้นอีก (ใบ้: ไม่ต้อง `ToLower` ทั้งข้อความ ถ้ารู้ว่ามีคำไม่กี่แบบ) แล้ววัดผลด้วย benchmark
+3. แอปของคุณใช้ `http.ListenAndServe(":8080", nil)` และมี `import _ "net/http/pprof"` อยู่ในโค้ด มีความเสี่ยงอะไร และแก้อย่างไร
+
+<details>
+<summary>เฉลย</summary>
+
+1. จะเห็น `strings.ToLower` และ `strings.FieldsSeq` ใน top รองลงมาคือ `runtime.mapassign_faststr` (การเขียนลง map) ผลแต่ละเครื่องอาจต่างกันเล็กน้อย
+2. ตัวอย่างแนวทาง: วนด้วย `strings.FieldsSeq(text)` โดยไม่ lower ทั้งข้อความ แล้วเรียก `strings.ToLower(w)` เฉพาะคำที่มีตัวพิมพ์ใหญ่ (ToLower คืน string เดิมโดยไม่ allocate ถ้าไม่มีอะไรต้องเปลี่ยน) จากนั้นวัดด้วย `-benchmem -count=10` + benchstat ก่อนสรุปเสมอ ไม่ใช่ทุกไอเดียจะเร็วขึ้นจริง
+3. `/debug/pprof/` จะเปิดบน port 8080 สาธารณะ ใครก็ดึง profile หรือยิง CPU profile ซ้ำ ๆ ได้ แก้โดยใช้ `http.NewServeMux()` ของตัวเองให้แอป และลงทะเบียน pprof บน mux แยกที่ฟัง `127.0.0.1:6060`
+
+</details>

@@ -1,0 +1,193 @@
+---
+title: Struct
+description: สร้างชนิดข้อมูลของตัวเองด้วย struct, struct literal, anonymous struct, embedding, struct tag และการเปรียบเทียบ
+sidebar:
+  order: 8
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import structsSrc from '../../../../examples/learn/basics/structs/main.go?raw';
+
+struct คือการรวม field หลายตัว (ซึ่งอาจเป็นคนละ type) ไว้เป็นก้อนเดียว เป็นวิธีหลักในการสร้าง **ชนิดข้อมูลของตัวเอง** ใน Go — Go ไม่มี class แต่ใช้ struct ร่วมกับ [method](/intermediate/methods/) และ [interface](/intermediate/interfaces/) แทน
+
+## ตัวอย่างรวม
+
+<Code code={structsSrc} lang="go" title="examples/learn/basics/structs/main.go" />
+
+```text title="Output"
+สมชาย เชียงใหม่
+เชียงใหม่
+{ID:1 Name:สมชาย Email: Address:{City:เชียงใหม่ Country:TH} password:}
+"" 0 ""
+สมชาย สมหญิง
+localhost 8080
+1 -> 2
+5 -> 10
+p1 == p2: true
+true false
+{"id":1,"name":"สมชาย","City":"เชียงใหม่","Country":"TH"}
+```
+
+## ประกาศ struct
+
+```go
+type Point struct {
+	X, Y int // field ที่ type เดียวกันเขียนรวมบรรทัดได้
+}
+
+type User struct {
+	ID       int
+	Name     string
+	password string // ตัวพิมพ์เล็ก = unexported
+}
+```
+
+กฎเรื่องตัวพิมพ์ใหญ่ใช้กับ field ด้วย: field ที่ขึ้นต้นด้วย **ตัวพิมพ์ใหญ่** package อื่นเข้าถึงได้ ส่วน **ตัวพิมพ์เล็ก** ใช้ได้เฉพาะใน package เดียวกัน (package อย่าง `encoding/json` ก็มองไม่เห็น field เหล่านี้ด้วย)
+
+## สร้างค่า: struct literal
+
+```go
+// ระบุชื่อ field (แนะนำ) — ลำดับไม่สำคัญ ไม่ใส่ field ไหนก็ได้ zero value
+u := User{ID: 1, Name: "สมชาย"}
+
+// ไม่ระบุชื่อ field — ต้องใส่ครบทุก field ตามลำดับ
+p := Point{1, 2}
+
+// zero value: ทุก field เป็น zero value
+var empty User
+
+// ได้ pointer ไปยัง struct ใหม่ (ใช้บ่อยมาก)
+up := &User{ID: 2, Name: "สมหญิง"}
+fmt.Println(up.Name) // Go dereference ให้อัตโนมัติ ไม่ต้องเขียน (*up).Name
+```
+
+<Aside type="tip" title="ระบุชื่อ field เสมอ">
+แบบไม่ระบุชื่อ field (`Point{1, 2}`) สั้นก็จริง แต่ถ้าวันหนึ่งมีคนเพิ่มหรือสลับลำดับ field ใน struct code ทุกที่จะ compile ไม่ผ่านหรือ **ผ่านแต่ค่าผิด field** ใช้ได้เฉพาะ struct เล็ก ๆ ที่ลำดับชัดเจนมาก เช่น พิกัด `X, Y` (`go vet` จะเตือนเมื่อใช้แบบไม่ระบุชื่อกับ struct จาก package อื่น)
+</Aside>
+
+`%+v` ใน `Printf` พิมพ์ struct พร้อมชื่อ field ช่วยได้มากตอน debug (ส่วน `%v` พิมพ์แค่ค่า และ `%#v` พิมพ์แบบ Go syntax)
+
+## struct เป็น value type
+
+assign หรือส่ง struct เข้า function = **copy ทุก field** ในตัวอย่าง แก้ `u2.Name` แล้ว `u.Name` ไม่เปลี่ยน
+
+```go
+u2 := u          // copy
+u2.Name = "สมหญิง"
+// u.Name ยังเป็น "สมชาย"
+```
+
+ถ้าต้องการให้ function แก้ struct ต้นฉบับได้ หรือ struct มีขนาดใหญ่ ให้ส่ง pointer (`*User`) ดูบท [Pointers](/basics/pointers/)
+
+<Aside type="caution">
+การ copy struct เป็นแบบ **ตื้น (shallow)** ถ้า field เป็น slice, map หรือ pointer สำเนาจะยังชี้ไปที่ข้อมูลชุดเดียวกัน แก้ข้อมูลในนั้นผ่านสำเนาจะกระทบต้นฉบับด้วย
+</Aside>
+
+## Anonymous struct
+
+struct ที่ไม่ตั้งชื่อ type ใช้ครั้งเดียวแล้วทิ้ง
+
+```go
+config := struct {
+	Host string
+	Port int
+}{"localhost", 8080}
+```
+
+ใช้บ่อยใน 2 กรณี: **table-driven test** (slice ของ anonymous struct เก็บ input/expected) และเป็นโครงสร้างชั่วคราวสำหรับแปลงเป็น JSON (ดูบท [Testing](/intermediate/testing/))
+
+## Embedding
+
+ใส่ type ไว้ใน struct **โดยไม่ตั้งชื่อ field** เรียกว่า embedding field และ method ของ type ที่ฝังจะถูก "ยกระดับ" (promote) ขึ้นมาให้เรียกได้โดยตรง
+
+```go
+type Address struct {
+	City    string
+	Country string
+}
+
+type User struct {
+	Name string
+	Address // embedded: ชื่อ field คือชื่อ type "Address"
+}
+
+u := User{Name: "สมชาย", Address: Address{City: "เชียงใหม่"}}
+u.City         // promoted field
+u.Address.City // เขียนเต็มก็ได้
+```
+
+<Aside type="note" title="embedding ไม่ใช่ inheritance">
+embedding คือ **composition** — `User` *มี* `Address` อยู่ข้างใน ไม่ใช่ `User` *เป็น* `Address` ส่ง `User` ไปที่ function ที่รับ `Address` ไม่ได้ ถ้ามี field ชื่อซ้ำกัน field ของ struct ชั้นนอกจะบังของชั้นใน
+</Aside>
+
+## Struct tag
+
+ข้อความใน backtick หลัง field คือ **struct tag** เป็น metadata ที่ package อื่นอ่านผ่าน reflection เพื่อปรับพฤติกรรม ตัวที่ใช้บ่อยที่สุดคือ `json`
+
+```go
+type User struct {
+	ID    int    `json:"id"`              // ใช้ชื่อ key "id"
+	Email string `json:"email,omitempty"` // ไม่ใส่ key ถ้าค่าเป็น zero value
+	Token string `json:"-"`               // ไม่ encode field นี้เลย
+}
+```
+
+ใน output ของตัวอย่างจะเห็นว่า
+
+- `ID` และ `Name` ใช้ชื่อตาม tag (`id`, `name`)
+- `Email` ว่างจึงถูกตัดออกเพราะ `omitempty`
+- field ของ `Address` ที่ embed ไว้ถูกยกขึ้นมาอยู่ระดับเดียวกัน (`City`, `Country`) และใช้ชื่อ field ตรง ๆ เพราะไม่มี tag
+- `password` ไม่ปรากฏเพราะเป็น unexported
+
+tag อื่นที่พบบ่อย เช่น `db:"..."` (library ฐานข้อมูล), `validate:"..."` (library validation) ซึ่งจะเห็นในส่วน [สร้าง Web API](/web-api/overview/)
+
+<Aside type="caution">
+รูปแบบ tag ต้องเป็น `key:"value"` เป๊ะ ๆ ห้ามมีช่องว่างหลัง `:` เช่น `` `json: "id"` `` จะถูกเพิกเฉยแบบเงียบ ๆ (แต่ `go vet` จับได้)
+</Aside>
+
+## เปรียบเทียบ struct
+
+struct เปรียบเทียบด้วย `==` ได้ **ถ้าทุก field เปรียบเทียบได้** — จะเท่ากันเมื่อทุก field เท่ากัน
+
+```go
+Point{1, 2} == Point{1, 2} // true
+```
+
+struct ที่เปรียบเทียบได้ยังใช้เป็น **key ของ map** ได้ด้วย เช่น `map[Point]bool` สำหรับเก็บพิกัดที่เคยไปแล้ว
+
+ถ้า struct มี field เป็น slice, map หรือ function จะใช้ `==` ไม่ได้ (compile error) ต้องเขียน function เปรียบเทียบเอง หรือใช้ `slices.Equal` / `maps.Equal` กับ field เหล่านั้น
+
+## Empty struct
+
+`struct{}` ไม่มี field เลยและ **ใช้หน่วยความจำ 0 byte** ใช้เมื่อสนใจแค่การมีอยู่ ไม่สนใจค่า เช่น ทำ set ด้วย map
+
+```go
+seen := map[string]struct{}{}
+seen["go"] = struct{}{}
+_, ok := seen["go"] // true
+```
+
+## แบบฝึกหัด
+
+1. สร้าง struct `Product` ที่มี `Name`, `Price` (float64), `Tags` ([]string) แล้วสร้าง slice ของ product 3 ชิ้น พิมพ์ชื่อสินค้าที่ราคาเกิน 100
+2. สร้าง struct `Employee` ที่ embed struct `Person` (`Name`, `Age`) และมี `Position` เพิ่ม ลองเรียก `e.Name` และพิมพ์ด้วย `%+v`
+3. ใส่ json tag ให้ `Product` ข้อ 1 โดยให้ key เป็นตัวพิมพ์เล็ก และไม่ส่ง `Tags` ถ้าว่าง แล้วลอง `json.Marshal`
+
+<details>
+<summary>เฉลยข้อ 3</summary>
+
+```go
+type Product struct {
+	Name  string   `json:"name"`
+	Price float64  `json:"price"`
+	Tags  []string `json:"tags,omitempty"`
+}
+
+data, err := json.Marshal(Product{Name: "กาแฟ", Price: 65})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(string(data)) // {"name":"กาแฟ","price":65}
+```
+
+</details>

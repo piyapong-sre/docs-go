@@ -1,0 +1,267 @@
+---
+title: String และ rune (UTF-8)
+description: เข้าใจ string ใน Go แบบ UTF-8, ความต่างของ byte กับ rune, การนับและตัดข้อความภาษาไทยให้ถูกต้อง และ package strings, strconv, unicode/utf8
+sidebar:
+  order: 7
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import stringsSrc from '../../../../examples/learn/basics/strings/main.go?raw';
+
+บทนี้ **สำคัญมากสำหรับคนที่ทำงานกับภาษาไทย** เพราะถ้าคิดว่า "1 ตัวอักษร = 1 ตำแหน่งใน string" เหมือนตอนเขียนภาษาอังกฤษ จะเจอ bug แปลก ๆ ทันที เช่น นับความยาวชื่อผิด ตัดข้อความแล้วได้ตัวอักษรเพี้ยน หรือ validation ความยาวที่ผิดพลาด
+
+## string ใน Go คืออะไร
+
+string ใน Go คือ **ลำดับของ byte ที่แก้ไขไม่ได้ (immutable)** ซึ่งโดยธรรมเนียมจะเข้ารหัสแบบ **UTF-8** (source code ของ Go เป็น UTF-8 เสมอ string literal จึงเป็น UTF-8 ด้วย)
+
+UTF-8 ใช้จำนวน byte ต่อตัวอักษรไม่เท่ากัน
+
+| ตัวอักษร | ตัวอย่าง | byte ต่อตัว |
+| --- | --- | --- |
+| ASCII (อังกฤษ ตัวเลข สัญลักษณ์พื้นฐาน) | `A`, `z`, `1` | 1 |
+| ละตินที่มีเครื่องหมาย, กรีก, ฯลฯ | `é`, `ß` | 2 |
+| **ภาษาไทย**, จีน, ญี่ปุ่น | `ก`, `ะ`, `中` | **3** |
+| emoji และอักขระนอก BMP | 😀 | 4 |
+
+จึงได้ข้อสรุปสำคัญ: **`len("สวัสดี")` ได้ `18` ไม่ใช่ `6`** เพราะมี 6 อักขระ × 3 byte
+
+## byte กับ rune
+
+| | `byte` | `rune` |
+| --- | --- | --- |
+| เป็น alias ของ | `uint8` | `int32` |
+| แทน | 1 byte ของข้อมูล | 1 Unicode code point (ตัวอักขระ) |
+| literal | — | `'ก'`, `'A'`, `'\n'` |
+| ได้จาก | `s[i]`, `[]byte(s)` | `range s`, `[]rune(s)` |
+
+## ตัวอย่างรวม
+
+<Code code={stringsSrc} lang="go" title="examples/learn/basics/strings/main.go" />
+
+```text title="Output"
+len: 18
+runes: 6
+len("Go"): 2
+s[0] = 224 (uint8)
+bytes: e0 b8 aa e0 b8 a7 e0 b8 b1 e0 b8 aa e0 b8 94 e0 b8 b5
+index 0: ก U+0E01
+index 3: ข U+0E02
+index 6: ้ U+0E49
+rune[1]: ว count: 6
+s[:4] = "ส\xe0" valid=false
+truncateRunes: สวั
+truncateRunes: ที
+truncateThai:  ที่
+truncateThai:  ที่นี่ปร
+"Go เป็นภาษาที่เรียบง่าย"
+true true
+3
+HELLO ababab
+a/b/c
+["a" "b" "c"]
+["one" "two" "three"]
+กรุงเทพ | เชียงใหม่
+key value true
+[0][1][2] เสร็จ
+124 <nil>
+strconv.Atoi: parsing "12a": invalid syntax
+6.28
+42! 11111111 "ไทย\n"
+true
+C:\new\folder
+```
+
+## อธิบายทีละส่วน
+
+### นับความยาว
+
+```go
+len(s)                      // 18 — จำนวน byte
+utf8.RuneCountInString(s)   // 6  — จำนวน rune
+len([]rune(s))              // 6  — ได้เหมือนกันแต่ต้องจองหน่วยความจำใหม่
+```
+
+ถ้าต้องตรวจ "ชื่อยาวไม่เกิน 50 ตัวอักษร" ต้องใช้ `utf8.RuneCountInString` ไม่ใช่ `len` ไม่อย่างนั้นชื่อภาษาไทยยาวแค่ 17 ตัวก็จะเกินแล้ว (17 × 3 = 51 byte)
+
+### `s[i]` ได้ byte
+
+`s[0]` ได้ `224` (`0xe0`) ซึ่งเป็นแค่ byte แรกจาก 3 byte ของ `ส` ไม่ได้มีความหมายเป็นตัวอักษรด้วยตัวเอง `% x` ใน `Printf` ช่วยให้เห็น byte ทั้งหมด จะเห็นว่าทุกตัวขึ้นต้นด้วย `e0 b8` เพราะอักษรไทยอยู่ในช่วง `U+0E00`–`U+0E7F`
+
+### `range` บน string ได้ rune
+
+```go
+for i, r := range "กข้" {
+	fmt.Printf("index %d: %c U+%04X\n", i, r, r)
+}
+```
+
+`range` จะถอดรหัส UTF-8 ให้ทีละ rune: `i` คือ **byte index** ที่ rune นั้นเริ่มต้น (จึงกระโดด 0, 3, 6) และ `r` คือ rune ถ้าเจอ byte ที่ไม่ใช่ UTF-8 ที่ถูกต้อง จะได้ `utf8.RuneError` (`U+FFFD`) แทน
+
+สังเกตว่า `้` (ไม้โท) ก็เป็น rune แยกหนึ่งตัว — เรื่องนี้สำคัญตอนตัดข้อความ
+
+### `[]rune` เข้าถึงทีละตัวอักษร
+
+```go
+runes := []rune(s)
+string(runes[1]) // "ว"
+```
+
+การแปลงเป็น `[]rune` ต้องจองหน่วยความจำใหม่ (4 byte ต่อ rune) เหมาะเมื่อต้องเข้าถึงแบบสุ่มตำแหน่งหลายครั้ง ถ้าแค่วนอ่านตามลำดับ ใช้ `range` ดีกว่า
+
+## ตัดข้อความภาษาไทยให้ถูก
+
+### ห้ามตัดด้วย byte
+
+`s[:4]` ตัดที่ byte ที่ 4 ซึ่งอยู่กลาง `ว` (byte 3–5) ได้ string ที่มี byte ไม่ครบ (`"ส\xe0"`) — UTF-8 ไม่ถูกต้อง แสดงผลเป็น `�` หรือทำให้ JSON/ฐานข้อมูลปฏิเสธข้อมูล
+
+### ตัดด้วย rune: ดีขึ้น แต่ยังไม่พอสำหรับภาษาไทย
+
+`truncateRunes` แปลงเป็น `[]rune` แล้วตัด ทำให้ UTF-8 ไม่พังแน่นอน แต่ภาษาไทยมี **สระบน สระล่าง และวรรณยุกต์** ที่เป็น rune แยกและวางซ้อนบนพยัญชนะ (เรียกว่า combining mark) ตัวอย่าง `"ที่นี่"` ประกอบด้วย 6 rune: `ท` `ี` `่` `น` `ี` `่`
+
+ตัด 2 rune ได้ `"ที"` — วรรณยุกต์ `่` หายไป **ความหมายเปลี่ยน** จาก "ที่" เป็น "ที"
+
+### ตัดตาม "ตัวอักษรหลัก" และเก็บ mark ที่ตามมา
+
+`truncateThai` นับเฉพาะ rune ที่ **ไม่ใช่** combining mark (หมวด Unicode `Mn` — Nonspacing Mark ซึ่งรวมสระบน/ล่างและวรรณยุกต์ไทย) แล้วตัดก่อนตัวอักษรหลักตัวที่ `n+1`
+
+```go
+func truncateThai(s string, n int) string {
+	count := 0
+	for i, r := range s {
+		if unicode.Is(unicode.Mn, r) {
+			continue // mark ติดไปกับตัวอักษรก่อนหน้า ไม่นับ
+		}
+		if count == n {
+			return s[:i] // i เป็น byte index ที่อยู่ตรงขอบ rune เสมอ
+		}
+		count++
+	}
+	return s
+}
+```
+
+`truncateThai("ที่นี่", 1)` จึงได้ `"ที่"` ครบทั้งสระและวรรณยุกต์ และเพราะใช้ `range` ซึ่งให้ byte index ที่ขอบ rune การตัด `s[:i]` จึงไม่ทำให้ UTF-8 พัง และไม่ต้องจอง `[]rune`
+
+<Aside type="caution" title="ข้อจำกัด">
+วิธีนี้ครอบคลุมกรณีส่วนใหญ่ของภาษาไทย แต่ยังไม่ใช่การแบ่ง **grapheme cluster** ตามมาตรฐาน Unicode (UAX #29) เต็มรูปแบบ เช่น `ำ` (สระอำ) ไม่ใช่หมวด `Mn` จึงถูกนับเป็นตัวอักษรหลักแยก และ emoji บางตัวประกอบจากหลาย rune ถ้าต้องการความถูกต้องสูงสุด (เช่น ตัดข้อความแสดงผลบน UI) ให้ใช้ library ที่ทำ grapheme segmentation เช่น `github.com/rivo/uniseg`
+
+อีกเรื่องคือ **ภาษาไทยไม่เว้นวรรคระหว่างคำ** `strings.Fields` หรือ `strings.Split(s, " ")` จึงแยกคำภาษาไทยไม่ได้ ต้องใช้ library ตัดคำ (word segmentation) โดยเฉพาะ
+</Aside>
+
+## Package `strings`
+
+| Function | ตัวอย่าง | ผลลัพธ์ |
+| --- | --- | --- |
+| `Contains` | `strings.Contains("ภาษา Go", "Go")` | `true` |
+| `HasPrefix` / `HasSuffix` | `strings.HasPrefix("golang", "go")` | `true` |
+| `Index` | `strings.Index("chicken", "ken")` | `4` (byte index, ไม่พบได้ `-1`) |
+| `Split` | `strings.Split("a,b,c", ",")` | `["a" "b" "c"]` |
+| `Fields` | `strings.Fields(" a  b ")` | `["a" "b"]` (แยกด้วย whitespace) |
+| `Join` | `strings.Join([]string{"a", "b"}, "-")` | `"a-b"` |
+| `ReplaceAll` | `strings.ReplaceAll("a-b", "-", "/")` | `"a/b"` |
+| `TrimSpace` | `strings.TrimSpace("  hi  ")` | `"hi"` |
+| `ToUpper` / `ToLower` | `strings.ToUpper("go")` | `"GO"` |
+| `Repeat` | `strings.Repeat("ab", 3)` | `"ababab"` |
+| `Cut` | `strings.Cut("key=value", "=")` | `"key", "value", true` |
+| `EqualFold` | `strings.EqualFold("Go", "GO")` | `true` (ไม่สนตัวพิมพ์เล็กใหญ่) |
+
+<Aside type="caution">
+`strings.Index` คืน **byte index** ไม่ใช่ตำแหน่งตัวอักษร ในตัวอย่าง `strings.Index(t, "เป็น")` ได้ `3` เพราะ `"Go "` ยาว 3 byte ถ้า string ด้านหน้ามีภาษาไทย ตัวเลขจะเป็นผลคูณของ 3 ใช้ค่านี้กับ `s[i:]` ได้อย่างปลอดภัย แต่อย่านำไปแสดงเป็น "ตำแหน่งตัวอักษรที่ i"
+</Aside>
+
+## `strings.Builder`
+
+string แก้ไขไม่ได้ การต่อ string ด้วย `+=` ใน loop จะสร้าง string ใหม่และ copy ข้อมูลทุกรอบ ถ้าต่อจำนวนมากให้ใช้ `strings.Builder`
+
+```go
+var sb strings.Builder        // zero value ใช้ได้เลย
+for i := range 3 {
+	fmt.Fprintf(&sb, "[%d]", i) // Builder เป็น io.Writer ใช้กับ Fprintf ได้
+}
+sb.WriteString(" เสร็จ")
+result := sb.String()          // "[0][1][2] เสร็จ"
+```
+
+มี method `WriteString`, `WriteByte`, `WriteRune` และ `Grow(n)` สำหรับจองพื้นที่ล่วงหน้า
+
+## Package `strconv`
+
+แปลงระหว่าง string กับตัวเลข/bool
+
+```go
+n, err := strconv.Atoi("123")        // string → int
+s := strconv.Itoa(42)                // int → string "42"
+f, err := strconv.ParseFloat("3.14", 64)
+b, err := strconv.ParseBool("true")
+i, err := strconv.ParseInt("ff", 16, 64) // ฐาน 16 → 255
+strconv.FormatInt(255, 2)            // "11111111"
+strconv.Quote("ไทย\n")               // "\"ไทย\\n\""
+```
+
+function `Parse...` และ `Atoi` คืน `error` เมื่อแปลงไม่ได้ **ต้องตรวจเสมอ** — `strconv.Atoi("12a")` ได้ error `strconv.Atoi: parsing "12a": invalid syntax`
+
+<Aside type="caution" title='string(65) ไม่ใช่ "65"'>
+`string(n)` เมื่อ `n` เป็นจำนวนเต็ม จะได้ **ตัวอักษรที่มี code point เท่ากับ n** เช่น `string(rune(65))` ได้ `"A"` ถ้าต้องการ `"65"` ต้องใช้ `strconv.Itoa(65)` หรือ `fmt.Sprint(65)`
+</Aside>
+
+## Package `unicode/utf8` และ `unicode`
+
+```go
+utf8.RuneCountInString(s) // นับ rune
+utf8.ValidString(s)       // UTF-8 ถูกต้องหรือไม่
+utf8.RuneLen('ก')         // 3 — rune นี้ใช้กี่ byte
+r, size := utf8.DecodeRuneInString(s) // ถอด rune แรก และขนาดเป็น byte
+
+unicode.IsLetter('ก')     // true
+unicode.IsDigit('๙')      // true — เลขไทยก็เป็น digit
+unicode.IsSpace('\t')     // true
+unicode.Is(unicode.Thai, 'ก') // true — อยู่ใน script ภาษาไทยหรือไม่
+```
+
+## String literal สองแบบ
+
+```go
+a := "บรรทัดแรก\nบรรทัดสอง\t(มี escape)" // interpreted: ตีความ \n \t \" \\
+b := `C:\new\folder`                    // raw: ไม่ตีความ escape, ขึ้นบรรทัดใหม่ได้
+```
+
+raw string (backtick) เหมาะกับ regex, path บน Windows, SQL หลายบรรทัด และ JSON ตัวอย่าง
+
+## แปลงระหว่าง string กับ `[]byte`
+
+```go
+b := []byte("สวัสดี") // copy เป็น byte slice ที่แก้ไขได้ (len 18)
+s := string(b)        // copy กลับเป็น string
+```
+
+ใช้บ่อยเวลาทำงานกับ I/O, network และ JSON ซึ่งมักรับส่งเป็น `[]byte` ทั้งสองทิศทางเป็นการ copy ข้อมูล
+
+<Aside type="tip" title="สรุปกฎสำหรับภาษาไทย">
+- นับความยาวที่ผู้ใช้เห็น → `utf8.RuneCountInString` (หรือนับเฉพาะตัวอักษรหลักถ้าต้องการความยาวที่แสดงผล)
+- วนทีละตัวอักษร → `for _, r := range s`
+- ตัดข้อความ → ตัดที่ขอบ rune และระวัง combining mark อย่าใช้ `s[:n]` กับ n ที่คิดเอาเอง
+- ค้นหา/แทนที่ → `strings.Contains`, `strings.ReplaceAll` ใช้กับภาษาไทยได้ปกติ เพราะทำงานระดับ byte ที่ตรงกันทั้งลำดับ
+</Aside>
+
+## แบบฝึกหัด
+
+1. เขียน function `reverseString(s string) string` ที่กลับลำดับตัวอักษร ทดสอบกับ `"Hello"` และ `"กขค"` (คำใบ้: ใช้ `[]rune`) แล้วลองกับ `"ที่"` ดูว่าเกิดอะไรขึ้นและเพราะอะไร
+2. เขียน function ตรวจว่าชื่อผู้ใช้ยาว 3–20 ตัวอักษร (นับเป็น rune) และประกอบด้วยตัวอักษรหรือตัวเลขเท่านั้น (ใช้ `unicode.IsLetter`, `unicode.IsDigit`) — `"สมชาย123"` ควรผ่านหรือไม่
+3. ใช้ `strings.Builder` สร้างตารางสูตรคูณแม่ 2 (`2 x 1 = 2` ถึง `2 x 12 = 24`) เป็น string เดียว
+
+<details>
+<summary>เฉลยข้อ 1 และ 2</summary>
+
+```go
+func reverseString(s string) string {
+	r := []rune(s)
+	slices.Reverse(r)
+	return string(r)
+}
+```
+
+`reverseString("ที่")` ได้วรรณยุกต์และสระขึ้นมาก่อนพยัญชนะ (`"่ีท"`) ซึ่งแสดงผลผิด เพราะกลับลำดับ rune โดยไม่สนใจว่า mark ต้องอยู่หลังพยัญชนะของมัน
+
+ข้อ 2: `"สมชาย123"` มี 8 rune — แต่ระวัง! สระและวรรณยุกต์ไทยบางตัว (เช่น `ั` `ี` `่`) ไม่ใช่ `IsLetter` (เป็นหมวด `Mn`) ดังนั้นชื่อเช่น `"สมศักดิ์"` จะไม่ผ่านถ้าเช็คแค่ `IsLetter` ต้องอนุญาต `unicode.Is(unicode.Mn, r)` ด้วย
+
+</details>

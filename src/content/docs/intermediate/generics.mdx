@@ -1,0 +1,189 @@
+---
+title: Generics
+description: เขียน function และ type ที่ใช้ได้กับหลาย type ด้วย type parameter และ constraint โดยยังคง type safety
+sidebar:
+  order: 6
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/intermediate/generics/main.go?raw';
+
+ก่อน Go 1.18 ถ้าอยากได้ function `Max` ที่ใช้ได้ทั้ง `int` และ `float64` ต้องเขียนซ้ำสองรอบ หรือใช้ `any` แล้วเสีย type safety
+**generics** แก้ปัญหานี้ด้วย **type parameter**: เขียนครั้งเดียว ใช้ได้หลาย type และ compiler ยังตรวจ type ให้ครบ
+
+## Type parameter
+
+type parameter อยู่ในวงเล็บเหลี่ยม `[...]` หลังชื่อ function
+
+```go
+//       type parameter
+//       ↓↓↓↓↓↓↓↓↓↓↓
+func Map[T, U any](s []T, f func(T) U) []U {
+	out := make([]U, 0, len(s))
+	for _, v := range s {
+		out = append(out, f(v))
+	}
+	return out
+}
+
+strs := Map([]int{1, 2}, strconv.Itoa)           // Go อนุมาน T=int, U=string ให้
+strs = Map[int, string]([]int{1, 2}, strconv.Itoa) // หรือระบุเองก็ได้
+```
+
+ส่วนหลังชื่อ type parameter (`any`) คือ **constraint** บอกว่า T เป็น type อะไรได้บ้าง
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/intermediate/generics/main.go" />
+
+```text title="Output"
+["3" "1" "4" "1" "5"]
+9
+mango
+2
+total: 245 baht
+3.75
+pop: second
+pop: first
+error: stack is empty
+{Key:age Val:30}
+```
+
+## Constraint ที่ใช้บ่อย
+
+| Constraint | ความหมาย | ใช้กับ |
+|---|---|---|
+| `any` | type อะไรก็ได้ | เก็บ/ส่งต่อค่า ไม่ต้องใช้ operator |
+| `comparable` | ใช้ `==` และ `!=` ได้ | key ของ map, การค้นหา |
+| `cmp.Ordered` | ใช้ `<` `<=` `>` `>=` ได้ (ตัวเลขทุกชนิด, string) | หา max/min, sort |
+
+```go
+func IndexOf[T comparable](s []T, target T) int  // ต้องใช้ ==
+func MaxOf[T cmp.Ordered](first T, rest ...T) T  // ต้องใช้ < > (max)
+```
+
+ถ้าเขียน `func IndexOf[T any]` แล้วใช้ `v == target` จะ compile ไม่ผ่าน เพราะ `any` ไม่รับประกันว่าเทียบ `==` ได้
+(เช่น slice หรือ func ใช้ `==` ไม่ได้)
+
+<Aside type="tip">
+ก่อนเขียน generic function เอง ลองดู package `slices`, `maps` และ `cmp` ก่อน
+เช่น `slices.Contains`, `slices.Index`, `slices.Max`, `slices.SortFunc`, `maps.Keys` ส่วนใหญ่มีให้ใช้แล้ว
+และ `min`/`max` เป็น built-in ตั้งแต่ Go 1.21
+</Aside>
+
+## เขียน constraint เอง
+
+constraint คือ interface ที่ระบุ **ชุดของ type** ด้วย `|` (union)
+
+```go
+type Number interface {
+	~int | ~int64 | ~float64
+}
+
+func Sum[T Number](nums []T) T {
+	var total T // zero value ของ T
+	for _, n := range nums {
+		total += n
+	}
+	return total
+}
+```
+
+### เครื่องหมาย `~` (tilde)
+
+`~int` หมายถึง "type ใดก็ตามที่มี **underlying type** เป็น `int`" ไม่ใช่แค่ `int` เป๊ะๆ
+
+```go
+type Baht int
+
+Sum([]Baht{120, 80, 45}) // ✅ ได้ เพราะ Baht มี underlying type เป็น int และเรามี ~int
+```
+
+ถ้าเขียนแค่ `int | int64 | float64` (ไม่มี `~`) การส่ง `[]Baht` จะ compile ไม่ผ่าน
+`cmp.Ordered` ใน standard library ก็ใช้ `~` ทุกตัว type อย่าง `type Celsius float64` จึงใช้ได้
+
+<Aside type="caution">
+interface ที่มี union หรือ `~` ใช้เป็น **constraint เท่านั้น** จะประกาศตัวแปร `var n Number` ไม่ได้
+</Aside>
+
+## Generic type
+
+struct และ type อื่นๆ ก็มี type parameter ได้
+
+```go
+type Stack[T any] struct {
+	items []T
+}
+
+func (s *Stack[T]) Push(v T) {
+	s.items = append(s.items, v)
+}
+
+var st Stack[string]   // ตอนใช้ต้องระบุ type เสมอ
+st.Push("first")
+```
+
+- method ใช้ type parameter ของ type ได้ (`Stack[T]`) แต่ **method จะประกาศ type parameter ใหม่ของตัวเองไม่ได้**
+  ถ้าต้องการ ให้เขียนเป็น function ธรรมดาแทน
+- `var zero T` คือวิธีมาตรฐานในการได้ zero value ของ T (ใช้ใน `Pop()` ตอน stack ว่าง)
+
+## เมื่อไหร่ **ไม่ควร** ใช้ generics
+
+generics เป็นเครื่องมือที่ดี แต่ใช้มากเกินไปทำให้ code อ่านยากขึ้นมาก หลักคิดคือ
+
+- **เขียน code ปกติก่อน** เมื่อพบว่าเขียน logic เดียวกันซ้ำกับหลาย type ค่อยเปลี่ยนเป็น generic
+- ถ้าแค่ **เรียก method** ของค่า ให้ใช้ **interface** ธรรมดา
+
+  ```go
+  // ❌ ไม่จำเป็น
+  func Write[T io.Writer](w T, data []byte) { w.Write(data) }
+
+  // ✅ interface ก็พอ
+  func Write(w io.Writer, data []byte) { w.Write(data) }
+  ```
+
+- ถ้า implementation **ต่างกัน** ในแต่ละ type (ไม่ใช่ logic เดียวกัน) generics ไม่ช่วย ใช้ interface หรือแยก function
+- อย่าใช้ type parameter แค่เพราะ "เผื่ออนาคต" — ใช้เมื่อมีอย่างน้อย 2 type ที่ต้องใช้จริงแล้ว
+
+generics เหมาะที่สุดกับ **data structure** (stack, queue, set, cache) และ **function ที่ทำงานกับ slice/map/channel ของ type อะไรก็ได้**
+
+## แบบฝึกหัด
+
+1. เขียน `func Filter[T any](s []T, keep func(T) bool) []T` แล้วใช้กรองเลขคู่จาก `[]int{1, 2, 3, 4, 5, 6}`
+2. เขียน generic type `Set[T comparable]` ที่มี method `Add(v T)`, `Has(v T) bool` และ `Len() int` (ใช้ map ข้างใน)
+3. ทำไม `func Biggest[T any](a, b T) T { if a > b { return a }; return b }` ถึง compile ไม่ผ่าน แก้อย่างไร
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+func Filter[T any](s []T, keep func(T) bool) []T {
+	var out []T
+	for _, v := range s {
+		if keep(v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+evens := Filter([]int{1, 2, 3, 4, 5, 6}, func(n int) bool { return n%2 == 0 })
+
+// 2
+type Set[T comparable] struct {
+	m map[T]struct{}
+}
+
+func NewSet[T comparable]() *Set[T] {
+	return &Set[T]{m: make(map[T]struct{})}
+}
+
+func (s *Set[T]) Add(v T)      { s.m[v] = struct{}{} }
+func (s *Set[T]) Has(v T) bool { _, ok := s.m[v]; return ok }
+func (s *Set[T]) Len() int     { return len(s.m) }
+```
+
+3. `any` ไม่รับประกันว่าใช้ `>` ได้ ต้องเปลี่ยน constraint เป็น `cmp.Ordered` (หรือใช้ built-in `max(a, b)` ไปเลย)
+
+</details>

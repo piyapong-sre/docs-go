@@ -1,0 +1,224 @@
+---
+title: เอกสาร API ด้วย OpenAPI
+description: เขียน contract ของ API เป็น OpenAPI 3.1 ฝังไว้ใน binary เปิดดูด้วย Swagger UI และรักษาให้ spec ตรงกับโค้ดเสมอ
+sidebar:
+  order: 14
+---
+
+import { Code, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import embedSrc from '../../../../examples/tasks-api/api/embed.go?raw';
+
+## ทำไมต้องมีเอกสาร API
+
+API คือ **สัญญา (contract)** ระหว่าง backend กับคนที่เรียกใช้ ทั้ง frontend, mobile app และทีมอื่น ถ้าสัญญาอยู่แค่ในหัวของคนเขียน backend ทุกคนต้องเดาหรือมาถามซ้ำ ๆ
+
+OpenAPI (ชื่อเดิม Swagger) คือมาตรฐานสำหรับอธิบาย REST API เป็นไฟล์ YAML / JSON ที่ทั้งคนและเครื่องอ่านได้ จากไฟล์เดียวเราได้
+
+- หน้าเอกสารแบบ interactive ลองยิง request ได้จากหน้าเว็บ
+- generate client (TypeScript, Kotlin, Swift ...) หรือ server stub
+- mock server ให้ frontend เริ่มทำงานได้ก่อน backend เสร็จ
+- lint และ contract test เพื่อตรวจว่า API ไม่เปลี่ยนแบบเงียบ ๆ
+
+## โครงสร้างของ `api/openapi.yaml`
+
+tasks-api ใช้ **OpenAPI 3.1** (เข้ากันได้กับ JSON Schema เต็มรูปแบบ เช่นเขียน nullable เป็น `type: [string, 'null']`)
+
+```yaml title="api/openapi.yaml"
+openapi: 3.1.0
+info:
+  title: Tasks API
+  version: 1.0.0
+  # ...
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+```
+
+`security` ระดับบนสุดบอกว่า **ทุก endpoint ต้องใช้ bearer token** เว้นแต่จะระบุเป็นอย่างอื่น endpoint ที่ไม่ต้อง login อย่าง register / login จึงเขียน `security: []` ทับไว้
+
+```yaml title="api/openapi.yaml"
+  /v1/auth/login:
+    post:
+      summary: เข้าสู่ระบบและรับ access token
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          # ...
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+```
+
+### `components`: เขียนครั้งเดียว ใช้ซ้ำทุกที่
+
+**securitySchemes** ประกาศวิธี auth
+
+```yaml title="api/openapi.yaml"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+```
+
+**schemas** คือรูปร่างของข้อมูล ตรงกับ DTO ใน Go ทีละ field
+
+```yaml title="api/openapi.yaml"
+    Task:
+      type: object
+      required: [id, title, description, status, due_at, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 5000 }
+        status: { $ref: '#/components/schemas/Status' }
+        due_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+```
+
+- `due_at` อยู่ใน `required` แต่เป็น `null` ได้ ตรงกับ Go ที่เป็น `*time.Time` ไม่มี `omitempty` คือ field มีเสมอ ค่าอาจเป็น `null`
+- `maxLength: 200` ตรงกับ `maxTitleLen` ใน handler
+- request schema ใส่ `additionalProperties: false` ตรงกับ `DisallowUnknownFields()` ใน `DecodeJSON`
+
+**responses** คือ response ที่ใช้ซ้ำ โดยเฉพาะ error ที่มีรูปร่างเดียวกันทั้ง API
+
+```yaml title="api/openapi.yaml"
+  responses:
+    # ...
+    ValidationError:
+      description: ข้อมูลไม่ผ่านการตรวจสอบ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: ข้อมูลไม่ผ่านการตรวจสอบ
+              details: [{ field: title, issue: ห้ามว่าง }]
+              request_id: req_4f1c2a9be0d3a7c1e8f05b6d
+    RateLimited:
+      description: เรียกบ่อยเกินไป
+      headers:
+        Retry-After: { schema: { type: integer }, description: วินาทีที่ต้องรอ }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+```
+
+ใส่ `example` ไว้ด้วย หน้าเอกสารจะแสดงตัวอย่างจริงให้ frontend เห็นภาพทันที
+
+## ฝัง spec ไว้ใน binary
+
+<Code code={embedSrc} lang="go" title="api/embed.go" />
+
+แล้วเปิด route ให้ดาวน์โหลด
+
+```go title="internal/server/server.go"
+	mux.HandleFunc("GET /openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = w.Write(api.OpenAPISpec)
+	})
+```
+
+- ไฟล์อยู่ที่ `api/openapi.yaml` ข้าง ๆ `api/embed.go` เพราะ `//go:embed` อ้างไฟล์ได้เฉพาะในโฟลเดอร์ของ package นั้นหรือโฟลเดอร์ลูก (ใช้ `..` ไม่ได้)
+- ใช้ `[]byte` เพราะเป็นไฟล์เดียวและส่งออกไปตรง ๆ และ import แบบ blank `import _ "embed"` (ทบทวน [embed](/advanced/embed/))
+- binary กับเอกสาร **เป็น version เดียวกันเสมอ** server ที่รันอยู่ตอบ spec ของตัวเอง ไม่ต้องกลัวว่าเอกสารบนเว็บเป็นของ version ไหน
+- media type `application/yaml` ลงทะเบียนเป็นทางการแล้วใน RFC 9512
+
+```bash
+curl -s localhost:8080/openapi.yaml | head -4
+```
+
+```text title="Output"
+openapi: 3.1.0
+info:
+  title: Tasks API
+  version: 1.0.0
+```
+
+## เปิดดูเอกสาร
+
+<Tabs>
+<TabItem label="Swagger UI">
+
+```bash
+docker run --rm -p 8081:8080 \
+  -e SWAGGER_JSON_URL=http://localhost:8080/openapi.yaml \
+  swaggerapi/swagger-ui
+```
+
+เปิด `http://localhost:8081` จะเห็นทุก endpoint กด **Authorize** แล้ววาง access token จาก login เพื่อลองยิง endpoint ที่ต้อง login ได้จากหน้าเว็บ
+
+</TabItem>
+<TabItem label="Redocly CLI">
+
+```bash
+npx @redocly/cli lint api/openapi.yaml        # ตรวจ spec ตามกฎ best practice
+npx @redocly/cli build-docs api/openapi.yaml  # สร้างหน้าเอกสาร HTML ไฟล์เดียว
+```
+
+เหมาะกับใส่ใน CI: `lint` ไม่ผ่าน = ไม่ให้ merge
+
+</TabItem>
+<TabItem label="Scalar">
+
+[Scalar](https://scalar.com/) เป็นหน้าเอกสาร API อีกตัวที่หน้าตาทันสมัย ชี้ไปที่ URL ของ `openapi.yaml` ได้เหมือน Swagger UI หรือจะฝังเป็นหน้า HTML ที่โหลดจาก CDN ก็ได้
+
+</TabItem>
+</Tabs>
+
+<Aside type="caution">
+Swagger UI รันที่ `http://localhost:8081` แต่ไปโหลด spec และยิง request ไปที่ `http://localhost:8080` คนละ origin กัน browser จึงต้องการ **CORS** ให้เพิ่ม origin ของ UI ลงใน `.env` แล้ว restart API
+
+```bash
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:8081
+```
+
+ถ้าลืม จะเห็น error "Failed to fetch" ในหน้า UI และข้อความ CORS ใน console ของ browser (ดู [Middleware](/web-api/middleware/))
+</Aside>
+
+## Spec-first หรือ Code-first
+
+| | Spec-first (เขียน YAML ก่อน) | Code-first (generate จากโค้ด) |
+| --- | --- | --- |
+| วิธี | ออกแบบ `openapi.yaml` แล้ว review กับ frontend ก่อนเขียนโค้ด | เขียน handler แล้วใช้ annotation / reflection สร้าง spec |
+| ข้อดี | คุยเรื่อง contract ได้ก่อนลงมือ, frontend ทำคู่ขนานด้วย mock ได้ | spec ไม่หลุดจากโค้ดง่าย ๆ, เริ่มเร็ว |
+| ข้อเสีย | ต้องมีวินัยให้โค้ดตรงกับ spec | spec มักละเอียดน้อยกว่า, ผูกกับ library ที่ใช้ |
+| เครื่องมือใน Go | [oapi-codegen](https://github.com/oapi-codegen/oapi-codegen) generate type และ interface ของ server จาก spec | swaggo/swag (comment annotation), Huma (สร้าง spec จาก type) |
+
+tasks-api เขียน spec **ด้วยมือ** ควบคู่กับโค้ด เพื่อให้เห็นทุกส่วนชัด ๆ และไม่ผูกกับ library ใด ถ้าทีมใหญ่ขึ้นหรือมีหลาย client การย้ายไป spec-first + oapi-codegen ช่วยให้ compiler บังคับว่า handler ตรงกับ spec ได้
+
+## รักษา spec ให้ตรงกับโค้ด
+
+spec ที่ไม่ตรงกับความจริงแย่กว่าไม่มี spec เพราะคนจะเชื่อมัน วิธีที่ช่วยได้
+
+**1. ใส่ไว้ใน checklist ของ code review** ทุก PR ที่แตะ handler หรือ DTO ต้องถามว่า
+
+- เพิ่ม / ลบ / เปลี่ยนชื่อ field หรือเปล่า แก้ schema แล้วหรือยัง
+- มี status code หรือ error code ใหม่ไหม
+- ข้อจำกัด (`maxLength`, `minimum`, `enum`) ตรงกับ validation ใน Go ไหม
+- เป็น breaking change ไหม ถ้าใช่ต้องคิดเรื่อง version (`/v2`)
+
+**2. lint ใน CI** ด้วย Redocly CLI หรือ Spectral
+
+**3. contract test** (ทำต่อเอง) ใน integration test โหลด `api.OpenAPISpec` ด้วย library อย่าง `kin-openapi` แล้วตรวจว่า response จริงทุกตัวผ่าน schema วิธีนี้จับได้ทันทีเมื่อโค้ดกับ spec เริ่มไม่ตรงกัน
+
+<Aside type="tip">
+สิ่งที่ spec ของ tasks-api ยังขาด และเป็นแบบฝึกหัดที่ดี: response 413 (`PAYLOAD_TOO_LARGE`), 415 (`UNSUPPORTED_MEDIA_TYPE`), 503 (`TIMEOUT`) และ header `X-RateLimit-*` ของ endpoint auth ทั้งหมดนี้โค้ดส่งออกมาจริงแต่ยังไม่ได้เขียนไว้ใน spec
+</Aside>
+
+## สรุป
+
+- OpenAPI คือ contract ของ API ที่ทั้งคนและเครื่องอ่านได้ ใช้ทำเอกสาร, generate client, mock และ test
+- `components` แยก `schemas`, `responses` และ `securitySchemes` ไว้ใช้ซ้ำ ลดการเขียนซ้ำและทำให้ error มีรูปเดียวทั้ง API
+- tasks-api ฝัง `api/openapi.yaml` ด้วย `//go:embed` และเสิร์ฟที่ `GET /openapi.yaml` spec จึงตรงกับ version ของ binary เสมอ
+- เปิดดูด้วย Swagger UI / Redocly / Scalar และอย่าลืมเพิ่ม origin ของ UI ใน `CORS_ALLOWED_ORIGINS`
+- spec-first (oapi-codegen) เหมาะเมื่ออยากตกลง contract ก่อน code-first เริ่มเร็วกว่า
+- รักษา spec ให้ตรงด้วย review checklist, lint ใน CI และ contract test

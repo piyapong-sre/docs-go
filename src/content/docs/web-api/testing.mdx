@@ -1,0 +1,396 @@
+---
+title: Testing Web API
+description: ทดสอบ API ทุกระดับ ตั้งแต่ unit test ของ service ด้วย repository ในหน่วยความจำ handler test ด้วย httptest ไปจนถึง integration test กับ PostgreSQL จริง
+sidebar:
+  order: 13
+---
+
+import { Code, Aside, FileTree } from '@astrojs/starlight/components';
+import tokenTestSrc from '../../../../examples/tasks-api/internal/auth/token_test.go?raw';
+import rateLimitTestSrc from '../../../../examples/tasks-api/internal/middleware/ratelimit_test.go?raw';
+import decodeTestSrc from '../../../../examples/tasks-api/internal/httpx/decode_test.go?raw';
+
+## Testing pyramid ของ API
+
+| ชั้น | ทดสอบอะไร | ต้องใช้ database | ความเร็ว | ไฟล์ใน tasks-api |
+| --- | --- | --- | --- | --- |
+| Unit | business rule ใน service, helper | ไม่ (ใช้ repo ปลอม) | เร็วมาก | `task/service_test.go`, `auth/token_test.go`, `httpx/decode_test.go` |
+| HTTP / handler | routing, decode, validation, status code, JSON | ไม่ | เร็ว | `task/handler_test.go`, `middleware/ratelimit_test.go` |
+| Integration | ทั้งระบบ router → service → SQL จริง | ใช่ | ช้ากว่า | `server/server_integration_test.go` |
+
+หลักคือ test ส่วนใหญ่อยู่ชั้นล่าง (เร็ว, ไม่ต้องตั้งค่าอะไร, รันได้ทุกครั้งที่ save) และมี integration test จำนวนน้อยแต่ครอบคลุม flow สำคัญ เพื่อยืนยันว่า SQL และการ wiring ทำงานจริง
+
+<FileTree>
+- internal/
+  - auth/
+    - token_test.go
+  - httpx/
+    - decode_test.go
+  - middleware/
+    - ratelimit_test.go
+  - server/
+    - server_integration_test.go
+  - task/
+    - handler_test.go
+    - service_test.go
+</FileTree>
+
+ถ้ายังไม่คุ้นกับ `testing`, table-driven test และ `t.Run` ทบทวนได้ที่ [Testing](/intermediate/testing/)
+
+## Unit test ของ service ด้วย repository ในหน่วยความจำ
+
+`task.Service` ขึ้นกับ interface `task.Repository` ไม่ใช่ PostgreSQL ตรง ๆ test จึงเขียน implementation ปลอมที่เก็บข้อมูลใน slice ได้
+
+```go title="internal/task/service_test.go"
+// memRepo is an in-memory task.Repository used only in tests.
+// Because the service depends on an interface, we can test business
+// rules without a database.
+type memRepo struct {
+	mu    sync.Mutex
+	tasks []task.Task
+	seq   int
+	clock time.Time
+}
+
+func (m *memRepo) Create(_ context.Context, p task.CreateParams) (task.Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seq++
+	m.clock = m.clock.Add(time.Second)
+	t := task.Task{
+		ID:          fmt.Sprintf("00000000-0000-7000-8000-%012d", m.seq),
+		UserID:      p.UserID,
+		// ...
+		CreatedAt:   m.clock,
+		UpdatedAt:   m.clock,
+	}
+	m.tasks = append(m.tasks, t)
+	return t, nil
+}
+
+// ...
+
+func (m *memRepo) List(_ context.Context, p task.ListParams) ([]task.Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []task.Task
+	for _, t := range m.tasks {
+		if t.UserID != p.UserID || (p.Status != nil && t.Status != *p.Status) {
+			continue
+		}
+		if p.After != nil && !before(t, *p.After) {
+			continue
+		}
+		out = append(out, t)
+	}
+	// newest first, same as ORDER BY created_at DESC, id DESC
+	slices.SortFunc(out, func(a, b task.Task) int {
+		return cmp.Or(b.CreatedAt.Compare(a.CreatedAt), cmp.Compare(b.ID, a.ID))
+	})
+	return out[:min(len(out), p.Limit)], nil
+}
+```
+
+จุดที่ควรสังเกต
+
+- id ถูกสร้างให้ **หน้าตาเหมือน UUID** (`00000000-0000-7000-8000-000000000001`) เพราะ handler ตรวจ `httpx.IsUUID` ถ้าใช้ id อย่าง `"1"` test ของ handler จะได้ 404 ทั้งที่ไม่ควร
+- `clock` เดินทีละ 1 วินาที ทุก task มี `created_at` ไม่ซ้ำ ลำดับจึงแน่นอน ไม่ต้องพึ่ง `time.Now()`
+- `List` เลียนแบบ `ORDER BY created_at DESC, id DESC` ด้วย `cmp.Or` ให้พฤติกรรมตรงกับ SQL จริง
+- มี `sync.Mutex` เพราะ repository ตัวจริงถูกเรียกจากหลาย goroutine พร้อมกัน (server รันแต่ละ request ใน goroutine ของตัวเอง) ของปลอมก็ควรปลอดภัยแบบเดียวกัน ถ้าวันหนึ่งมี test ที่ยิง request พร้อมกัน `-race` จะไม่ฟ้องผิดที่
+
+test ของ pagination วนขอทีละหน้าจนหมด แล้วตรวจทั้งลำดับและจำนวนหน้า
+
+```go title="internal/task/service_test.go"
+func TestServiceListPaginates(t *testing.T) {
+	ctx := t.Context()
+	svc := task.NewService(&memRepo{})
+	for i := range 5 {
+		if _, err := svc.Create(ctx, task.CreateParams{UserID: "u1", Title: fmt.Sprint("t", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Another user's task must never appear.
+	if _, err := svc.Create(ctx, task.CreateParams{UserID: "u2", Title: "other"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var titles []string
+	var after *task.Cursor
+	pages := 0
+	for {
+		page, err := svc.List(ctx, task.ListParams{UserID: "u1", Limit: 2, After: after})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		for _, tk := range page.Tasks {
+			titles = append(titles, tk.Title)
+		}
+		if page.Next == nil {
+			break
+		}
+		after = page.Next
+	}
+
+	want := []string{"t4", "t3", "t2", "t1", "t0"}
+	if !slices.Equal(titles, want) {
+		t.Errorf("titles = %v, want %v", titles, want)
+	}
+	if pages != 3 {
+		t.Errorf("pages = %d, want 3", pages)
+	}
+}
+```
+
+5 รายการ แบ่งหน้าละ 2 ต้องได้ 3 หน้า (2 + 2 + 1) เรียงใหม่สุดก่อน และไม่มี task ของ `u2` ปนมา test นี้จับทั้ง bug ของเคล็ดลับ limit + 1 และ bug เรื่องสิทธิ์ได้ในคราวเดียว
+
+<Aside type="tip">
+`t.Context()` (มีตั้งแต่ Go 1.24) คืน context ที่ถูก cancel อัตโนมัติก่อน cleanup ของ test จะทำงาน ใช้แทน `context.Background()` ใน test ได้เลย goroutine หรือ query ที่ลืมหยุดจะถูกยกเลิกเมื่อ test จบ
+</Aside>
+
+## Handler test ด้วย `httptest`
+
+`net/http/httptest` ให้เรายิง request เข้า `http.Handler` ได้โดยไม่ต้องเปิด port จริง
+
+```go title="internal/task/handler_test.go"
+// newTestServer builds a router with the task routes, pretending the
+// request was already authenticated as userID (via the X-Test-User header).
+func newTestServer(t *testing.T) http.Handler {
+	t.Helper()
+	h := task.NewHandler(task.NewService(&memRepo{}))
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /v1/tasks", httpx.HandlerFunc(h.List))
+	mux.Handle("POST /v1/tasks", httpx.HandlerFunc(h.Create))
+	mux.Handle("GET /v1/tasks/{id}", httpx.HandlerFunc(h.Get))
+	mux.Handle("PATCH /v1/tasks/{id}", httpx.HandlerFunc(h.Update))
+	mux.Handle("DELETE /v1/tasks/{id}", httpx.HandlerFunc(h.Delete))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := auth.WithUserID(r.Context(), r.Header.Get("X-Test-User"))
+		mux.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func do(t *testing.T, h http.Handler, user, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(method, path, strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Test-User", user)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	return w
+}
+```
+
+- **จำลองผู้ใช้ที่ login แล้ว** ด้วย `auth.WithUserID` แทนการสร้าง JWT จริง handler test จึงโฟกัสที่ตัว handler ส่วนเรื่อง token มี test ของตัวเองแยกต่างหาก header `X-Test-User` มีแค่ใน test ไม่มีใน server จริง
+- ใช้ pattern `"POST /v1/tasks"` เหมือน `server.go` ทำให้ `r.PathValue("id")` ทำงานเหมือนของจริง
+- `httptest.NewRecorder()` เก็บ status, header และ body ไว้ให้ตรวจ
+
+generic helper ตัวเล็ก ๆ ช่วยให้ decode response สั้นลง
+
+```go title="internal/task/handler_test.go"
+func decode[T any](t *testing.T, w *httptest.ResponseRecorder) T {
+	t.Helper()
+	var v T
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("decode %q: %v", w.Body.String(), err)
+	}
+	return v
+}
+```
+
+ใช้แบบ `created := decode[taskBody](t, w)` ได้ค่าที่มี type ทันที ไม่ต้องประกาศตัวแปรแล้ว unmarshal ซ้ำทุกที่
+
+### Table-driven test ของ validation
+
+```go title="internal/task/handler_test.go"
+func TestCreateValidation(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name      string
+		body      string
+		wantField string
+	}{
+		{"empty title", `{"title":"   "}`, "title"},
+		{"bad status", `{"title":"x","status":"later"}`, "status"},
+		{"title too long", `{"title":"` + strings.Repeat("ก", 201) + `"}`, "title"},
+		{"unknown field", `{"title":"x","priority":1}`, "priority"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := do(t, srv, "alice", "POST", "/v1/tasks", tt.body)
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status %d, want 422; body %s", w.Code, w.Body)
+			}
+			e := decode[errBody](t, w)
+			if e.Error.Code != "VALIDATION_ERROR" {
+				t.Errorf("code = %q", e.Error.Code)
+			}
+			if len(e.Error.Details) == 0 || e.Error.Details[0].Field != tt.wantField {
+				t.Errorf("details = %+v, want field %q", e.Error.Details, tt.wantField)
+			}
+		})
+	}
+}
+```
+
+test ไม่ได้เช็กแค่ status แต่เช็ก **`code` และ `field`** ใน error body ด้วย เพราะนั่นคือ contract ที่ frontend ใช้ ถ้าวันหนึ่งเผลอเปลี่ยนชื่อ field ใน error test จะพัง
+
+`handler_test.go` ยังมี test สำคัญอื่น เช่น `TestCreateAndGet` ที่ยืนยันว่า bob ขอ task ของ alice แล้วได้ **404** และ `TestListValidation` ที่ส่ง `limit=0`, `limit=101`, `status=nope`, cursor เสีย แล้วต้องได้ 422 ทุกกรณี
+
+## Middleware test ด้วยนาฬิกาปลอม
+
+<Code code={rateLimitTestSrc} lang="go" title="internal/middleware/ratelimit_test.go" />
+
+- `RateLimiter` มี field `now func() time.Time` ที่ปกติเป็น `time.Now` test อยู่ใน `package middleware` (ไม่ใช่ `middleware_test`) จึงเปลี่ยน field ที่ unexported นี้ได้
+- อยากทดสอบว่า "ผ่านไป 1 นาทีแล้ว limit reset" ก็แค่ `now = now.Add(time.Minute)` **ไม่ต้อง `time.Sleep`** test เร็วและไม่ flaky
+- ตั้ง `r.RemoteAddr` เองเพื่อจำลอง IP ของ client
+- ตรวจทั้ง status 429 และ header `Retry-After` / `X-RateLimit-Remaining`
+
+## Auth test: token ที่ต้องถูกปฏิเสธ
+
+<Code code={tokenTestSrc} lang="go" title="internal/auth/token_test.go" />
+
+`TestTokenRejected` รวม "วิธีโจมตี" ไว้ในตารางเดียว
+
+| กรณี | ทดสอบว่า |
+| --- | --- |
+| `wrong secret` | token ที่ sign ด้วย secret อื่นใช้ไม่ได้ |
+| `wrong issuer` | ตรวจ `iss` จริง |
+| `expired` | เลื่อนนาฬิกาของตัวตรวจไป 2 นาที (token อายุ 1 นาที) ต้องหมดอายุ |
+| `garbage` | string ที่ไม่ใช่ JWT |
+| `alg none` | token `{"alg":"none"}` ที่ไม่มี signature ต้องถูกปฏิเสธ |
+| `tampered body` | แก้ท้าย signature แล้ว signature ไม่ตรง |
+
+test แบบนี้สำคัญกับโค้ดด้าน security มาก ถ้าวันหนึ่งมีคนลบ `WithValidMethods` หรือ `WithExpirationRequired` ออก test จะบอกทันที
+
+## Table test ของ `DecodeJSON`
+
+<Code code={decodeTestSrc} lang="go" title="internal/httpx/decode_test.go" />
+
+ทุกกรณีที่ client อาจส่งมาผิดถูกแปลงเป็น status ที่ถูกต้อง: body ว่าง / JSON พัง / ตัดกลางทาง → 400, ผิด type / field แปลก → 422 พร้อมชื่อ field, สอง object ติดกัน → 400, ใหญ่เกิน 1 MB → 413 (ดู [Validation และ Error](/web-api/validation-and-errors/))
+
+## Integration test กับ PostgreSQL จริง
+
+unit test พิสูจน์ไม่ได้ว่า SQL ถูก หรือ middleware ต่อกันถูกลำดับ จึงมี test หนึ่งตัวที่ประกอบระบบทั้งหมดแบบเดียวกับ `main.go`
+
+```go title="internal/server/server_integration_test.go"
+func TestAPIIntegration(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx := t.Context()
+
+	pool, err := postgres.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := postgres.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	// ...
+
+	srv := httptest.NewServer(server.NewHandler(server.Deps{
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DB:             pool,
+		Tokens:         tokens,
+		Users:          user.NewHandler(userSvc),
+		Tasks:          task.NewHandler(task.NewService(postgres.NewTaskRepo(pool))),
+		AuthLimiter:    mw.NewRateLimiter(100, time.Minute),
+		RequestTimeout: 5 * time.Second,
+	}))
+	t.Cleanup(srv.Close)
+
+	// ...
+
+	// Unique email per run so the test can be repeated on the same database.
+	email := "it-" + time.Now().Format("20060102150405.000000000") + "@example.com"
+```
+
+- **ข้ามอัตโนมัติ** ถ้าไม่ได้ตั้ง `TEST_DATABASE_URL` คนที่ไม่มี database ก็ยังรัน `go test ./...` ผ่าน
+- `httptest.NewServer` เปิด server จริงบน port สุ่มของ localhost ยิงด้วย `http.Client` จริง ผ่าน middleware ครบทุกตัว (request ID, recover, CORS, timeout, content type, auth)
+- ใช้ `server.NewHandler` ตัวเดียวกับ production ไม่ได้ประกอบ route ใหม่ใน test
+- flow ที่ทดสอบ: register → register ซ้ำ (409) → login ผิด (401) → login → ไม่มี token (401) → สร้าง 3 task → แบ่งหน้า `limit=2` สองหน้า → PATCH → DELETE (204) → GET ที่ลบแล้ว (404)
+- อีเมลไม่ซ้ำทุกรอบ จึงรันซ้ำบน database เดิมได้โดยไม่ต้องล้างข้อมูล
+- logger ทิ้ง output ไปที่ `io.Discard` ไม่ให้ log รก output ของ test
+
+<Aside type="tip">
+integration test นี้ใช้ database ตัวเดียวกับตอน dev ถ้าอยากให้แยกขาดจริง ๆ ลอง [testcontainers-go](https://golang.testcontainers.org/) ที่สร้าง PostgreSQL container ใหม่ให้ทุกครั้งที่รัน test (tasks-api ยังไม่ได้ใช้ เป็นไอเดียให้ทำต่อ)
+</Aside>
+
+## รัน test
+
+### Unit + handler test
+
+```bash
+go test -race ./...    # หรือ make test
+```
+
+`-race` เปิด race detector จับการเข้าถึงข้อมูลพร้อมกันโดยไม่มี lock ควรใช้ทุกครั้งทั้งบนเครื่องและใน CI integration test จะถูก skip
+
+```bash
+go test -run TestAPIIntegration -v ./internal/server/
+```
+
+```text title="Output"
+=== RUN   TestAPIIntegration
+    server_integration_test.go:30: TEST_DATABASE_URL not set
+--- SKIP: TestAPIIntegration (0.00s)
+PASS
+ok  	github.com/example/tasks-api/internal/server	0.410s
+```
+
+### รวม integration test
+
+```bash
+make db-up              # start PostgreSQL (host port 5433)
+make test-integration
+```
+
+target นี้ตั้ง `TEST_DATABASE_URL=postgres://tasks:tasks@localhost:${DB_HOST_PORT:-5433}/tasks?sslmode=disable` แล้วรัน `go test -race -count=1 ./...` (`-count=1` ปิด test cache ให้รันกับ database จริงทุกครั้ง)
+
+```text title="Output"
+ok  	github.com/example/tasks-api/internal/auth	1.396s
+ok  	github.com/example/tasks-api/internal/httpx	1.401s
+ok  	github.com/example/tasks-api/internal/middleware	1.396s
+ok  	github.com/example/tasks-api/internal/server	4.262s
+ok  	github.com/example/tasks-api/internal/task	1.404s
+```
+
+(ตัดบรรทัด `? ... [no test files]` ของ package ที่ไม่มี test ออก) สังเกตว่า `internal/server` ใช้เวลานานกว่าตัวอื่นเพราะต่อ database จริงและ hash bcrypt หลายรอบ
+
+<Aside type="caution">
+ถ้า port 5433 บนเครื่องถูกใช้อยู่ ให้ใช้ port อื่นทั้งตอน start database และตอนรัน test เพราะทั้งสอง target อ่าน `DB_HOST_PORT` เหมือนกัน
+
+```bash
+DB_HOST_PORT=5434 make db-up
+DB_HOST_PORT=5434 make test-integration
+```
+</Aside>
+
+## ใน CI
+
+ขั้นต่ำที่ควรมีใน pipeline
+
+```bash
+go vet ./...
+go test -race ./...
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+```
+
+(`make lint` รัน `go vet` กับ `govulncheck` ให้) และถ้า CI รองรับ service container ให้เพิ่ม PostgreSQL 18 แล้วตั้ง `TEST_DATABASE_URL` เพื่อรัน integration test ด้วย
+
+## สรุป
+
+- แบ่ง test เป็นชั้น: unit (เร็ว, เยอะ) → handler ด้วย `httptest` → integration กับ database จริง (น้อยแต่ครอบคลุม)
+- ออกแบบให้ service ขึ้นกับ interface แล้วใช้ `memRepo` ในหน่วยความจำแทน database
+- handler test จำลองผู้ใช้ด้วย `auth.WithUserID` ใช้ table-driven test ตรวจทั้ง status, `code` และ `field`
+- ใส่ `now func() time.Time` ไว้ใน struct เพื่อใช้นาฬิกาปลอม ไม่ต้อง `time.Sleep`
+- test ด้าน security ควรรวมกรณีโจมตี เช่น `alg none`, หมดอายุ, signature ถูกแก้
+- integration test ข้ามเมื่อไม่มี `TEST_DATABASE_URL` ใช้ `httptest.NewServer` กับ handler ตัวเดียวกับ production
+- ใช้ `t.Context()` และรัน `go test -race ./...` เสมอ

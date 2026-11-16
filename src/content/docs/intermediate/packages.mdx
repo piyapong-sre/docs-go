@@ -1,0 +1,179 @@
+---
+title: Package และ import
+description: จัดระเบียบ code ด้วย package เข้าใจกฎ exported/unexported, internal/ และการตั้งชื่อ package แบบ Go
+sidebar:
+  order: 5
+---
+
+import { Aside, Code, FileTree } from '@astrojs/starlight/components';
+import mainSrc from '../../../../examples/learn/intermediate/packages/main.go?raw';
+import greetingSrc from '../../../../examples/learn/intermediate/packages/greeting/greeting.go?raw';
+import textutilSrc from '../../../../examples/learn/intermediate/packages/internal/textutil/textutil.go?raw';
+
+เมื่อโปรแกรมโตขึ้น การยัดทุกอย่างไว้ใน `main.go` ไฟล์เดียวจะเริ่มอ่านยาก
+Go แบ่ง code เป็น **package** ซึ่งเป็นหน่วยของการ compile, การตั้งชื่อ และการซ่อนรายละเอียด
+
+## Package, module และ import path
+
+- **package** = ไฟล์ `.go` ทุกไฟล์ใน **โฟลเดอร์เดียวกัน** ที่ขึ้นต้นด้วย `package xxx` ชื่อเดียวกัน
+- **module** = กลุ่มของ package ที่มี `go.mod` อยู่ที่ราก ระบุ module path เช่น `module learn`
+- **import path** = module path + path ของโฟลเดอร์ เช่น `learn/intermediate/packages/greeting`
+
+ทุกไฟล์ในโฟลเดอร์เดียวกันต้องเป็น package เดียวกัน (ยกเว้นไฟล์ `_test.go` ที่ใช้ `package xxx_test` ได้)
+และมองเห็นของกันและกันทั้งหมด ไม่ต้อง import กันเอง
+
+## ตัวอย่าง module หลาย package
+
+<FileTree>
+- examples/learn/
+  - go.mod                 module learn
+  - intermediate/packages/
+    - main.go              package main
+    - greeting/
+      - greeting.go        package greeting
+    - internal/
+      - textutil/
+        - textutil.go      package textutil
+</FileTree>
+
+<Code code={greetingSrc} lang="go" title="examples/learn/intermediate/packages/greeting/greeting.go" />
+
+<Code code={textutilSrc} lang="go" title="examples/learn/intermediate/packages/internal/textutil/textutil.go" />
+
+<Code code={mainSrc} lang="go" title="examples/learn/intermediate/packages/main.go" />
+
+```bash
+cd examples/learn
+go run ./intermediate/packages
+```
+
+```text title="Output"
+Hello, Gopher!
+Hello, World!
+สวัสดี คุณสมชาย
+gnalog
+```
+
+### อธิบายทีละส่วน
+
+- `main.go` import ด้วย **path เต็ม** `"learn/intermediate/packages/greeting"` แต่ใช้งานด้วย **ชื่อ package** `greeting.Hello(...)`
+- `greeting` import `textutil` ต่ออีกทอด package เรียกใช้กันเป็นลำดับชั้นได้ แต่ **ห้าม import วนกัน** (A → B → A) compiler จะ error `import cycle not allowed`
+- `Greeter` มี field `word` ตัวพิมพ์เล็ก คนนอก package สร้าง `Greeter` ที่มีค่า `word` เองไม่ได้ ต้องผ่าน `greeting.New(...)` ซึ่งเป็น constructor ตามธรรมเนียม Go
+
+## Exported vs unexported
+
+Go ไม่มีคำว่า `public`/`private` ใช้ **ตัวอักษรแรกของชื่อ** เป็นตัวกำหนด
+
+| ชื่อ | ความหมาย |
+|---|---|
+| `Hello`, `Greeter`, `New` | **exported** — package อื่นใช้ได้ |
+| `defaultName`, `word` | **unexported** — ใช้ได้ภายใน package เดียวกันเท่านั้น |
+
+กฎนี้ใช้กับทุกอย่าง: function, type, ตัวแปร, ค่าคงที่, field ของ struct และ method
+
+<Aside type="caution" title="field ตัวพิมพ์เล็กกับ JSON">
+`encoding/json` ก็อยู่นอก package ของเรา จึงมองไม่เห็น field ที่ unexported
+
+```go
+type User struct {
+	name string // ❌ ไม่ถูก encode เป็น JSON
+	Age  int    // ✅
+}
+```
+
+ถ้าอยากได้ชื่อ key ตัวพิมพ์เล็กให้ใช้ struct tag: ``Name string `json:"name"` ``
+</Aside>
+
+## รูปแบบการ import
+
+```go
+import (
+	"fmt"           // standard library
+	"net/http"
+
+	"github.com/google/uuid" // third-party
+
+	"learn/intermediate/packages/greeting" // package ใน module เดียวกัน
+)
+```
+
+- จัดกลุ่ม standard library ไว้บนสุด คั่นกลุ่มด้วยบรรทัดว่าง (`goimports` จัดให้อัตโนมัติ)
+- import แล้วไม่ใช้ = **compile error** Go เข้มงวดเรื่องนี้เพื่อให้ dependency สะอาด
+- ตั้งชื่อเล่น (alias) ได้เมื่อชื่อชนกัน: `import mrand "math/rand/v2"`
+- `import _ "image/png"` คือ import เพื่อให้ `init()` ของ package นั้นทำงานเท่านั้น (เช่น ลงทะเบียน driver)
+
+## internal/
+
+package ที่อยู่ใต้โฟลเดอร์ชื่อ `internal` จะ import ได้เฉพาะ code ที่อยู่ใน **โฟลเดอร์แม่ของ `internal`** (และลูกหลาน) เท่านั้น
+
+ในตัวอย่าง `learn/intermediate/packages/internal/textutil` ถูก import ได้จาก
+`learn/intermediate/packages/...` แต่ถ้า package อื่นเช่น `learn/intermediate/generics` พยายาม import จะได้
+
+```text
+use of internal package learn/intermediate/packages/internal/textutil not allowed
+```
+
+นี่คือวิธีของ Go ในการบอกว่า "package นี้ใช้ภายในโปรเจกต์ ไม่ใช่ public API" เปลี่ยนได้ตามใจโดยไม่ต้องกลัวทำให้คนอื่นพัง
+(ดูการจัดโครงสร้างโปรเจกต์จริงได้ใน [Project layout](/advanced/project-layout/))
+
+## ตั้งชื่อ package ให้ดี
+
+- **สั้น ตัวพิมพ์เล็ก คำเดียว** ไม่มี `_` หรือ camelCase: `greeting`, `httputil`, `strconv`
+- ตั้งตาม **สิ่งที่ package ให้** ไม่ใช่สิ่งที่มันบรรจุ — หลีกเลี่ยง `util`, `common`, `helpers`, `misc`
+- ชื่อโฟลเดอร์ควรตรงกับชื่อ package
+- **ไม่พูดซ้ำ** ชื่อ package ในชื่อ function เพราะคนเรียกต้องพิมพ์ชื่อ package อยู่แล้ว
+
+```go
+greeting.Hello()         // ✅
+greeting.GreetingHello() // ❌ ซ้ำ
+
+http.Server              // ✅ ไม่ใช่ http.HTTPServer
+bytes.Buffer             // ✅ ไม่ใช่ bytes.ByteBuffer
+```
+
+## init() — มีไว้ แต่หลีกเลี่ยงถ้าทำได้
+
+ทุก package มี function `init()` ได้ (กี่ตัวก็ได้) จะถูกเรียกอัตโนมัติ **ก่อน `main`** หลังจากตัวแปรระดับ package ถูก initialize แล้ว
+
+```go
+var registry map[string]Handler
+
+func init() {
+	registry = map[string]Handler{}
+}
+```
+
+<Aside type="caution" title="ทำไมควรเลี่ยง init()">
+- ทำงานแบบ "มองไม่เห็น" แค่ import ก็มี side effect แล้ว
+- คืน error ไม่ได้ ถ้าพังทำได้แค่ panic
+- ลำดับการทำงานข้าม package เข้าใจยาก และทำให้ test ยาก
+
+ส่วนใหญ่แทนด้วยการ initialize ตรงๆ (`var registry = map[string]Handler{}`) หรือ function อย่าง `New...()` ที่เรียกจาก `main` อย่างชัดเจน
+</Aside>
+
+<Aside type="tip">
+เริ่มจาก package น้อยๆ ก่อน แยกเมื่อมีเหตุผลชัดเจน เช่น ส่วนนั้นมีหน้าที่ของตัวเองและ API ชัด
+การแบ่ง package ละเอียดเกินไปตั้งแต่แรกทำให้เกิด import cycle และต้อง export ของที่ไม่ควร export
+</Aside>
+
+## แบบฝึกหัด
+
+1. เพิ่ม function `Shout(name string) string` ใน package `greeting` ที่คืน `"HELLO, NAME!"` แล้วเรียกจาก `main.go`
+2. ลองเพิ่ม `import "learn/intermediate/packages/internal/textutil"` ใน `examples/learn/intermediate/generics/main.go` แล้ว `go build` ดูว่าได้ error อะไร (อย่าลืมลบออก)
+3. ชื่อ package ต่อไปนี้ชื่อไหนเหมาะสม: `userService`, `user_repo`, `utils`, `auth`, `strutil`
+
+<details>
+<summary>เฉลย</summary>
+
+1. ใน `greeting.go`
+
+   ```go
+   func Shout(name string) string {
+   	return "HELLO, " + strings.ToUpper(name) + "!"
+   }
+   ```
+
+2. ได้ `use of internal package ... not allowed` เพราะ `generics` ไม่ได้อยู่ใต้ `intermediate/packages/`
+3. เหมาะ: `auth`, `strutil` — ส่วน `userService` (camelCase), `user_repo` (มี `_`) และ `utils` (กว้างเกินไป ไม่บอกหน้าที่) ไม่เหมาะ
+
+</details>

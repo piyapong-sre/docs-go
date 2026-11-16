@@ -1,0 +1,186 @@
+---
+title: Goroutine
+description: รันงานพร้อมกันด้วย goroutine และรอให้เสร็จด้วย sync.WaitGroup รวมถึง wg.Go ใน Go 1.25
+sidebar:
+  order: 1
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/concurrency/goroutines/main.go?raw';
+
+concurrency คือจุดแข็งที่ทำให้ Go โด่งดัง และทุกอย่างเริ่มจาก **goroutine**
+หน่วยการทำงานที่เบามากจนสร้างได้เป็นหมื่นเป็นแสนตัวในโปรแกรมเดียว
+
+## Goroutine คืออะไร
+
+goroutine คือ function ที่ทำงาน **พร้อมกัน (concurrently)** กับส่วนอื่นของโปรแกรม
+สร้างด้วยการใส่คำว่า `go` ข้างหน้าการเรียก function
+
+```go
+go doSomething()         // เรียก function ปกติ
+go func() {              // หรือ function literal
+	fmt.Println("in a goroutine")
+}()
+```
+
+- เบามาก: เริ่มต้นใช้ stack แค่ไม่กี่ KB และโตได้ตามต้องการ (thread ของ OS มักใช้ระดับ MB)
+- Go runtime เป็นคนจัดการกระจาย goroutine ไปรันบน thread ของ OS ให้เอง (M:N scheduling)
+- `go` **ไม่รอ** ให้ function ทำงานเสร็จ คืนการควบคุมทันที และไม่มีค่าที่ return กลับมา
+
+<Aside>
+**Concurrency ≠ Parallelism** — concurrency คือการ *จัดโครงสร้าง* โปรแกรมให้มีหลายงานดำเนินไปพร้อมกันได้
+ส่วน parallelism คือการ *รันจริงพร้อมกัน* บนหลาย CPU core Go ให้เราเขียนแบบ concurrent แล้ว runtime จะรันแบบ parallel ให้ถ้ามีหลาย core
+</Aside>
+
+## กับดักแรก: main จบ โปรแกรมจบ
+
+```go
+func main() {
+	go fmt.Println("hello from goroutine")
+}
+// ส่วนใหญ่จะไม่พิมพ์อะไรเลย
+```
+
+เมื่อ `main` return โปรแกรมจะจบ **ทันที** goroutine ที่ยังทำงานไม่เสร็จจะถูกทิ้งโดยไม่มีการเตือน
+หลายคนแก้ด้วย `time.Sleep(time.Second)` ซึ่ง **ผิด** เพราะเราไม่มีทางรู้ว่างานจะเสร็จเมื่อไร
+วิธีที่ถูกคือ **synchronize** ด้วย `sync.WaitGroup` หรือ [channel](/concurrency/channels/)
+
+## sync.WaitGroup
+
+`WaitGroup` คือตัวนับงานที่ยังไม่เสร็จ
+
+| method | ความหมาย |
+|---|---|
+| `wg.Add(n)` | เพิ่มตัวนับ n (มีงานใหม่ n งาน) |
+| `wg.Done()` | ลดตัวนับ 1 (งานเสร็จ 1 งาน) |
+| `wg.Wait()` | block จนกว่าตัวนับจะเป็น 0 |
+| `wg.Go(f)` | **Go 1.25+** เรียก `Add(1)` แล้วรัน `f` ใน goroutine ใหม่ พร้อม `Done()` ให้เมื่อจบ |
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/concurrency/goroutines/main.go" />
+
+```text title="Output (ลำดับอาจต่างกันในแต่ละครั้ง)"
+downloaded b.txt (100ms)
+downloaded c.txt (200ms)
+downloaded a.txt (300ms)
+classic: done in ~300ms
+squares: [0 1 4 9 16]
+wg.Go: done in ~100ms
+```
+
+## อธิบายทีละส่วน
+
+### แบบคลาสสิก: Add / Done / Wait
+
+```go
+wg.Add(1)          // ① เพิ่มตัวนับ "ก่อน" สั่ง go
+go func() {
+	defer wg.Done() // ② ลดตัวนับเมื่อจบ ใช้ defer เพื่อให้ทำงานแม้ panic หรือ return กลางทาง
+	download(name, d)
+}()
+wg.Wait()          // ③ รอจนครบ
+```
+
+งานสามงานใช้เวลา 300, 100, 200 ms แต่รวมแล้วเสร็จใน ~300 ms (ไม่ใช่ 600) เพราะทำพร้อมกัน
+ลำดับที่พิมพ์ออกมาขึ้นกับว่างานไหนเสร็จก่อน และการวน map เองก็ไม่มีลำดับแน่นอน
+
+### แบบใหม่: wg.Go (Go 1.25+)
+
+```go
+for i := range 5 {
+	wg.Go(func() {
+		results[i] = i * i
+	})
+}
+wg.Wait()
+```
+
+สั้นกว่าและ **ลืม Add/Done ไม่ได้** เพราะ `wg.Go` ทำให้ทั้งคู่ — โปรเจกต์ที่ใช้ Go 1.25 ขึ้นไปควรใช้แบบนี้
+
+### เขียนผลลัพธ์คนละช่องของ slice
+
+goroutine แต่ละตัวเขียน `results[i]` **คนละ index** จึงไม่ชนกัน ไม่เกิด data race
+(แต่ถ้าหลาย goroutine `append` slice เดียวกัน หรือเขียน map เดียวกันพร้อมกัน จะเกิด race — ดู [sync](/concurrency/sync/) และ [Race detector](/concurrency/race-detector/))
+
+### ตัวแปร loop ใน Go 1.22+
+
+ตั้งแต่ Go 1.22 ตัวแปร loop (`i`, `name`, `d`) เป็น **ตัวใหม่ทุกรอบ** goroutine แต่ละตัวจึงเห็นค่าของรอบตัวเอง
+ใน Go เวอร์ชันเก่าต้องเขียน `i := i` หรือส่งเป็น argument ไม่งั้นทุก goroutine อาจเห็นค่าสุดท้ายเหมือนกันหมด
+
+<Aside type="caution" title="ข้อผิดพลาดที่เจอบ่อยกับ WaitGroup">
+- **เรียก `wg.Add(1)` ข้างใน goroutine** — `Wait()` อาจทำงานก่อนที่ `Add` จะถูกเรียก แล้วจบเร็วเกินไป ต้อง `Add` ก่อน `go` เสมอ (หรือใช้ `wg.Go`)
+- **ลืม `Done()`** — `Wait()` จะค้างตลอดไป (ถ้าไม่มี goroutine อื่นเหลือ จะได้ `fatal error: all goroutines are asleep - deadlock!`)
+- **copy WaitGroup** — ส่ง `WaitGroup` เข้า function แบบ value จะได้สำเนา ต้องส่งเป็น `*sync.WaitGroup` (`go vet` จับได้)
+</Aside>
+
+## ได้ผลลัพธ์และ error กลับมาอย่างไร
+
+goroutine ไม่มีค่า return ทางเลือกที่ใช้บ่อยคือ
+
+- เขียนลง slice คนละ index (ตามตัวอย่าง) — ง่ายที่สุดเมื่อรู้จำนวนงานล่วงหน้า
+- ส่งผ่าน [channel](/concurrency/channels/)
+- ใช้ `errgroup` เมื่องานคืน error ได้ (ดู [Concurrency patterns](/concurrency/patterns/))
+
+<Aside type="tip" title="ทุก goroutine ต้องมีทางจบ">
+ก่อนเขียน `go` ทุกครั้ง ให้ตอบให้ได้ว่า **goroutine นี้จะจบเมื่อไรและอย่างไร**
+goroutine ที่ไม่มีวันจบ (goroutine leak) จะกิน memory สะสมไปเรื่อยๆ จนโปรแกรมพัง
+ใช้ [context](/concurrency/context/) เพื่อบอกให้ goroutine หยุด
+</Aside>
+
+## แบบฝึกหัด
+
+1. เขียนโปรแกรมที่สร้าง 10 goroutine แต่ละตัวพิมพ์ `worker N done` แล้วให้ `main` รอจนครบก่อนพิมพ์ `all done` (ใช้ `wg.Go`)
+2. เขียน function `func SumParallel(nums []int, parts int) int` ที่แบ่ง slice เป็น `parts` ส่วน ให้แต่ละ goroutine รวมผลส่วนของตัวเองลง `partial[i]` แล้วรวมอีกทีตอนท้าย
+3. code นี้มีปัญหาอะไร
+
+   ```go
+   var wg sync.WaitGroup
+   for i := range 3 {
+   	go func() {
+   		wg.Add(1)
+   		defer wg.Done()
+   		fmt.Println(i)
+   	}()
+   }
+   wg.Wait()
+   ```
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+var wg sync.WaitGroup
+for i := range 10 {
+	wg.Go(func() { fmt.Printf("worker %d done\n", i) })
+}
+wg.Wait()
+fmt.Println("all done")
+
+// 2
+func SumParallel(nums []int, parts int) int {
+	partial := make([]int, parts)
+	size := (len(nums) + parts - 1) / parts
+	var wg sync.WaitGroup
+	for p := range parts {
+		lo := min(p*size, len(nums))
+		hi := min(lo+size, len(nums))
+		wg.Go(func() {
+			for _, n := range nums[lo:hi] {
+				partial[p] += n
+			}
+		})
+	}
+	wg.Wait()
+	total := 0
+	for _, s := range partial {
+		total += s
+	}
+	return total
+}
+```
+
+3. `wg.Add(1)` อยู่ใน goroutine ทำให้ `wg.Wait()` อาจทำงานตอนตัวนับยังเป็น 0 แล้วจบทันทีก่อนที่จะพิมพ์อะไร ต้องย้าย `wg.Add(1)` ไปไว้ก่อน `go` หรือใช้ `wg.Go`
+
+</details>

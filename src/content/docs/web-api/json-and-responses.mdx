@@ -1,0 +1,374 @@
+---
+title: JSON และ response
+description: ออกแบบ response envelope มาตรฐาน เขียน JSON อย่างถูกต้อง และ render error จากที่เดียวด้วย httpx.HandlerFunc
+sidebar:
+  order: 3
+---
+
+import { Aside, Code, Tabs, TabItem } from '@astrojs/starlight/components';
+import respondSrc from '../../../../examples/tasks-api/internal/httpx/respond.go?raw';
+
+API ที่ดีควร "เดาได้" client ไม่ควรต้องเขียนโค้ดแยกสำหรับแต่ละ endpoint ว่า response หน้าตาแบบไหน หน้านี้จะวางรากฐานเรื่องนั้น: ใช้ `encoding/json` ให้ถูก, กำหนดรูปแบบ response กลาง และรวมการเขียน error ไว้ที่เดียว
+
+## encoding/json ฉบับย่อ
+
+`encoding/json` แปลง struct เป็น JSON โดยดูจาก **struct tag**
+
+```go
+type taskResponse struct {
+	ID          string     `json:"id"`
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	Status      Status     `json:"status"`
+	DueAt       *time.Time `json:"due_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+```
+
+กฎที่ต้องรู้
+
+- **ต้องเป็น exported field** (ขึ้นต้นตัวใหญ่) ไม่อย่างนั้น `encoding/json` มองไม่เห็น
+- **ตั้งชื่อด้วย tag** โปรเจกต์นี้ใช้ `snake_case` ทุก field (`due_at`, `created_at`) ซึ่งเป็นแบบที่ API สาธารณะส่วนใหญ่ใช้ เลือกแบบไหนก็ได้ แต่ต้อง **เหมือนกันทั้ง API**
+- **`omitempty`** ตัด field ทิ้งเมื่อเป็น zero value (`""`, `0`, `false`, `nil`, slice/map ว่าง)
+- **`time.Time`** ถูกเขียนเป็น RFC 3339 เช่น `"2026-11-16T04:31:27.525654Z"` และอ่านกลับได้ทั้งแบบ `Z` และแบบมี offset อย่าง `+07:00`
+
+### null หรือไม่ส่ง field: ใช้ pointer
+
+`DueAt` เป็น `*time.Time` และ **ไม่มี** `omitempty` ผลคือ task ที่ไม่มีกำหนดส่งจะได้ `"due_at": null` ส่วน task ที่มีจะได้เวลาจริง
+
+```json
+{ "title": "อ่านหนังสือ", "due_at": null }
+{ "title": "เรียน Go",   "due_at": "2026-12-01T02:00:00Z" }
+```
+
+ทำไมไม่ใช้ `omitempty` ตรงนี้? เพราะเราอยากให้ **ทุก task มี key ครบเหมือนกันเสมอ** client จะได้ไม่ต้องเช็กว่า key มีหรือไม่มี แค่เช็กว่าเป็น `null` หรือเปล่า ส่วน `omitempty` เราใช้กับสิ่งที่ "มีบ้างไม่มีบ้าง" โดยธรรมชาติ เช่น `next_cursor` หรือ `details` ของ error
+
+<Aside type="caution" title="nil slice กลายเป็น null">
+slice ที่เป็น `nil` ถูกเขียนเป็น `null` ไม่ใช่ `[]` ถ้า list ว่างแล้วตอบ `"data": null` client หลายภาษาจะพังตอนวนลูป handler `List` จึงสร้าง slice ด้วย `make([]taskResponse, 0, len(page.Tasks))` เพื่อให้ได้ `"data": []` เสมอ
+</Aside>
+
+### แปลงเวลาเป็น UTC ก่อนตอบ
+
+`toResponse` เรียก `.UTC()` กับทุกเวลา ทำให้ API ตอบเวลาในรูปแบบเดียวกันเสมอ ไม่ว่า client จะส่งมาเป็น timezone อะไร
+
+```bash
+# ส่งเป็นเวลาไทย
+-d '{"title":"เรียน Go","due_at":"2026-12-01T09:00:00+07:00"}'
+# ได้กลับเป็น UTC ซึ่งคือเวลาเดียวกัน
+"due_at":"2026-12-01T02:00:00Z"
+```
+
+การแสดงผลเป็นเวลาท้องถิ่นเป็นหน้าที่ของ client
+
+## Response envelope
+
+ทุก response ของ tasks-api ห่อข้อมูลไว้ในโครงสร้างเดียวกันที่เรียกว่า **envelope**
+
+<Tabs>
+<TabItem label="สำเร็จ (ชิ้นเดียว)">
+
+```json
+{
+  "data": {
+    "id": "01a1e29f-d325-7bf7-b957-179ae14d9519",
+    "title": "เรียน Go",
+    "description": "",
+    "status": "todo",
+    "due_at": "2026-12-01T02:00:00Z",
+    "created_at": "2026-11-16T04:31:27.525654Z",
+    "updated_at": "2026-11-16T04:31:27.525654Z"
+  },
+  "meta": { "request_id": "req_8edbbf508dfaac60e85cd858" }
+}
+```
+
+</TabItem>
+<TabItem label="สำเร็จ (list)">
+
+```json
+{
+  "data": [ { "id": "...", "title": "เรียน Go" } ],
+  "pagination": { "limit": 5, "has_more": false },
+  "meta": { "request_id": "req_..." }
+}
+```
+
+</TabItem>
+<TabItem label="error">
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "ข้อมูลไม่ผ่านการตรวจสอบ",
+    "details": [
+      { "field": "email", "issue": "รูปแบบอีเมลไม่ถูกต้อง" },
+      { "field": "name", "issue": "ห้ามว่าง" },
+      { "field": "password", "issue": "ต้องยาวอย่างน้อย 8 ตัวอักษร" }
+    ],
+    "request_id": "req_1e980678b8275cae8a5ac921"
+  }
+}
+```
+
+</TabItem>
+</Tabs>
+
+ข้อดีของการใช้ envelope
+
+- **รูปแบบคงที่** client เขียนโค้ดอ่าน response ครั้งเดียวใช้ได้ทุก endpoint: สำเร็จดูที่ `data` ผิดพลาดดูที่ `error`
+- **เพิ่มข้อมูลประกอบได้โดยไม่ทำลายของเดิม** เช่น `pagination` หรือ field ใหม่ใน `meta` ในอนาคต
+- **มี `request_id` ทุก response** เมื่อผู้ใช้แจ้งปัญหา แค่ส่ง `request_id` มา เราก็ค้น log ของ request นั้นเจอทันที (ค่านี้มาจาก middleware `RequestID` ในหน้า [Middleware](/web-api/middleware/))
+- **error มี `code` ที่คงที่** client ใช้ `code` ตัดสินใจในโค้ด ส่วน `message` ไว้แสดงให้คนอ่าน ซึ่งเราเปลี่ยนถ้อยคำได้โดยไม่ทำให้ client พัง
+
+<Aside type="note">
+`/healthz` และ `/readyz` ตอบ `{"status":"ok"}` โดยไม่ใช้ envelope เพราะเป็น endpoint สำหรับเครื่องมือของระบบ (load balancer, Kubernetes) ไม่ใช่สำหรับ client ของ API
+</Aside>
+
+## internal/httpx/respond.go
+
+helper ทั้งหมดที่ใช้เขียน response อยู่ในไฟล์เดียว
+
+<Code code={respondSrc} lang="go" title="internal/httpx/respond.go" />
+
+### JSON: ฟังก์ชันระดับล่างสุด
+
+```go title="internal/httpx/respond.go"
+func JSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false) // keep "<" and "&" readable; this is an API, not HTML
+	if err := enc.Encode(v); err != nil {
+		// The status line is already sent; all we can do is log.
+		slog.Error("encode response", "err", err)
+	}
+}
+```
+
+- ตั้ง `Content-Type` **ก่อน** `WriteHeader` ตามลำดับที่เรียนในหน้า [พื้นฐาน net/http](/web-api/http-basics/)
+- ใช้ `json.NewEncoder(w)` เขียนลง `ResponseWriter` โดยตรง ไม่ต้องสร้าง `[]byte` กลางทาง
+- ถ้า encode ล้มเหลว เราส่ง status ไปแล้ว จึงเปลี่ยนเป็น 500 ไม่ได้ ทำได้แค่ log ในทางปฏิบัติแทบไม่เกิด เพราะเรา encode แต่ struct ที่เรากำหนดเอง
+
+**`SetEscapeHTML(false)`** โดยค่าเริ่มต้น encoder จะแปลง `<`, `>`, `&` เป็น `<`, `>`, `&` เพื่อกันปัญหาเวลาฝัง JSON ลงใน HTML แต่ API นี้ตอบ JSON ล้วน (และมี header `X-Content-Type-Options: nosniff` กำกับ) การ escape จึงทำให้อ่านยากโดยไม่ได้ประโยชน์
+
+```bash
+$ curl -s -X POST localhost:8080/v1/tasks ... -d '{"title":"<b>เรียน Go & SQL</b>"}'
+{"data":{"id":"...","title":"<b>เรียน Go & SQL</b>",...}}
+# ถ้าไม่ปิด จะได้ "title":"<b>เรียน Go & SQL</b>"
+```
+
+### OK, List, NoContent
+
+```go
+httpx.OK(w, r, http.StatusCreated, toResponse(t))  // {"data": ..., "meta": ...}
+httpx.List(w, r, items, pg)                         // {"data": [...], "pagination": ..., "meta": ...}
+httpx.NoContent(w)                                  // 204 ไม่มี body (ใช้กับ DELETE)
+```
+
+ทั้ง `OK` และ `List` ใช้ struct `envelope` ตัวเดียวกัน ต่างกันแค่ `Pagination` ที่เป็น pointer พร้อม `omitempty` จึงโผล่เฉพาะใน list และทั้งคู่ดึง `request_id` จาก `r.Context()` มาใส่ `meta` ให้อัตโนมัติ
+
+### Error: แปลง error ทุกชนิดเป็น response
+
+`Error` รับ `error` อะไรก็ได้ แล้วตัดสินใจว่าจะตอบอย่างไร
+
+| error ที่ได้รับ | สิ่งที่ตอบ |
+| --- | --- |
+| `*httpx.APIError` (หาเจอด้วย `errors.As`) | ใช้ status, code, message, details ตามที่ error ระบุ |
+| error ที่ wrap `context.DeadlineExceeded` | `503 TIMEOUT` และ log ระดับ Warn |
+| error อื่นๆ ทั้งหมด | `500 INTERNAL_ERROR` และ log ระดับ Error พร้อมข้อความ error จริง |
+
+กรณีสุดท้ายสำคัญมาก: **ข้อความของ error ที่ไม่รู้จักจะไม่ถูกส่งให้ client** client เห็นแค่ "เกิดข้อผิดพลาดภายในระบบ" พร้อม `request_id` ส่วนรายละเอียดจริง (เช่นชื่อตาราง หรือ SQL ที่ล้มเหลว) อยู่ใน log ฝั่ง server เท่านั้น
+
+`APIError` คือ error type ที่ "รู้ว่าตัวเองควรแสดงผลอย่างไร" นิยามอยู่ใน `internal/httpx/errors.go`
+
+```go title="internal/httpx/errors.go"
+// APIError is an error that knows how it should be rendered over HTTP.
+// Handlers return it (or a plain error, which becomes a 500).
+type APIError struct {
+	Status  int
+	Code    string
+	Message string
+	Details []FieldError
+}
+```
+
+พร้อม constructor อย่าง `httpx.NotFound(msg)`, `httpx.Conflict(msg)` และ `httpx.Validation(details)` รายการ code ทั้งหมดและการแปลง domain error อยู่ในหน้า [Validation และ error](/web-api/validation-and-errors/)
+
+## httpx.HandlerFunc: handler ที่คืน error ได้
+
+handler มาตรฐานของ `net/http` ไม่มีค่าคืน ทุกครั้งที่เกิด error เราต้องเขียน response เองแล้ว `return` ซึ่งลืมง่ายมาก
+
+```go
+// แบบ http.HandlerFunc ปกติ
+func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
+	t, err := h.svc.Get(r.Context(), userID, id)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return // ลืมบรรทัดนี้ = เขียน response ซ้ำสองครั้ง
+	}
+	httpx.OK(w, r, http.StatusOK, toResponse(t))
+}
+```
+
+tasks-api จึงนิยาม handler type ใหม่ที่ **คืน `error`** ได้ ด้วยเทคนิคเดียวกับ `http.HandlerFunc`
+
+```go title="internal/httpx/respond.go"
+// HandlerFunc is an http.HandlerFunc that may return an error.
+// Returning errors (instead of writing them in every handler) keeps
+// error rendering in exactly one place.
+type HandlerFunc func(w http.ResponseWriter, r *http.Request) error
+
+func (fn HandlerFunc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if err := fn(w, r); err != nil {
+		Error(w, r, err)
+	}
+}
+```
+
+เพราะมี method `ServeHTTP` จึงเป็น `http.Handler` ใช้กับ `mux.Handle` และ middleware ได้ทันที ส่วน handler จริงเขียนแบบ Go ปกติ: เจอ error ก็ `return err`
+
+```go title="internal/task/handler.go"
+// Get handles GET /v1/tasks/{id}.
+func (h *Handler) Get(w http.ResponseWriter, r *http.Request) error {
+	id, ok := httpx.PathUUID(r, "id")
+	if !ok {
+		return errTaskNotFound
+	}
+	t, err := h.svc.Get(r.Context(), mustUserID(r), id)
+	if err != nil {
+		return mapError(err)
+	}
+	httpx.OK(w, r, http.StatusOK, toResponse(t))
+	return nil
+}
+```
+
+และลงทะเบียนโดยห่อด้วย `httpx.HandlerFunc(...)`
+
+```go title="internal/server/server.go"
+mux.Handle("GET /v1/tasks/{id}", requireAuth(httpx.HandlerFunc(d.Tasks.Get)))
+```
+
+<Aside type="tip">
+กฎของ handler แบบนี้: **ถ้าเขียน response แล้ว ให้ `return nil`** ถ้าคืน error หลังจากเขียน response ไปแล้ว `Error` จะพยายามเขียนซ้ำ ซึ่ง status จะไม่เปลี่ยนแล้ว เพราะส่งออกไปก่อนหน้านั้น
+</Aside>
+
+## แยก response DTO ออกจาก domain model
+
+domain model `task.Task` **ไม่มี JSON tag เลย** โดยตั้งใจ
+
+```go title="internal/task/task.go"
+// Task is the domain model. It has no JSON or SQL tags on purpose:
+// the HTTP layer and the database layer each map it to their own shape.
+type Task struct {
+	ID          string
+	UserID      string
+	Title       string
+	Description string
+	Status      Status
+	DueAt       *time.Time
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+```
+
+ชั้น HTTP มี struct ของตัวเองคือ `taskResponse` (DTO: data transfer object) และฟังก์ชัน `toResponse` สำหรับแปลง
+
+```go title="internal/task/handler.go"
+func toResponse(t Task) taskResponse {
+	r := taskResponse{
+		ID:          t.ID,
+		Title:       t.Title,
+		Description: t.Description,
+		Status:      t.Status,
+		CreatedAt:   t.CreatedAt.UTC(),
+		UpdatedAt:   t.UpdatedAt.UTC(),
+	}
+	if t.DueAt != nil {
+		due := t.DueAt.UTC()
+		r.DueAt = &due
+	}
+	return r
+}
+```
+
+สังเกตว่า `UserID` ไม่ได้ถูกส่งออกไป เพราะ client ไม่จำเป็นต้องรู้ ประโยชน์ของการแยกเห็นชัดที่สุดใน feature user ซึ่ง domain model มี `PasswordHash`
+
+```go title="internal/user/handler.go"
+// userResponse never includes the password hash.
+type userResponse struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+```
+
+ถ้าเราใส่ JSON tag ให้ `user.User` แล้วส่งออกไปตรงๆ วันหนึ่งที่มีคนเพิ่ม field ลับเข้าไปใน model ก็จะหลุดออกไปทาง API ทันทีโดยไม่มีใครตั้งใจ การมี DTO แยกทำให้ **field ที่ออกไปต้องถูกเลือกอย่างตั้งใจเสมอ** และเปลี่ยนโครงสร้างภายในได้โดยไม่ทำให้ API contract เปลี่ยน
+
+<Aside type="caution">
+อย่าใช้ `json:"-"` บน domain model เป็นการป้องกันหลัก มันใช้ได้ แต่ป้องกันได้เฉพาะ field ที่เราจำได้ว่าต้องซ่อน ส่วน DTO ป้องกันโดยปริยาย: field ใหม่จะไม่ออกไปจนกว่าจะมีคนเพิ่มลงใน DTO
+</Aside>
+
+## ลองดูของจริง
+
+สร้าง task แล้วดู header และ body
+
+```bash
+curl -si -X POST localhost:8080/v1/tasks \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"เรียน Go","due_at":"2026-12-01T09:00:00+07:00"}'
+```
+
+```text
+HTTP/1.1 201 Created
+Content-Type: application/json; charset=utf-8
+Location: /v1/tasks/01a1e29f-d325-7bf7-b957-179ae14d9519
+X-Request-Id: req_8edbbf508dfaac60e85cd858
+...
+```
+
+```json
+{
+  "data": {
+    "id": "01a1e29f-d325-7bf7-b957-179ae14d9519",
+    "title": "เรียน Go",
+    "description": "",
+    "status": "todo",
+    "due_at": "2026-12-01T02:00:00Z",
+    "created_at": "2026-11-16T04:31:27.525654Z",
+    "updated_at": "2026-11-16T04:31:27.525654Z"
+  },
+  "meta": { "request_id": "req_8edbbf508dfaac60e85cd858" }
+}
+```
+
+- status `201 Created` พร้อม header `Location` ชี้ไปที่ resource ใหม่ ตามธรรมเนียม REST
+- `request_id` ใน body ตรงกับ header `X-Request-Id`
+
+ลองเรียก task ที่ไม่มีอยู่
+
+```bash
+curl -s localhost:8080/v1/tasks/01a1e29f-0000-7000-8000-000000000000 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "ไม่พบ task",
+    "request_id": "req_..."
+  }
+}
+```
+
+## สรุป
+
+- ใช้ struct tag ตั้งชื่อ field แบบ `snake_case` ให้เหมือนกันทั้ง API, ใช้ pointer แทน "ไม่มีค่า" และแปลงเวลาเป็น UTC
+- ทุก response ใช้ envelope เดียวกัน: `data` + `pagination` + `meta` เมื่อสำเร็จ และ `error` (code, message, details, request_id) เมื่อผิดพลาด
+- `httpx.HandlerFunc` ให้ handler `return err` ได้ แล้ว `httpx.Error` render error ทั้งหมดในที่เดียว error ที่ไม่รู้จักกลายเป็น 500 โดยไม่เปิดเผยรายละเอียด
+- แยก response DTO (`taskResponse`, `userResponse`) ออกจาก domain model เพื่อไม่ให้ field ภายในอย่าง `PasswordHash` หลุดออกไป

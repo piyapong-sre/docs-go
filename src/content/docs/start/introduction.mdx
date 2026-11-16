@@ -1,0 +1,117 @@
+---
+title: Go คืออะไร
+description: รู้จักภาษา Go ที่มา จุดเด่น ข้อจำกัด และเหตุผลที่บริษัทชั้นนำเลือกใช้
+sidebar:
+  order: 1
+---
+
+import { Aside, Code, CardGrid, Card } from '@astrojs/starlight/components';
+import tasteSrc from '../../../../examples/learn/start/taste/main.go?raw';
+
+**Go** (หรือที่หลายคนเรียกว่า **Golang** ตามชื่อเว็บไซต์เดิม golang.org) เป็นภาษาโปรแกรมแบบ open source ที่ Google เริ่มพัฒนาในปี 2007 โดย Robert Griesemer, Rob Pike และ Ken Thompson (หนึ่งในผู้สร้าง Unix และภาษา B) และเปิดตัวสู่สาธารณะในปี 2009 ส่วน Go 1.0 ออกในปี 2012 พร้อมคำสัญญาเรื่อง **Go 1 compatibility** ว่า code ที่เขียนตามสเปก Go 1 จะยัง compile ได้ในเวอร์ชันถัด ๆ ไป
+
+## ทำไม Go ถึงเกิดขึ้น
+
+ทีมผู้สร้างเจอปัญหาจากการพัฒนาระบบขนาดใหญ่ที่ Google ด้วย C++ และ Java:
+
+- **compile ช้ามาก** — โปรเจกต์ใหญ่ build ทีเป็นสิบนาทีหรือนานกว่านั้น
+- **ภาษาซับซ้อน** — มีวิธีทำสิ่งเดียวกันหลายแบบ ทำให้อ่าน code ของคนอื่นยาก
+- **dependency ยุ่งเหยิง** — header file และ build system ที่ซับซ้อน
+- **ฮาร์ดแวร์เปลี่ยนไป** — CPU มีหลาย core แต่การเขียนโปรแกรมแบบ concurrent ยังยากและผิดพลาดง่าย
+
+Go จึงถูกออกแบบให้ **เรียบง่าย อ่านง่าย compile เร็ว และรองรับ concurrency ตั้งแต่ระดับภาษา**
+
+## จุดเด่นของ Go
+
+<CardGrid>
+	<Card title="เรียบง่าย" icon="approve-check">
+		keyword มีแค่ 25 คำ ไม่มี class/inheritance ไม่มี exception มีวิธีเขียน loop แบบเดียวคือ `for` ทำให้ code ของทุกคนหน้าตาคล้ายกัน
+	</Card>
+	<Card title="Compile เร็ว ได้ไฟล์เดียว" icon="rocket">
+		compile เป็น native binary ไฟล์เดียว ไม่ต้องติดตั้ง runtime บนเครื่องปลายทาง และ cross-compile ข้าม OS ได้ง่าย
+	</Card>
+	<Card title="Concurrency ในตัว" icon="random">
+		goroutine เบามาก (เริ่มต้นใช้ stack เพียงไม่กี่ KB) สร้างได้เป็นแสนตัว และสื่อสารกันผ่าน channel
+	</Card>
+	<Card title="Tooling ครบ" icon="setting">
+		`go fmt`, `go vet`, `go test`, `go mod`, profiler และ race detector มาพร้อมกับ toolchain ไม่ต้องหาเพิ่ม
+	</Card>
+	<Card title="Standard library แข็งแรง" icon="open-book">
+		มี HTTP server/client, JSON, crypto, testing, logging ฯลฯ ในตัว เขียน Web API ระดับ production ได้โดยแทบไม่ต้องพึ่ง library ภายนอก
+	</Card>
+	<Card title="Statically typed + GC" icon="star">
+		จับ error ได้ตั้งแต่ตอน compile มี garbage collector จัดการหน่วยความจำให้ จึงปลอดภัยกว่า C/C++ แต่ยังเร็ว
+	</Card>
+</CardGrid>
+
+## ชิมลาง: หน้าตาของ Go
+
+ตัวอย่างด้านล่างรวมหลายอย่างที่เราจะได้เรียนในบทต่อ ๆ ไป ได้แก่ struct, slice, `for ... range` และ goroutine ตอนนี้ยังไม่ต้องเข้าใจทุกบรรทัด แค่ดูว่า code อ่านง่ายแค่ไหน
+
+<Code code={tasteSrc} lang="go" title="examples/learn/start/taste/main.go" />
+
+```text title="Output"
+- Go เบื้องต้น (120 หน้า)
+- Concurrency in Go (240 หน้า)
+- Web API ด้วย Go (310 หน้า)
+```
+
+สังเกตว่า:
+
+- `type Book struct { ... }` ประกาศชนิดข้อมูลใหม่ — ไม่มี class แต่มี struct
+- `wg.Go(func() { ... })` ทำงานแต่ละงานใน **goroutine** แยกกัน (ทำงานพร้อมกันได้) แล้ว `wg.Wait()` รอให้ทุกงานเสร็จ
+- ทั้งไฟล์ไม่มี `;` ปิดท้ายบรรทัด และจัดรูปแบบตามมาตรฐานเดียวกันด้วย `go fmt`
+
+## ใครใช้ Go บ้าง
+
+Go เป็นภาษาหลักของโลก **cloud-native** และ infrastructure:
+
+| ประเภท | ตัวอย่างซอฟต์แวร์ที่เขียนด้วย Go |
+| --- | --- |
+| Container & Orchestration | Docker, Kubernetes, containerd |
+| Infrastructure as Code | Terraform, Pulumi |
+| Observability | Prometheus, Grafana (backend), Jaeger |
+| Database & Storage | CockroachDB, etcd, InfluxDB, MinIO |
+| Networking & Proxy | Caddy, Traefik, Consul |
+| Developer Tools | GitHub CLI (`gh`), Hugo |
+
+บริษัทที่ใช้ Go ในระบบ production เช่น Google, Uber, Cloudflare, Dropbox, Twitch, PayPal และบริษัทในไทยจำนวนมากโดยเฉพาะสาย fintech, e-commerce และ backend ที่ต้องรองรับ traffic สูง
+
+## Go เหมาะกับงานแบบไหน
+
+**เหมาะมาก**
+
+- Web API / microservices / backend ที่ต้องรองรับ request จำนวนมาก
+- CLI tool (ได้ไฟล์ binary ไฟล์เดียว แจกจ่ายง่าย)
+- งาน infrastructure, DevOps, networking
+- ระบบที่ต้องการ concurrency สูง เช่น worker, queue consumer, real-time service
+
+**อาจไม่ใช่ตัวเลือกแรก**
+
+- งาน data science / machine learning (ecosystem ของ Python ใหญ่กว่ามาก)
+- แอป GUI บน desktop หรือ mobile
+- ระบบที่ต้องควบคุมหน่วยความจำและ latency ละเอียดระดับไมโครวินาทีโดยไม่มี GC (เช่น game engine หรือ OS kernel) ซึ่ง C, C++ หรือ Rust เหมาะกว่า
+
+<Aside type="tip" title="ปรัชญาของ Go">
+Go ให้ความสำคัญกับ **ความชัดเจน (clarity) มากกว่าความฉลาด (cleverness)** — code ที่อ่านแล้วเข้าใจทันทีดีกว่า code ที่สั้นแต่ต้องตีความ ถ้ามาจากภาษาที่มี feature เยอะ อาจรู้สึกว่า Go "ขาด" บางอย่าง แต่ความเรียบง่ายนี้คือจุดแข็งเมื่อทำงานเป็นทีมและดูแล code ระยะยาว
+</Aside>
+
+<Aside type="caution" title="Go กับ Golang">
+ชื่อทางการของภาษาคือ **Go** ส่วนคำว่า "Golang" มาจากชื่อโดเมนเดิม เวลาค้นหาข้อมูลบนอินเทอร์เน็ต การใช้คำว่า "golang" จะได้ผลลัพธ์ตรงกว่า เพราะคำว่า "go" เป็นคำทั่วไปเกินไป
+</Aside>
+
+## แหล่งข้อมูลทางการ
+
+- [go.dev](https://go.dev) — เว็บไซต์หลัก ดาวน์โหลดและเอกสาร
+- [go.dev/tour](https://go.dev/tour) — A Tour of Go แบบ interactive
+- [pkg.go.dev](https://pkg.go.dev) — เอกสารของ standard library และ package ทั้งหมด
+- [go.dev/play](https://go.dev/play) — Go Playground ลองรัน code บน browser ได้ทันที
+- [Effective Go](https://go.dev/doc/effective_go) — แนวทางเขียน Go ให้เป็น "idiomatic"
+
+## แบบฝึกหัด
+
+1. ลองเปิด [Go Playground](https://go.dev/play) แล้ว copy ตัวอย่าง "ชิมลาง" ด้านบนไปรัน จากนั้นเพิ่มหนังสือเล่มที่ 4 เข้าไปใน slice `books`
+2. ลองคิดว่าระบบที่คุณทำงานอยู่ (หรืออยากสร้าง) มีส่วนไหนที่เหมาะจะเขียนด้วย Go และส่วนไหนที่ไม่เหมาะ เพราะอะไร
+3. ค้นหาว่าซอฟต์แวร์ที่คุณใช้อยู่ทุกวัน (เช่น Docker, VS Code extension, CLI tool ต่าง ๆ) ตัวไหนเขียนด้วย Go บ้าง
+
+ขั้นต่อไป: [ติดตั้ง Go และเตรียมเครื่องมือ](/start/installation/)

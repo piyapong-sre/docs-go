@@ -1,0 +1,233 @@
+---
+title: Concurrency patterns
+description: pattern ที่ใช้จริงบ่อยๆ ได้แก่ worker pool, pipeline, fan-out/fan-in, errgroup พร้อม SetLimit และ semaphore ด้วย buffered channel
+sidebar:
+  order: 6
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/concurrency/patterns/main.go?raw';
+
+เมื่อเข้าใจ goroutine, channel, select, sync และ context แล้ว บทนี้รวม **pattern สำเร็จรูป** ที่เจอบ่อยในงานจริง
+ทุก pattern อยู่ในไฟล์เดียวด้านล่าง แล้วจะอธิบายทีละส่วน
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/concurrency/patterns/main.go" />
+
+```text title="Output"
+worker pool: [{1 4} {2 9} {3 16} {4 25} {5 36}]
+pipeline: [1 4 9 16 25 36]
+errgroup ok: [body of a.com body of b.com body of c.com] <nil>
+errgroup err: fetch bad://url: unsupported operation
+semaphore peak concurrency: 3
+```
+
+<Aside>
+ตัวอย่างนี้ใช้ `golang.org/x/sync/errgroup` ซึ่งเป็น module เสริมของทีม Go (ไม่อยู่ใน standard library)
+ติดตั้งในโปรเจกต์ของคุณด้วย `go get golang.org/x/sync`
+</Aside>
+
+## 1. Worker pool
+
+**ปัญหา:** มีงาน 10,000 ชิ้น ถ้าสร้าง goroutine ทีละชิ้นอาจยิง request พร้อมกันจน server ปลายทางล่ม หรือ database connection หมด
+**ทางแก้:** สร้าง worker จำนวน **คงที่** แล้วให้ดึงงานจาก channel เดียวกัน
+
+```text
+            ┌─> worker 1 ─┐
+jobs ──────>├─> worker 2 ─┤──────> results
+            └─> worker 3 ─┘
+```
+
+ขั้นตอนใน `workerPool`
+
+1. สร้าง worker `workers` ตัว แต่ละตัว `for j := range jobCh` — วนรับงานจนกว่า `jobCh` จะถูกปิด
+2. goroutine หนึ่งส่งงานทั้งหมดเข้า `jobCh` แล้ว `close(jobCh)` เพื่อบอก worker ว่าหมดงานแล้ว
+3. อีก goroutine รอ `wg.Wait()` แล้ว `close(resCh)` เพื่อให้ฝั่งรับรู้ว่าผลครบแล้ว
+4. `main` วน `range resCh` เก็บผล
+
+<Aside type="caution" title="ทำไมต้อง close(resCh) ใน goroutine แยก">
+ถ้าเขียน `wg.Wait()` ตรงๆ ใน function ก่อนอ่าน `resCh` จะ deadlock
+เพราะ worker บล็อกอยู่ที่ `resCh <- ...` (ไม่มีใครรับ) จึงไม่มีวัน `Done` และ `Wait` ก็ไม่มีวันจบ
+</Aside>
+
+ผลลัพธ์จาก worker pool **มาไม่เรียงลำดับ** เพราะงานเสร็จไม่พร้อมกัน ถ้าลำดับสำคัญให้แนบ ID ไปกับผลแล้ว sort ภายหลัง (เหมือนที่ทำในตัวอย่าง)
+
+## 2. Pipeline
+
+แบ่งการประมวลผลเป็น **ขั้นตอน (stage)** แต่ละขั้นเป็น goroutine รับจาก channel ขาเข้าและส่งไป channel ขาออก
+
+```text
+generate ──> square ──> (consumer)
+```
+
+ทุก stage ในตัวอย่างทำตามแบบเดียวกัน
+
+```go
+func stage(ctx context.Context, in <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)          // ① ปิด out เมื่อจบ ให้ stage ถัดไปรู้
+		for n := range in {       // ② วนจน in ถูกปิด
+			select {
+			case out <- n * n:    // ③ ส่งต่อ
+			case <-ctx.Done():    // ④ หรือหยุดถ้าถูกยกเลิก
+				return
+			}
+		}
+	}()
+	return out                    // ⑤ คืน channel แบบรับอย่างเดียว
+}
+```
+
+`select` กับ `ctx.Done()` สำคัญมาก ถ้าผู้ใช้ปลายทางเลิกอ่านกลางทาง stage จะไม่ค้างอยู่ที่ `out <- ...` ตลอดไป
+
+## 3. Fan-out / Fan-in
+
+- **fan-out:** หลาย goroutine อ่านจาก channel **เดียวกัน** เพื่อกระจายงาน (ในตัวอย่าง `square` สามตัวอ่าน `src` ร่วมกัน)
+- **fan-in:** รวมหลาย channel เป็น channel **เดียว** (`merge`)
+
+```text
+              ┌─> square ─┐
+generate ──>  ├─> square ─┤──> merge ──> main
+              └─> square ─┘
+```
+
+`merge` สร้าง goroutine หนึ่งตัวต่อ channel ขาเข้า คอยส่งต่อเข้า `out`
+แล้วใช้ `WaitGroup` รอให้ทุกตัวจบก่อน `close(out)` — โครงเดียวกับ worker pool
+
+fan-out เหมาะกับ stage ที่ช้า (เช่น เรียก API) ใส่หลาย goroutine ให้ stage นั้นไม่เป็นคอขวด
+
+## 4. errgroup
+
+`WaitGroup` รอได้อย่างเดียว ไม่รับ error ถ้างานคืน error ได้ ใช้ **`errgroup.Group`** แทน
+
+```go
+g, ctx := errgroup.WithContext(ctx)
+g.SetLimit(2) // จำกัดจำนวนงานที่รันพร้อมกัน
+
+for i, u := range urls {
+	g.Go(func() error {
+		// ... ใช้ ctx ในงาน
+		return err
+	})
+}
+if err := g.Wait(); err != nil { // error ตัวแรกที่เกิด
+	return nil, err
+}
+```
+
+| ความสามารถ | รายละเอียด |
+|---|---|
+| `g.Go(func() error)` | รันงานใน goroutine ใหม่ |
+| `g.Wait()` | รอทุกงาน คืน **error ตัวแรก** ที่ไม่ใช่ nil |
+| `errgroup.WithContext` | ได้ `ctx` ที่จะถูก **ยกเลิกทันที** เมื่องานใดงานหนึ่งคืน error งานอื่นจึงหยุดได้เร็ว |
+| `g.SetLimit(n)` | ให้รันพร้อมกันไม่เกิน n — `g.Go` จะ block รอจนมีช่องว่าง |
+| `g.TryGo(f)` | เหมือน `Go` แต่ไม่ block คืน `false` ถ้าเต็ม |
+
+`SetLimit` ทำให้ errgroup เป็น worker pool ฉบับย่อได้ในตัว ไม่ต้องสร้าง channel เอง
+**ในงานจริงส่วนใหญ่ errgroup + SetLimit คือตัวเลือกแรก** สำหรับ "ทำ N งานพร้อมกัน จำกัดจำนวน และหยุดเมื่อพัง"
+
+<Aside type="caution">
+ตัวแปร `ctx` ที่ได้จาก `errgroup.WithContext` จะถูกยกเลิกเมื่อ `Wait` คืนค่าด้วย
+อย่าเอา ctx ตัวนี้ไปใช้ต่อหลัง `g.Wait()` ให้ใช้ ctx ตัวเดิมของ caller แทน
+</Aside>
+
+## 5. Semaphore ด้วย buffered channel
+
+ถ้าแค่อยาก **จำกัดจำนวนงานพร้อมกัน** ในโค้ดที่มี goroutine อยู่แล้ว buffered channel ทำหน้าที่เป็น semaphore ได้
+
+```go
+sem := make(chan struct{}, 3) // ช่องว่าง 3 ช่อง
+
+sem <- struct{}{}        // ขอ slot (block ถ้าครบ 3 แล้ว)
+defer func() { <-sem }() // คืน slot เมื่อเสร็จ
+```
+
+ในตัวอย่างมีงาน 10 ชิ้น แต่ `peak` (จำนวนที่รันพร้อมกันสูงสุด) เป็น 3 เสมอ
+ใช้ `struct{}` เพราะมีขนาด 0 byte — เราสนแค่ "มีที่ว่างไหม" ไม่ได้สนค่า
+
+ถ้าต้องการ semaphore ที่แต่ละงานใช้ "น้ำหนัก" ไม่เท่ากัน มี `golang.org/x/sync/semaphore` ให้ใช้
+
+## เลือก pattern ไหนดี
+
+| ต้องการ | ใช้ |
+|---|---|
+| รัน N งาน รอให้ครบ ไม่มี error | `sync.WaitGroup` + `wg.Go` |
+| รัน N งาน มี error หยุดเมื่อพัง | `errgroup.WithContext` |
+| เหมือนข้างบน แต่จำกัดจำนวนพร้อมกัน | `errgroup` + `SetLimit` |
+| งานไหลต่อเนื่อง (stream) ผ่านหลายขั้นตอน | pipeline (+ fan-out ที่ stage ช้า) |
+| worker อายุยาว รับงานจากคิวไปเรื่อยๆ | worker pool ด้วย channel |
+
+<Aside type="tip" title="ใช้ concurrency เมื่อมีเหตุผล">
+concurrency เพิ่มความซับซ้อนเสมอ ใช้เมื่องานเป็น **I/O-bound** (รอ network/disk) หรือ CPU-bound ที่แบ่งได้จริง
+และ **วัดผลก่อนและหลัง** — หลายครั้ง loop ธรรมดาเร็วพอแล้ว และงานเล็กๆ ที่แตก goroutine มากเกินไปอาจช้ากว่าเดิม
+</Aside>
+
+## แบบฝึกหัด
+
+1. แก้ `workerPool` ให้รับ `ctx context.Context` และหยุดส่งงานเมื่อ ctx ถูกยกเลิก
+2. เขียน `func checkURLs(ctx context.Context, urls []string) error` ด้วย errgroup ที่ทำ HTTP GET พร้อมกันไม่เกิน 5 ตัว คืน error ถ้ามี URL ไหนตอบ status ไม่ใช่ 200
+3. เพิ่ม stage `filterEven` ใน pipeline ระหว่าง `generate` กับ `square` ให้ผ่านเฉพาะเลขคู่
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1 — ฝั่งส่งงาน
+go func() {
+	defer close(jobCh)
+	for _, j := range jobs {
+		select {
+		case jobCh <- j:
+		case <-ctx.Done():
+			return
+		}
+	}
+}()
+
+// 2
+func checkURLs(ctx context.Context, urls []string) error {
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(5)
+	for _, u := range urls {
+		g.Go(func() error {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+			if err != nil {
+				return err
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("%s: status %d", u, resp.StatusCode)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+// 3
+func filterEven(ctx context.Context, in <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for n := range in {
+			if n%2 != 0 {
+				continue
+			}
+			select {
+			case out <- n:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+```
+
+</details>

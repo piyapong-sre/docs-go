@@ -1,0 +1,419 @@
+---
+title: Middleware
+description: เขียน middleware รูปแบบมาตรฐาน func(http.Handler) http.Handler สำหรับ request id, logging, recover, security headers, CORS, timeout และตรวจ Content-Type
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+งานบางอย่างต้องทำกับ **ทุก request** เช่น ใส่ request id, เขียน access log, กัน panic หรือใส่ security header ถ้าเขียนซ้ำในทุก handler โค้ดจะรกและลืมง่าย middleware คือการแยกงานเหล่านี้ออกมาเป็นชั้นที่ห่อ handler ไว้
+
+## รูปแบบของ middleware
+
+middleware ใน Go คือฟังก์ชันที่รับ `http.Handler` แล้วคืน `http.Handler` ตัวใหม่ที่ห่อตัวเดิมไว้
+
+```go title="internal/middleware/middleware.go"
+// Middleware wraps an http.Handler with extra behaviour.
+type Middleware func(http.Handler) http.Handler
+```
+
+โครงของ middleware ทุกตัวเหมือนกัน
+
+```go
+func Example(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1. ทำอะไรก่อนเรียก handler ข้างใน (อ่าน header, เริ่มจับเวลา, ...)
+		next.ServeHTTP(w, r) // 2. ส่งต่อ (หรือไม่ส่งต่อ ถ้าต้องการตัดจบ)
+		// 3. ทำอะไรหลัง handler ทำงานเสร็จ (เขียน log, ...)
+	})
+}
+```
+
+เพราะใช้แค่ type ของ `net/http` middleware แบบนี้จึงใช้ได้กับทุก router ที่ compatible กับ `net/http` และใช้ middleware ของคนอื่นที่เขียนรูปแบบเดียวกันได้ทันที
+
+middleware ที่ต้องการค่าตั้งค่า (เช่น logger หรือรายชื่อ origin) เขียนเป็นฟังก์ชันที่ **คืน** `Middleware` อีกชั้นหนึ่ง เช่น `Logger(base *slog.Logger) Middleware` และ `CORS(allowedOrigins []string) Middleware`
+
+## Chain: ต่อ middleware หลายตัว
+
+ถ้าห่อเองตรงๆ จะได้ `A(B(C(mux)))` ซึ่งอ่านยากเมื่อมีหลายตัว โปรเจกต์จึงมี helper `Chain`
+
+```go title="internal/middleware/middleware.go"
+// Chain applies middlewares so that the first one listed is the outermost:
+// Chain(h, A, B) == A(B(h)). A request flows A → B → h.
+func Chain(h http.Handler, mws ...Middleware) http.Handler {
+	for _, mw := range slices.Backward(mws) {
+		h = mw(h)
+	}
+	return h
+}
+```
+
+`slices.Backward` (Go 1.23) วนจากท้ายไปหน้า: ห่อตัวสุดท้ายก่อน ตัวแรกจึงอยู่ **นอกสุด** ผลคือลำดับที่เขียนตรงกับลำดับที่ request วิ่งผ่าน
+
+```go title="internal/server/server.go"
+	// Global middleware, outermost first.
+	return mw.Chain(mux,
+		mw.RequestID,
+		mw.Logger(d.Logger),
+		mw.Recoverer,
+		mw.SecureHeaders,
+		mw.CORS(d.CORSOrigins),
+		mw.Timeout(d.RequestTimeout),
+		mw.ContentTypeJSON,
+	)
+```
+
+```text
+request ─► RequestID ─► Logger ─► Recoverer ─► SecureHeaders ─► CORS ─► Timeout ─► ContentTypeJSON ─► mux ─► handler
+response ◄──────────────────────────────── (ย้อนกลับทางเดิม) ◄─────────────────────────────────────────────────┘
+```
+
+### ทำไมต้องเรียงแบบนี้
+
+- **RequestID นอกสุด** ทุกอย่างหลังจากนี้ (log, error response) จะมี request id ใช้
+- **Logger ก่อน Recoverer** ถ้า handler panic, Recoverer จะเขียน 500 แล้ว Logger ที่อยู่ชั้นนอกยังเห็นและ log status 500 ได้ ถ้าสลับกัน panic จะทะลุ Logger ไปก่อนที่มันจะได้ log
+- **SecureHeaders และ CORS ก่อนตัวที่อาจตัดจบ request** ทำให้ response ทุกแบบ รวมถึง error 415 มี header เหล่านี้ครบ
+- **ContentTypeJSON ในสุด** ตัดจบ request ที่ผิดรูปแบบ หลังจาก request ได้ id, ถูก log และมี header ครบแล้ว
+
+## RequestID
+
+```go title="internal/middleware/middleware.go"
+var validRequestID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// RequestID reuses a sane incoming X-Request-Id (e.g. from a load balancer)
+// or generates a new one, stores it in the context and echoes it back.
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-Id")
+		if !validRequestID.MatchString(id) {
+			id = newRequestID()
+		}
+		w.Header().Set("X-Request-Id", id)
+		next.ServeHTTP(w, r.WithContext(httpx.WithRequestID(r.Context(), id)))
+	})
+}
+
+func newRequestID() string {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b) // crypto/rand.Read never returns an error since Go 1.24
+	return "req_" + hex.EncodeToString(b)
+}
+```
+
+- ถ้ามี load balancer หรือ service ต้นทางส่ง `X-Request-Id` มา เราใช้ค่าเดิม ทำให้ตามรอย request ข้ามหลาย service ได้
+- **แต่ต้องตรวจก่อน** header มาจาก client ซึ่งเชื่อไม่ได้ ถ้ารับมาตรงๆ คนอาจส่งข้อความยาวมหาศาล หรือมีขึ้นบรรทัดใหม่เพื่อปลอม log ได้ เราจึงยอมรับแค่ตัวอักษรที่ปลอดภัย ยาวไม่เกิน 64 ตัว นอกนั้นสร้างใหม่
+- เก็บ id ลง context ด้วย `httpx.WithRequestID` ซึ่งใช้ key type ที่ไม่ export (`requestIDKey struct{}`) เพื่อไม่ให้ชนกับ package อื่น
+
+```bash
+$ curl -si localhost:8080/healthz -H 'X-Request-Id: my-trace-123' | grep -i request-id
+X-Request-Id: my-trace-123
+```
+
+## Logger
+
+```go title="internal/middleware/middleware.go"
+func Logger(base *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			log := base.With("request_id", httpx.RequestID(r.Context()))
+			rec := &statusRecorder{ResponseWriter: w}
+
+			next.ServeHTTP(rec, r.WithContext(httpx.WithLogger(r.Context(), log)))
+
+			if rec.status == 0 {
+				rec.status = http.StatusOK
+			}
+			level := slog.LevelInfo
+			if rec.status >= 500 {
+				level = slog.LevelError
+			}
+			// Log the path only: query strings may contain sensitive data.
+			log.LogAttrs(r.Context(), level, "http request",
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.Int("status", rec.status),
+				slog.Int("bytes", rec.bytes),
+				slog.Duration("duration", time.Since(start)),
+			)
+		})
+	}
+}
+```
+
+Logger ทำสองอย่าง
+
+1. **สร้าง request-scoped logger** ที่ติด `request_id` ไว้แล้ว เก็บลง context ให้โค้ดชั้นในเรียก `httpx.Logger(r.Context())` ได้ ทุกบรรทัด log ของ request เดียวกันจึงมี `request_id` เดียวกันโดยไม่ต้องส่งต่อเอง
+2. **เขียน access log หนึ่งบรรทัดต่อ request** หลัง handler ทำงานเสร็จ status 5xx ใช้ระดับ Error ที่เหลือใช้ Info
+
+```json
+{"time":"2026-11-16T11:35:08.638867+07:00","level":"INFO","msg":"http request","request_id":"my-trace-123","method":"GET","path":"/healthz","status":200,"bytes":16,"duration":27750}
+```
+
+<Aside type="caution" title="log แค่ path ไม่ log query string">
+ใช้ `r.URL.Path` ไม่ใช่ `r.URL.String()` หรือ `r.RequestURI` เพราะ query string อาจมีข้อมูลลับ เช่น token, อีเมล หรือ cursor ที่ client ส่งมา log มักถูกเก็บนานและหลายคนเข้าถึงได้ จึงต้องระวังเป็นพิเศษ ด้วยเหตุผลเดียวกัน อย่า log header `Authorization` หรือ request body
+</Aside>
+
+### statusRecorder: ดัก status code
+
+`http.ResponseWriter` ไม่มี method ให้อ่าน status ที่เขียนไปแล้ว เราจึงห่อมันด้วย struct ที่ embed `ResponseWriter` แล้ว override แค่ `WriteHeader` และ `Write`
+
+```go title="internal/middleware/middleware.go"
+// statusRecorder captures the status code and size written by the handler.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (rec *statusRecorder) WriteHeader(code int) {
+	if rec.status == 0 {
+		rec.status = code
+	}
+	rec.ResponseWriter.WriteHeader(code)
+}
+
+func (rec *statusRecorder) Write(b []byte) (int, error) {
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	n, err := rec.ResponseWriter.Write(b)
+	rec.bytes += n
+	return n, err
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (rec *statusRecorder) Unwrap() http.ResponseWriter { return rec.ResponseWriter }
+```
+
+- จำแค่ status **แรก** เพราะ `WriteHeader` ครั้งต่อไปไม่มีผลกับ response จริงอยู่แล้ว
+- `Write` โดยไม่เรียก `WriteHeader` ก่อน แปลว่า status เป็น 200 จึงบันทึกตามนั้น
+- **`Unwrap`** สำคัญ: `ResponseWriter` ตัวจริงมีความสามารถเพิ่มเติม เช่น `Flush` สำหรับ streaming หรือตั้ง deadline การเขียน ซึ่ง wrapper ของเราไม่มี `http.ResponseController` (Go 1.20) จะเรียก `Unwrap` เพื่อหาตัวจริงข้างใน ถ้าไม่มี method นี้ handler ที่ต้องใช้ฟีเจอร์เหล่านั้นจะได้ error `http.ErrNotSupported`
+
+## Recoverer
+
+```go title="internal/middleware/middleware.go"
+func Recoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			v := recover()
+			if v == nil {
+				return
+			}
+			if v == http.ErrAbortHandler { // deliberate abort; let net/http handle it
+				panic(v)
+			}
+			httpx.Logger(r.Context()).Error("panic recovered",
+				"panic", fmt.Sprint(v),
+				"stack", string(debug.Stack()),
+			)
+			w.Header().Set("Connection", "close")
+			httpx.Error(w, r, fmt.Errorf("panic: %v", v))
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+`net/http` เองก็ recover panic ใน handler อยู่แล้ว แต่วิธีของมันคือ log stack ลง error log แล้ว **ตัด connection ทิ้ง** client จะเห็นแค่ connection หลุดโดยไม่มี response ใดๆ Recoverer ของเราทำให้ดีขึ้น
+
+- ตอบ `500 INTERNAL_ERROR` ในรูปแบบ envelope ปกติพร้อม `request_id` (ผ่าน `httpx.Error` ซึ่งไม่ส่งข้อความ panic ให้ client)
+- log panic และ stack trace ผ่าน request-scoped logger จึงหา log ได้จาก `request_id`
+- ตั้ง `Connection: close` เพราะหลัง panic เราไม่แน่ใจว่าสถานะของ connection ยังดีอยู่หรือไม่
+
+**`http.ErrAbortHandler`** เป็น panic ค่าพิเศษที่โค้ดใช้เพื่อ "ยกเลิก response ทันที" (เช่น reverse proxy ที่ฝั่ง upstream หลุด) `net/http` จะตัด connection โดยไม่ log stack เราจึงต้อง panic ต่อให้มันจัดการตามปกติ ไม่ใช่กลืนไว้
+
+<Aside type="tip">
+Recoverer จับได้เฉพาะ panic ใน goroutine ของ request เท่านั้น ถ้า handler เปิด goroutine ใหม่แล้ว goroutine นั้น panic โปรแกรมทั้งตัวจะตาย goroutine ที่สร้างเองต้องมี `recover` ของตัวเอง (ทบทวนได้ที่ [defer, panic, recover](/intermediate/defer-panic-recover/))
+</Aside>
+
+## SecureHeaders
+
+```go title="internal/middleware/middleware.go"
+// SecureHeaders sets conservative security headers suitable for a JSON API.
+func SecureHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Header | ป้องกันอะไร |
+| --- | --- |
+| `X-Content-Type-Options: nosniff` | browser ต้องเชื่อ `Content-Type` ห้ามเดาว่า JSON เป็น HTML หรือ script |
+| `X-Frame-Options: DENY` | ห้ามนำ response ไปแสดงใน iframe (กัน clickjacking) |
+| `Referrer-Policy: no-referrer` | ไม่ส่ง URL ของ API ต่อไปใน header `Referer` |
+| `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` | ถ้ามีใครเปิด response ใน browser ก็ห้ามโหลดหรือรันอะไรทั้งสิ้น |
+
+API ที่ตอบแต่ JSON ไม่ต้องการ policy ที่ซับซ้อน แค่ "ห้ามทุกอย่าง" ก็พอ
+
+## CORS
+
+browser ห้ามหน้าเว็บจาก origin หนึ่ง (เช่น `http://localhost:3000`) อ่าน response จาก origin อื่น (เช่น `http://localhost:8080`) เว้นแต่ server จะอนุญาตผ่าน header CORS
+
+```go title="internal/middleware/middleware.go"
+func CORS(allowedOrigins []string) Middleware {
+	allowAll := slices.Contains(allowedOrigins, "*")
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			w.Header().Add("Vary", "Origin")
+
+			if origin != "" && (allowAll || slices.Contains(allowedOrigins, origin)) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Expose-Headers", "X-Request-Id, Location, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset")
+
+				// Preflight request.
+				if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+					w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id")
+					w.Header().Set("Access-Control-Max-Age", "600")
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+```
+
+- **เทียบ origin แบบตรงตัว** กับรายการใน `CORS_ALLOWED_ORIGINS` แล้วตอบ origin นั้นกลับใน `Access-Control-Allow-Origin` (ไม่ใช่ `*`)
+- **`Vary: Origin` ใส่ทุก response** เพราะ response ต่างกันตาม origin ถ้าไม่บอก cache (CDN, proxy) อาจส่ง response ที่มี header ของ origin หนึ่งให้อีก origin
+- **Preflight** ก่อนส่ง request ที่ไม่ใช่แบบง่าย (เช่น มี `Authorization` หรือ `Content-Type: application/json`) browser จะส่ง `OPTIONS` พร้อม `Access-Control-Request-Method` มาถามก่อน เราตอบ `204` พร้อมรายการ method/header ที่อนุญาต และ `Max-Age: 600` ให้ browser จำคำตอบไว้ 10 นาที
+- **`Expose-Headers`** โดยปกติ JavaScript อ่าน response header ได้แค่ไม่กี่ตัว เราจึงเปิดให้อ่าน `X-Request-Id`, `Location`, `Retry-After` และ `X-RateLimit-*` ได้ (frontend จะได้แสดงโควตาที่เหลือ)
+
+```bash
+$ curl -si -X OPTIONS localhost:8080/v1/tasks \
+    -H 'Origin: http://localhost:3000' \
+    -H 'Access-Control-Request-Method: POST'
+HTTP/1.1 204 No Content
+Access-Control-Allow-Headers: Authorization, Content-Type, X-Request-Id
+Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS
+Access-Control-Allow-Origin: http://localhost:3000
+Access-Control-Expose-Headers: X-Request-Id, Location, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset
+Access-Control-Max-Age: 600
+Vary: Origin
+...
+```
+
+ถ้า origin ไม่อยู่ในรายการ middleware จะไม่ใส่ header CORS แล้วส่งต่อตามปกติ (ในที่นี้ `OPTIONS /v1/tasks` ไม่มี route จึงได้ 404) browser เห็นว่าไม่มี `Access-Control-Allow-Origin` ก็จะบล็อก request จริงเอง
+
+<Aside type="caution" title="CORS ไม่ใช่ระบบ security ของ API">
+CORS ป้องกันแค่ "หน้าเว็บใน browser อ่าน response ข้าม origin" เท่านั้น curl, Postman หรือ server อื่นเรียก API ได้เสมอโดยไม่สน CORS การป้องกันจริงคือ authentication และ authorization ส่วน `*` ให้ใช้แค่ตอนพัฒนา production ต้องระบุ origin ที่แน่นอน
+</Aside>
+
+## Timeout
+
+```go title="internal/middleware/middleware.go"
+// Timeout gives every request a deadline. Context-aware work (database calls,
+// outgoing HTTP) stops when the deadline passes, and httpx.Error renders the
+// resulting context.DeadlineExceeded as 503.
+func Timeout(d time.Duration) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), d)
+			defer cancel()
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+```
+
+middleware นี้ไม่ได้ "ตัด" handler ทิ้ง แต่ตั้ง deadline ให้ context ของ request งานที่ส่ง context ต่อไป เช่น query ของ pgx จะถูกยกเลิกเมื่อเลย deadline และคืน error ที่ wrap `context.DeadlineExceeded` ขึ้นมา ซึ่ง `httpx.Error` แปลงเป็น 503
+
+```go title="internal/httpx/respond.go"
+	case errors.Is(err, context.DeadlineExceeded):
+		Logger(r.Context()).Warn("request timed out", "err", err)
+		apiErr = &APIError{
+			Status:  http.StatusServiceUnavailable,
+			Code:    CodeTimeout,
+			Message: "request ใช้เวลานานเกินไป กรุณาลองใหม่",
+		}
+```
+
+```json
+{
+  "error": {
+    "code": "TIMEOUT",
+    "message": "request ใช้เวลานานเกินไป กรุณาลองใหม่",
+    "request_id": "req_b4898285a54045229cb874b6"
+  }
+}
+```
+
+กลไกนี้ทำงานได้เพราะเรา **wrap error ด้วย `%w` ทุกชั้น** (`fmt.Errorf("list tasks: %w", err)`) `errors.Is` จึงหา `context.DeadlineExceeded` เจอแม้จะถูกห่อหลายชั้น
+
+<Aside type="note">
+standard library มี `http.TimeoutHandler` ที่ตัด response ทิ้งได้จริง แต่มันต้อง buffer response ทั้งหมดไว้ใน memory และตอบ error เป็น plain text ที่ไม่ตรงกับ envelope ของเรา การใช้ context deadline เข้ากับโค้ดที่ส่ง context ต่ออยู่แล้วได้ดีกว่า ส่วนกรณีที่โค้ดไม่สน context ยังมี `WriteTimeout` ของ `http.Server` เป็นด่านสุดท้าย (ดู [Graceful shutdown](/web-api/graceful-shutdown/))
+</Aside>
+
+## ContentTypeJSON
+
+```go title="internal/middleware/middleware.go"
+// ContentTypeJSON rejects write requests whose body is not JSON (415).
+func ContentTypeJSON(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch:
+			ct := r.Header.Get("Content-Type")
+			if !strings.HasPrefix(strings.ToLower(ct), "application/json") {
+				httpx.Error(w, r, &httpx.APIError{
+					Status:  http.StatusUnsupportedMediaType,
+					Code:    httpx.CodeUnsupportedMediaType,
+					Message: "Content-Type ต้องเป็น application/json",
+				})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+request ที่มี body (`POST`, `PUT`, `PATCH`) ต้องส่ง `Content-Type: application/json` (รับ `application/json; charset=utf-8` ด้วยเพราะเช็กแค่ prefix) นอกจากบอก client ชัดๆ ว่าส่งผิดรูปแบบ ยังช่วยป้องกัน CSRF แบบง่าย เพราะ HTML form ส่ง `application/json` ไม่ได้
+
+```bash
+$ curl -s -X POST localhost:8080/v1/auth/register -d '{}'
+{"error":{"code":"UNSUPPORTED_MEDIA_TYPE","message":"Content-Type ต้องเป็น application/json","request_id":"req_75bb815e294fa6b0882cb869"}}
+```
+
+(curl ที่ใช้ `-d` จะส่ง `Content-Type: application/x-www-form-urlencoded` ถ้าไม่ระบุเอง)
+
+## Global middleware vs route-specific middleware
+
+middleware ทั้ง 7 ตัวข้างบนเป็น **global** ห่อทั้ง mux จึงทำงานกับทุก request แต่บางอย่างควรใช้กับบาง route เท่านั้น เราห่อ handler ตอนลงทะเบียนแทน
+
+```go title="internal/server/server.go"
+	// Auth: stricter rate limit against brute-force attempts.
+	limited := d.AuthLimiter.Middleware
+	mux.Handle("POST /v1/auth/register", limited(httpx.HandlerFunc(d.Users.Register)))
+	mux.Handle("POST /v1/auth/login", limited(httpx.HandlerFunc(d.Users.Login)))
+	mux.Handle("GET /v1/me", requireAuth(httpx.HandlerFunc(d.Users.Me)))
+
+	// Tasks: every route requires a logged-in user.
+	mux.Handle("GET /v1/tasks", requireAuth(httpx.HandlerFunc(d.Tasks.List)))
+```
+
+- **`requireAuth`** (จาก `auth.RequireAuth`) ตรวจ Bearer token และใส่ user id ลง context ใช้กับทุก route ที่ต้อง login แต่ไม่ใช้กับ `/healthz` หรือ `/v1/auth/login`
+- **rate limiter** จำกัดจำนวนครั้งต่อนาทีต่อ IP ใช้กับ register/login ที่เสี่ยงต่อการเดารหัสผ่าน
+
+ทั้งสองตัวมีรูปแบบ `func(http.Handler) http.Handler` เหมือนกันทุกประการ ต่างกันแค่ว่าห่อที่ไหน รายละเอียดอยู่ในหน้า [Authentication](/web-api/authentication/)
+
+<Aside type="tip">
+ห่อ route-specific middleware ไว้ **ใกล้ handler** และ global middleware ไว้ **นอก mux** ถ้าวันหนึ่ง route ส่วนใหญ่ต้อง login เหมือนกัน อาจแยกเป็น mux ย่อยหรือ helper อย่าง `protected := func(h httpx.HandlerFunc) http.Handler { return requireAuth(h) }` ก็ได้ แต่อย่าทำให้มองไม่ออกว่า route ไหนต้อง login
+</Aside>
+
+## สรุป
+
+- middleware คือ `func(http.Handler) http.Handler` ทำงานก่อน/หลังเรียก `next.ServeHTTP` หรือตัดจบเองก็ได้
+- `Chain` ใช้ `slices.Backward` ให้ตัวแรกในรายการอยู่นอกสุด และลำดับมีผล: RequestID → Logger → Recoverer → SecureHeaders → CORS → Timeout → ContentTypeJSON
+- RequestID ตรวจค่าที่รับมา, Logger ใช้ `statusRecorder` (มี `Unwrap`) และ log แค่ path, Recoverer ตอบ 500 แบบ JSON และปล่อย `http.ErrAbortHandler` ผ่าน
+- CORS เทียบ origin ตรงตัวและใส่ `Vary: Origin`, Timeout ใช้ context deadline ที่กลายเป็น 503 `TIMEOUT`, ContentTypeJSON ตอบ 415
+- middleware เฉพาะ route (`requireAuth`, rate limiter) ห่อตอนลงทะเบียน route

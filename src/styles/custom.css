@@ -1,0 +1,31 @@
+/* Thai-first typography. Code blocks keep Starlight's monospace font. */
+:root {
+	--sl-font: 'IBM Plex Sans Thai', system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--sl-line-height: 1.85;
+	--sl-line-height-headings: 1.4;
+
+	/* Go brand cyan as accent */
+	--sl-color-accent-low: #00303d;
+	--sl-color-accent: #00add8;
+	--sl-color-accent-high: #b8ecfa;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #c9f1fb;
+	--sl-color-accent: #007d9c;
+	--sl-color-accent-high: #00384a;
+}
+
+.sl-markdown-content :is(h2, h3) {
+	scroll-margin-top: 5rem;
+}
+
+/* Thai text has no spaces between words; allow wrapping of long technical tokens. */
+.sl-markdown-content :not(pre) > code {
+	overflow-wrap: anywhere;
+}
+
+.sl-markdown-content table {
+	display: block;
+	overflow-x: auto;
+}

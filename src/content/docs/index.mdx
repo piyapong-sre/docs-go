@@ -1,0 +1,52 @@
+---
+title: Go ภาษาไทย
+description: เรียนภาษา Go ตั้งแต่พื้นฐานจนถึงขั้นสูง และสร้าง Web API แบบ best practice เป็นภาษาไทย
+template: splash
+hero:
+  tagline: เรียน Go ตั้งแต่บรรทัดแรก จนถึงสร้าง Web API ระดับ production — อธิบายเป็นภาษาไทย พร้อมตัวอย่าง code ที่รันได้จริง
+  actions:
+    - text: เริ่มเรียนเลย
+      link: /start/introduction/
+      icon: right-arrow
+    - text: ข้ามไปสร้าง Web API
+      link: /web-api/overview/
+      icon: rocket
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## เส้นทางการเรียน
+
+<CardGrid>
+	<Card title="1. เริ่มต้น" icon="rocket">
+		Go คืออะไร ติดตั้งเครื่องมือ เขียน Hello World และรู้จัก Go modules
+	</Card>
+	<Card title="2. พื้นฐาน" icon="pencil">
+		ตัวแปร ชนิดข้อมูล control flow function slice map struct pointer และการจัดการข้อความภาษาไทย (UTF-8)
+	</Card>
+	<Card title="3. ระดับกลาง" icon="puzzle">
+		method, interface, error handling, generics, iterators, package และการเขียน test
+	</Card>
+	<Card title="4. Concurrency" icon="random">
+		goroutine, channel, select, sync, context และ pattern ที่ใช้จริง
+	</Card>
+	<Card title="5. ขั้นสูง" icon="setting">
+		project layout, slog, embed, profiling, memory, reflection, code generation และ tooling
+	</Card>
+	<Card title="6. สร้าง Web API" icon="seti:go">
+		REST API ด้วย `net/http` + PostgreSQL + JWT ทีละขั้น ตามแนวทาง best practice
+	</Card>
+</CardGrid>
+
+## สิ่งที่ต้องมีก่อนเริ่ม
+
+- คอมพิวเตอร์ที่ติดตั้ง Go ได้ (Windows, macOS หรือ Linux)
+- พื้นฐานการใช้ terminal เบื้องต้น
+- ถ้าเคยเขียนภาษาอื่นมาก่อนจะเรียนได้เร็วขึ้น แต่ไม่จำเป็น
+
+<LinkCard
+	title="ตัวอย่าง code ทั้งหมดอยู่ในโฟลเดอร์ examples/"
+	description="ทุกตัวอย่างใน docs นี้ compile และรันได้จริง รวมถึงโปรเจกต์ tasks-api ที่ใช้ในบทที่ 6"
+	href="/web-api/overview/"
+/>

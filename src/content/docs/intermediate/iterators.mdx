@@ -1,0 +1,191 @@
+---
+title: Iterators
+description: ใช้ range กับ function (Go 1.23+) ผ่าน iter.Seq และ iter.Seq2 พร้อมเขียน iterator ของตัวเอง
+sidebar:
+  order: 7
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/intermediate/iterators/main.go?raw';
+
+ตั้งแต่ Go 1.23 คำสั่ง `for ... range` วนได้ไม่เฉพาะ slice, map, string, channel และ int อีกต่อไป
+แต่ **วนกับ function** ได้ด้วย เรียกว่า **range-over-func** หรือ iterator
+ทำให้เราสร้างลำดับข้อมูลแบบ lazy (คำนวณทีละตัวเมื่อต้องใช้) และต่อกันเป็น pipeline ได้สวยงาม
+
+## iterator คือ function หน้าตาแบบนี้
+
+```go
+func(yield func(V) bool)          // iter.Seq[V]   — ให้ค่าทีละ 1 ตัว
+func(yield func(K, V) bool)       // iter.Seq2[K, V] — ให้ค่าทีละคู่
+```
+
+package `iter` ตั้งชื่อ type ให้แล้ว
+
+```go
+package iter
+
+type Seq[V any] func(yield func(V) bool)
+type Seq2[K, V any] func(yield func(K, V) bool)
+```
+
+หลักการทำงาน: iterator เรียก `yield(v)` เพื่อ **ส่งค่าแต่ละตัว** ให้ตัว loop
+ถ้า `yield` คืน `false` แปลว่าผู้ใช้ `break` (หรือ `return`) ออกจาก loop แล้ว iterator **ต้องหยุดทันที**
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/intermediate/iterators/main.go" />
+
+```text title="Output"
+3 2 1 go!
+0 1 1 2 3 5 8 13 21 34 
+0 2 8 34 144 610 
+1: alpha
+2: beta
+3: gamma
+0 mango
+1 durian
+2 banana
+[durian banana]
+[banana durian mango]
+```
+
+## อธิบายทีละส่วน
+
+### เขียน iterator เอง
+
+```go
+func Countdown(n int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for i := n; i > 0; i-- {
+			if !yield(i) {
+				return
+			}
+		}
+	}
+}
+
+for n := range Countdown(3) { ... }
+```
+
+`Countdown` ไม่ใช่ iterator เอง แต่เป็น function ที่ **คืน** iterator (รูปแบบที่ใช้กันทั่วไป เพื่อรับ parameter ได้)
+เบื้องหลัง compiler แปลง body ของ `for` เป็น function `yield` แล้วส่งให้ iterator เรียก
+
+### iterator ไม่มีที่สิ้นสุด + early break
+
+`Fibonacci()` วน `for { ... }` ตลอดไป แต่ไม่เป็นปัญหาเพราะเป็น lazy
+ค่าจะถูกคำนวณเฉพาะตอนที่ loop ต้องการ และเมื่อ loop `break` → `yield` คืน `false` → iterator `return` จบการทำงาน
+
+### ต่อ iterator เป็น pipeline
+
+`Filter` รับ `iter.Seq[T]` แล้วคืน `iter.Seq[T]` ใหม่ จึงต่อกันได้
+
+```go
+even := Filter(Fibonacci(), func(n int) bool { return n%2 == 0 })
+```
+
+ไม่มี slice ระหว่างทางถูกสร้างเลย ทุกค่าไหลผ่านทีละตัว
+
+### iter.Seq2
+
+`Lines` คืนค่าเป็นคู่ `(บรรทัดที่, ข้อความ)` ใช้กับ `for no, line := range ...` เหมือนวน map
+
+## Iterator ใน standard library
+
+| function | คืน | ใช้ทำอะไร |
+|---|---|---|
+| `slices.All(s)` | `iter.Seq2[int, E]` | index และค่า |
+| `slices.Values(s)` | `iter.Seq[E]` | ค่าอย่างเดียว |
+| `slices.Backward(s)` | `iter.Seq2[int, E]` | วนจากท้ายไปหน้า |
+| `slices.Collect(seq)` | `[]E` | รวบ iterator เป็น slice |
+| `slices.Sorted(seq)` | `[]E` | รวบแล้ว sort |
+| `maps.Keys(m)` / `maps.Values(m)` | `iter.Seq[K]` / `iter.Seq[V]` | key หรือ value ของ map |
+| `maps.All(m)` | `iter.Seq2[K, V]` | คู่ key/value |
+| `maps.Collect(seq2)` | `map[K]V` | รวบ Seq2 เป็น map |
+| `strings.SplitSeq`, `strings.Lines` | `iter.Seq[string]` | แยก string แบบไม่สร้าง slice (Go 1.24+) |
+
+```go
+keys := slices.Sorted(maps.Keys(stock)) // ได้ key ของ map แบบเรียงลำดับในบรรทัดเดียว
+```
+
+<Aside type="caution" title="ต้องเช็คค่าที่ yield คืนเสมอ">
+ถ้าเขียน iterator แล้วไม่สนค่าที่ `yield` คืน และยังเรียก `yield` ต่อหลังผู้ใช้ `break` แล้ว
+โปรแกรมจะ panic ด้วยข้อความประมาณ
+
+```text
+range function continued iteration after function for loop body returned false
+```
+
+กฎคือ: **`yield` คืน `false` เมื่อไร ต้อง `return` ทันที**
+</Aside>
+
+<Aside type="tip" title="ใช้เมื่อไหร่ดี">
+- ข้อมูลเยอะหรือไม่มีที่สิ้นสุด และไม่อยากโหลดทั้งหมดเข้า memory
+- อยากซ่อนโครงสร้างภายใน เช่น tree หรือ linked list แต่ให้คนนอกวนได้ด้วย `for range`
+- ถ้าข้อมูลน้อยและมีเป็น slice อยู่แล้ว การคืน `[]T` ธรรมดาก็ยังเรียบง่ายและเร็วกว่า
+</Aside>
+
+## Pull iterator (รู้ไว้)
+
+iterator ที่เห็นมาเป็นแบบ **push** (iterator เป็นคนส่งค่าให้ loop)
+ถ้าต้องการ **ดึง** ค่าทีละตัวเอง เช่น เดินสอง iterator พร้อมกัน ใช้ `iter.Pull`
+
+```go
+next, stop := iter.Pull(Countdown(3))
+defer stop() // ต้องเรียก stop เสมอ เพื่อคืน resource
+
+v1, ok1 := next() // 3 true
+v2, ok2 := next() // 2 true
+```
+
+ใช้น้อย แต่มีประโยชน์ในบางสถานการณ์
+
+## แบบฝึกหัด
+
+1. เขียน `func Range(start, end, step int) iter.Seq[int]` ที่ให้ค่า `start, start+step, ...` จนก่อนถึง `end`
+2. เขียน `func Take[T any](seq iter.Seq[T], n int) iter.Seq[T]` ที่ให้ค่าแค่ n ตัวแรก แล้วใช้กับ `Fibonacci()` เพื่อเอา 10 ตัวแรกด้วย `slices.Collect`
+3. ใช้ `maps.Keys` และ `slices.Sorted` พิมพ์ชื่อผลไม้จาก map `stock` เรียงตามตัวอักษร พร้อมจำนวนคงเหลือ
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+func Range(start, end, step int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for i := start; i < end; i += step {
+			if !yield(i) {
+				return
+			}
+		}
+	}
+}
+
+// 2
+func Take[T any](seq iter.Seq[T], n int) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		if n <= 0 {
+			return
+		}
+		count := 0
+		for v := range seq {
+			if !yield(v) {
+				return
+			}
+			count++
+			if count == n {
+				return
+			}
+		}
+	}
+}
+
+first10 := slices.Collect(Take(Fibonacci(), 10))
+// [0 1 1 2 3 5 8 13 21 34]
+
+// 3
+for _, k := range slices.Sorted(maps.Keys(stock)) {
+	fmt.Println(k, stock[k])
+}
+```
+
+</details>

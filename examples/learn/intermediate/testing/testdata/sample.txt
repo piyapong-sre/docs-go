@@ -1,0 +1,2 @@
+Go makes it easy to build
+simple, reliable, and efficient software.

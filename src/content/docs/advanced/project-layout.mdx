@@ -1,0 +1,213 @@
+---
+title: โครงสร้างโปรเจกต์
+description: วิธีจัดโฟลเดอร์และ package ของโปรเจกต์ Go ให้เริ่มง่าย โตต่อได้ และไม่ซับซ้อนเกินจำเป็น
+sidebar:
+  order: 1
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Go ไม่ได้บังคับโครงสร้างโฟลเดอร์แบบ framework อื่น สิ่งที่ Go สนใจจริง ๆ มีแค่ **module** (`go.mod`) กับ **package** (หนึ่งโฟลเดอร์ = หนึ่ง package) ที่เหลือเป็นธรรมเนียมที่ชุมชนใช้กันจนเป็นมาตรฐาน
+
+หน้านี้สรุปธรรมเนียมเหล่านั้น พร้อมเหตุผลว่าทำไม จะได้เลือกใช้เท่าที่จำเป็น ไม่ใช่ลอกโครงใหญ่ ๆ มาตั้งแต่วันแรก
+
+## หลักข้อแรก: เริ่มจากเล็ก
+
+โปรเจกต์ใหม่ส่วนใหญ่เริ่มแบบนี้ได้เลย
+
+<FileTree>
+- go.mod
+- main.go
+- main_test.go
+</FileTree>
+
+พอโค้ดเริ่มเยอะ ค่อยแยกไฟล์ (ยังอยู่ package เดียวกัน) แล้วค่อยแยก package เมื่อเห็นขอบเขตที่ชัดเจน การแตกโฟลเดอร์เร็วเกินไปทำให้เกิด package เล็ก ๆ ที่ import กันไปมา และเสี่ยงเจอ **import cycle** ซึ่ง Go ไม่อนุญาต
+
+<Aside type="tip">
+ถ้ายังไม่แน่ใจว่าจะแยก package ดีไหม ให้ยังไม่ต้องแยก การย้ายโค้ดออกจาก package เดียวทีหลังทำได้ง่ายกว่าการรวม package ที่แยกผิดกลับมา
+</Aside>
+
+## โฟลเดอร์ที่มีความหมายพิเศษ
+
+| โฟลเดอร์ | ความหมาย |
+| --- | --- |
+| `cmd/<name>/` | ธรรมเนียม: แต่ละโฟลเดอร์ย่อยคือ `package main` หนึ่งตัว = binary หนึ่งตัว |
+| `internal/` | **compiler บังคับ**: package ข้างในถูก import ได้เฉพาะโค้ดที่อยู่ใต้ parent ของ `internal/` เท่านั้น |
+| `pkg/` | ธรรมเนียม (ไม่บังคับ): code ที่ตั้งใจให้โปรเจกต์อื่น import ไปใช้ |
+| `testdata/` | `go` tool ข้ามโฟลเดอร์นี้ตอน build ใช้เก็บไฟล์สำหรับ test |
+| `vendor/` | dependency ที่ copy มาด้วย `go mod vendor` |
+
+### `cmd/` สำหรับหลาย binary
+
+ถ้าโปรเจกต์มี binary เดียว `main.go` ที่ root ก็พอ แต่ถ้ามีหลายตัว เช่น API server กับ worker ให้แยกใต้ `cmd/` และให้ `main.go` บางที่สุด ทำแค่อ่าน config ประกอบ dependency แล้วเรียก `run()`
+
+```go title="cmd/api/main.go"
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"example.com/shop/internal/server"
+)
+
+func main() {
+	if err := server.Run(context.Background(), os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+```
+
+ติดตั้งหรือ build ได้ตรง ๆ ด้วย `go build ./cmd/api` หรือ `go install example.com/shop/cmd/api@latest`
+
+### `internal/` คือเครื่องมือกั้นขอบเขตที่ดีที่สุด
+
+อะไรที่อยู่ใต้ `internal/` คนนอก module import ไม่ได้ (compile error) ทำให้เราเปลี่ยน API ภายในได้อิสระโดยไม่ทำให้ใครพัง สำหรับ application (ไม่ใช่ library) แนะนำให้ใส่โค้ดเกือบทั้งหมดไว้ใน `internal/`
+
+### `pkg/` ไม่จำเป็นเสมอไป
+
+`pkg/` เป็นแค่ธรรมเนียม ไม่มีผลกับ compiler หลายโปรเจกต์ดัง ๆ ก็ไม่ใช้ ถ้าคุณเขียน **library** ให้คนอื่นใช้ วาง package ไว้ที่ root ของ module เลยดีกว่า เพราะ import path จะสั้นกว่า (`example.com/money` แทน `example.com/money/pkg/money`)
+
+## แบ่ง package ตาม domain ไม่ใช่ตาม layer
+
+ความผิดพลาดที่พบบ่อยของคนย้ายมาจากภาษาอื่น คือแบ่ง package ตามชนิดของโค้ด
+
+<Tabs>
+<TabItem label="ไม่แนะนำ: แบ่งตาม layer">
+<FileTree>
+- internal/
+  - models/
+    - user.go
+    - order.go
+  - controllers/
+    - user.go
+    - order.go
+  - services/
+    - user.go
+    - order.go
+  - repositories/
+    - user.go
+    - order.go
+</FileTree>
+</TabItem>
+<TabItem label="แนะนำ: แบ่งตาม domain">
+<FileTree>
+- internal/
+  - user/
+    - user.go type User + business rules
+    - handler.go HTTP handler
+    - store.go เข้าถึง database
+    - user_test.go
+  - order/
+    - order.go
+    - handler.go
+    - store.go
+  - platform/ โค้ดกลางที่ทุก domain ใช้
+    - postgres/
+    - httpx/
+</FileTree>
+</TabItem>
+</Tabs>
+
+ทำไมแบบ domain ถึงดีกว่าใน Go
+
+- **ชื่อ package อ่านแล้วรู้เรื่อง**: `user.New()`, `order.Store` อ่านดีกว่า `models.User`, `services.UserService` (ซึ่งพูดคำว่า user ซ้ำสองรอบ)
+- **แก้ฟีเจอร์เดียวแตะโฟลเดอร์เดียว** แทนที่จะต้องเปิดสี่โฟลเดอร์
+- **ลด import cycle**: แบบ layer มักจบที่ `models` ถูกทุกคน import และ `services` import กันเอง
+- **unexported ทำงานได้จริง**: helper ภายใน domain ซ่อนเป็นตัวพิมพ์เล็กได้ เพราะอยู่ package เดียวกัน
+
+<Aside type="caution">
+หลีกเลี่ยงชื่อ package กลาง ๆ อย่าง `utils`, `common`, `helpers`, `models` เพราะไม่บอกว่ามันทำอะไร และมักกลายเป็นที่ทิ้งโค้ดทุกอย่าง ตั้งชื่อตามสิ่งที่ package **ให้บริการ** เช่น `money`, `slug`, `postgres`
+</Aside>
+
+## ไม่ต้องลอก golang-standards/project-layout
+
+repo `golang-standards/project-layout` บน GitHub มีคนอ้างถึงเยอะ แต่**ไม่ใช่มาตรฐานทางการ**ของทีม Go และมีโฟลเดอร์เยอะเกินความจำเป็นสำหรับโปรเจกต์ส่วนใหญ่ (`/api`, `/web`, `/configs`, `/init`, `/deployments` ฯลฯ) ใช้เป็นแหล่งไอเดียได้ แต่อย่าสร้างโฟลเดอร์เปล่ารอไว้
+
+แหล่งที่เป็นทางการคือบทความ "Organizing a Go module" บน go.dev ซึ่งแนะนำให้เริ่มเรียบง่ายเช่นกัน
+
+## ตัวอย่างโครงสร้างจริง
+
+<Tabs>
+<TabItem label="Small CLI">
+<FileTree>
+- go.mod
+- go.sum
+- main.go parse flags แล้วเรียก run()
+- run.go
+- run_test.go
+- format.go
+- testdata/
+  - input.csv
+  - golden.txt
+- README.md
+</FileTree>
+
+CLI เล็ก ๆ ไม่ต้องมี `cmd/` หรือ `internal/` เลย ทุกอย่างอยู่ `package main` และ test ได้ผ่านฟังก์ชัน `run(args []string, stdout io.Writer) error`
+</TabItem>
+<TabItem label="Web service">
+<FileTree>
+- go.mod
+- go.sum
+- cmd/
+  - api/
+    - main.go
+  - worker/
+    - main.go
+- internal/
+  - config/
+    - config.go
+  - server/
+    - server.go ประกอบ router + middleware
+    - routes.go
+  - user/
+    - user.go
+    - handler.go
+    - store.go
+  - order/
+    - order.go
+    - handler.go
+    - store.go
+  - platform/
+    - postgres/
+      - postgres.go
+      - migrations/
+        - 0001_init.sql
+- Dockerfile
+- Makefile
+</FileTree>
+
+มีสอง binary (`api`, `worker`) ที่ใช้ domain package ร่วมกัน ทุกอย่างอยู่ใน `internal/` เพราะเป็น application ไม่ใช่ library
+</TabItem>
+</Tabs>
+
+ส่วน [โครงสร้างโปรเจกต์ Web API](/web-api/project-structure/) จะนำหลักการในหน้านี้ไปใช้สร้าง service จริงแบบเต็ม ๆ ส่วนเรื่อง package และ import พื้นฐาน ทวนได้ที่ [Packages](/intermediate/packages/)
+
+## เช็กลิสต์สั้น ๆ
+
+1. เริ่มที่ `main.go` ไฟล์เดียว
+2. มีหลาย binary เมื่อไหร่ค่อยสร้าง `cmd/`
+3. เป็น application ให้ใช้ `internal/` เป็นค่าเริ่มต้น
+4. แบ่ง package ตามสิ่งที่มันทำ (domain) ไม่ใช่ตามชนิดไฟล์
+5. `main` บาง ๆ ส่วน logic อยู่ใน package ที่ test ได้
+
+<Aside type="tip">
+ลองถามตัวเองว่า "ถ้าอ่านแค่ชื่อโฟลเดอร์ใน `internal/` จะรู้ไหมว่าแอปนี้ทำอะไร" ถ้าเห็นแค่ `models/ services/ handlers/` แปลว่ายังบอกไม่ได้ ถ้าเห็น `user/ order/ payment/` ก็รู้ทันที
+</Aside>
+
+## แบบฝึกหัด
+
+1. มีโปรเจกต์ที่มีโฟลเดอร์ `models/`, `handlers/`, `services/` และมีสอง domain คือ `book` กับ `member` ลองวาดโครงสร้างใหม่แบบแบ่งตาม domain
+2. ถ้าโค้ดใน module `example.com/a` พยายาม import `example.com/b/internal/auth` จะเกิดอะไรขึ้น
+3. คุณกำลังเขียน library แปลงสกุลเงินชื่อ `example.com/money` ควรวางโค้ดไว้ที่ `pkg/money/` หรือไม่ เพราะอะไร
+
+<details>
+<summary>เฉลย</summary>
+
+1. ตัวอย่างหนึ่ง: `internal/book/` (มี `book.go`, `handler.go`, `store.go`), `internal/member/` (โครงเดียวกัน) และถ้ามีโค้ดเชื่อมต่อ database ใช้ร่วมกัน ให้แยกไว้ที่ `internal/platform/postgres/`
+2. compile error `use of internal package example.com/b/internal/auth not allowed` เพราะ `example.com/a` ไม่ได้อยู่ใต้ `example.com/b`
+3. ไม่จำเป็น วางไว้ที่ root ของ module ดีกว่า ผู้ใช้จะ import เป็น `example.com/money` ซึ่งสั้นและตรงกับชื่อ package
+
+</details>

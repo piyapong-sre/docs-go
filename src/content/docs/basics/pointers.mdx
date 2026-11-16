@@ -1,0 +1,179 @@
+---
+title: Pointers
+description: เข้าใจ pointer ใน Go ตัวดำเนินการ & และ *, new, nil, การเลือกใช้ pointer และสิ่งที่ Go ไม่อนุญาต
+sidebar:
+  order: 9
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import pointersSrc from '../../../../examples/learn/basics/pointers/main.go?raw';
+
+pointer คือตัวแปรที่เก็บ **ที่อยู่ (address) ในหน่วยความจำ** ของค่าอื่น ฟังดูน่ากลัวสำหรับคนที่มาจาก JavaScript หรือ Python แต่ pointer ใน Go **ปลอดภัยและเรียบง่ายกว่า C มาก** — ไม่มี pointer arithmetic และมี garbage collector จัดการหน่วยความจำให้
+
+เหตุผลหลักที่ต้องรู้เรื่อง pointer: Go ส่งค่าแบบ **pass by value** เสมอ ถ้าอยากให้ function แก้ค่าของผู้เรียกได้ หรือไม่อยาก copy struct ขนาดใหญ่ ต้องใช้ pointer
+
+## ตัวอย่างรวม
+
+<Code code={pointersSrc} lang="go" title="examples/learn/basics/pointers/main.go" />
+
+```text title="Output"
+type of p: *int
+*p = 10
+x = 20
+after double: 40
+after resetByValue: 42
+after resetByPointer: 0
+new(int): 0
+*n = 5
+{Name:clicks Value:1}
+likes 3
+a.Value = 99  same: true
+np is nil
+```
+
+## `&` และ `*`
+
+| สัญลักษณ์ | ตำแหน่ง | ความหมาย |
+| --- | --- | --- |
+| `*T` | ใน type | "pointer ไปยัง T" เช่น `*int`, `*User` |
+| `&x` | หน้าตัวแปร | เอาที่อยู่ของ `x` |
+| `*p` | หน้าตัวแปร pointer | ค่าที่ `p` ชี้อยู่ (dereference) — อ่านหรือเขียนได้ |
+
+```go
+x := 10
+p := &x   // p มี type *int เก็บที่อยู่ของ x
+*p        // 10 — อ่านค่าผ่าน pointer
+*p = 20   // เขียนค่าผ่าน pointer → x กลายเป็น 20
+```
+
+ลองนึกภาพว่า `x` คือบ้าน `p` คือกระดาษที่เขียนที่อยู่บ้าน `*p` คือการเดินไปตามที่อยู่นั้นแล้วเปิดประตูเข้าบ้าน
+
+## Pointer กับ function
+
+```go
+func resetByValue(c Counter) {
+	c.Value = 0 // แก้ "สำเนา" — ผู้เรียกไม่เห็น
+}
+
+func resetByPointer(c *Counter) {
+	c.Value = 0 // แก้ค่าต้นฉบับผ่าน pointer
+}
+
+resetByValue(c)    // c.Value ยังเป็น 42
+resetByPointer(&c) // c.Value กลายเป็น 0
+```
+
+<Aside type="tip" title="auto-dereference กับ struct">
+สำหรับ pointer ไปยัง struct เขียน `c.Value` ได้เลย ไม่ต้องเขียน `(*c).Value` — Go ทำให้อัตโนมัติ ในทำนองเดียวกันเมื่อเรียน [method](/intermediate/methods/) จะเห็นว่าเรียก method ที่รับ pointer จากตัวแปรธรรมดาได้โดยไม่ต้องเขียน `&`
+</Aside>
+
+## `new` และ `&T{}`
+
+```go
+n := new(int)          // จอง int ที่มีค่า 0 แล้วคืน *int
+cp := &Counter{Name: "clicks"} // struct literal พร้อม & — นิยมกว่า new(Counter)
+```
+
+`new(T)` คืน pointer ไปยัง zero value ของ `T` ส่วนกับ struct นิยมใช้ `&T{...}` เพราะกำหนดค่า field ได้ในบรรทัดเดียว
+
+<Aside type="note" title="new(expr) ใน Go 1.26+">
+ตั้งแต่ Go 1.26 `new` รับ **นิพจน์** ได้ด้วย เช่น `p := new(42)` ได้ `*int` ที่ชี้ไปยังค่า 42 สะดวกมากกับ field แบบ optional ใน struct (เช่น `Age: new(30)`) แต่ใช้ได้เมื่อ `go.mod` ระบุ `go 1.26` ขึ้นไป
+</Aside>
+
+## คืน pointer ของตัวแปร local ได้
+
+```go
+func newCounter(name string) *Counter {
+	c := Counter{Name: name}
+	return &c // ปลอดภัย!
+}
+```
+
+ใน C แบบนี้คือ bug ร้ายแรง (dangling pointer) แต่ใน Go compiler จะวิเคราะห์ (**escape analysis**) ว่าค่านี้ยังถูกใช้หลัง function จบ จึงย้ายไปไว้บน heap ให้เอง และ garbage collector จะคืนหน่วยความจำเมื่อไม่มีใครใช้แล้ว รูปแบบ `NewXxx(...) *Xxx` นี้คือ **constructor** แบบ Go ที่เห็นทั่วไป
+
+## หลาย pointer ชี้ที่เดียวกัน
+
+```go
+a := &Counter{Name: "shared"}
+b := a        // copy pointer — ไม่ได้ copy struct
+b.Value = 99
+a.Value       // 99
+a == b        // true: เปรียบเทียบที่อยู่ ไม่ใช่เนื้อหา
+```
+
+## `nil` pointer
+
+zero value ของ pointer คือ `nil` (ไม่ได้ชี้ไปไหน) การ dereference `nil` จะทำให้โปรแกรม **panic**
+
+```go
+var np *Counter
+fmt.Println(np.Value)
+// panic: runtime error: invalid memory address or nil pointer dereference
+```
+
+<Aside type="caution" title="ตรวจ nil ก่อนใช้">
+ทุกครั้งที่รับ pointer จากภายนอก (parameter, ค่าคืนจาก function, field ของ struct) ให้คิดว่ามันเป็น `nil` ได้หรือไม่ ถ้าได้ ต้องตรวจก่อน
+
+```go
+if u == nil {
+	return errors.New("user is nil")
+}
+```
+
+nil pointer dereference เป็นสาเหตุของ panic ที่พบบ่อยที่สุดใน Go
+</Aside>
+
+## Go ไม่มี pointer arithmetic
+
+```go
+p := &arr[0]
+p++ // compile error: invalid operation: p++ (non-numeric type *int)
+```
+
+ใน C เราเลื่อน pointer ไปมาเพื่อเข้าถึง array ได้ แต่ Go ไม่อนุญาต ทำให้ไม่มีปัญหาเข้าถึงหน่วยความจำนอกขอบเขต — ถ้าต้องการเข้าถึงสมาชิกถัดไปก็ใช้ slice กับ index ตามปกติ (package `unsafe` ทำได้ แต่ตามชื่อเลย ไม่ควรใช้ใน code ทั่วไป)
+
+## เมื่อไหร่ควรใช้ pointer
+
+**ใช้ pointer เมื่อ**
+
+- function ต้อง **แก้ไข** ค่าของผู้เรียก
+- struct **ใหญ่** (มีหลาย field) และถูกส่งไปมาบ่อย การ copy pointer (8 byte บนเครื่อง 64-bit) ถูกกว่า
+- struct มี field ที่ **ห้าม copy** เช่น `sync.Mutex`
+- ต้องการแยกแยะ "ไม่มีค่า" (`nil`) ออกจาก zero value เช่น field optional `*int` ใน JSON ที่ต่างกันระหว่าง "ไม่ส่งมา" กับ "ส่ง 0 มา"
+
+**ไม่จำเป็นต้องใช้ pointer เมื่อ**
+
+- เป็น type ขนาดเล็ก (`int`, `bool`, `string`, `time.Time`, struct เล็ก ๆ)
+- เป็น **slice, map, channel, function** — ตัวมันเองมีตัวชี้ข้างในอยู่แล้ว ส่งตรง ๆ ได้เลย (`*[]int` หรือ `*map[...]` แทบไม่มีเหตุผลให้ใช้)
+- ต้องการให้ค่า immutable จากมุมมองของ function ที่รับไป
+
+<Aside type="tip">
+`string` ใน Go เป็น header เล็ก ๆ (pointer + ความยาว) อยู่แล้ว การส่ง string ไม่ได้ copy ตัวข้อความ จึง **ไม่ต้องใช้ `*string`** เพื่อประสิทธิภาพ ใช้ `*string` เฉพาะเมื่อต้องการแยก "ไม่มีค่า" ออกจาก `""` เท่านั้น
+</Aside>
+
+## แบบฝึกหัด
+
+1. เขียน `func swap(a, b *int)` ที่สลับค่าของตัวแปรสองตัว ทดสอบด้วย `x, y := 1, 2; swap(&x, &y)` แล้วได้ `x = 2, y = 1`
+2. เขียน `type Account struct { Owner string; Balance float64 }` และ `func deposit(acc *Account, amount float64)` จากนั้นลองเปลี่ยนให้ `deposit` รับ `Account` (ไม่ใช่ pointer) แล้วสังเกตผล
+3. ทำนายผลลัพธ์ แล้วรันเพื่อตรวจคำตอบ
+
+   ```go
+   a := 1
+   b := &a
+   c := &a
+   *b = 5
+   fmt.Println(a, *c, b == c)
+   ```
+
+<details>
+<summary>เฉลยข้อ 1 และ 3</summary>
+
+```go
+func swap(a, b *int) {
+	*a, *b = *b, *a
+}
+```
+
+ข้อ 3 ได้ `5 5 true` — `b` และ `c` ชี้ไปที่ `a` ตัวเดียวกัน แก้ผ่าน `b` จึงเห็นผลทั้งจาก `a` และ `*c`
+
+</details>

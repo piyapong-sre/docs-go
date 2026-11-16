@@ -1,0 +1,209 @@
+---
+title: Docker และการ Deploy
+description: build image ขนาดเล็กด้วย multi-stage Dockerfile รัน API คู่กับ PostgreSQL ด้วย Docker Compose และสิ่งที่ต้องคิดก่อนขึ้น production
+sidebar:
+  order: 15
+---
+
+import { Code, Aside, Steps } from '@astrojs/starlight/components';
+import dockerfileSrc from '../../../../examples/tasks-api/Dockerfile?raw';
+import composeSrc from '../../../../examples/tasks-api/compose.yaml?raw';
+import dockerignoreSrc from '../../../../examples/tasks-api/.dockerignore?raw';
+import makefileSrc from '../../../../examples/tasks-api/Makefile?raw';
+
+## Multi-stage Dockerfile
+
+Go compile เป็น binary ไฟล์เดียวที่ไม่ต้องมี runtime ข้างนอก (ไม่เหมือน Node.js หรือ Python) เราจึงแยก image เป็น 2 stage: stage แรกมี Go toolchain ไว้ build, stage สุดท้ายมีแค่ binary
+
+<Code code={dockerfileSrc} lang="dockerfile" title="Dockerfile" />
+
+### Build stage
+
+**`COPY go.mod go.sum` ก่อน แล้วค่อย `COPY . .`** Docker cache ทีละ layer ถ้าไฟล์ที่ COPY ไม่เปลี่ยน layer นั้นและ `RUN` ถัดไปจะใช้ cache ได้ การแยก `go mod download` ไว้ก่อน ทำให้แก้โค้ดแล้ว build ใหม่ไม่ต้องดาวน์โหลด module ทั้งหมดซ้ำ ดาวน์โหลดใหม่เฉพาะตอน dependency เปลี่ยน
+
+**flag ของ `go build`** (ทบทวน [Build และ Deploy](/advanced/build-and-deploy/))
+
+| flag | ทำอะไร |
+| --- | --- |
+| `CGO_ENABLED=0` | ปิด cgo ได้ **static binary** ที่ไม่ link กับ libc รันบน image ที่ไม่มี libc ได้ |
+| `GOOS=linux` | build สำหรับ Linux เสมอ แม้เครื่องที่ build จะเป็นอะไรก็ตาม |
+| `-trimpath` | ตัด path ของเครื่องที่ build ออกจาก binary (ไม่หลุด `/home/someone/...` ใน stack trace) และ build ซ้ำได้ผลเหมือนเดิม |
+| `-ldflags="-s -w"` | ตัด symbol table และ DWARF debug info ออก binary เล็กลง |
+| `-X main.version=${VERSION}` | ฝังค่าลงตัวแปร `version` ใน `cmd/api/main.go` ตอน build |
+
+`ARG VERSION=dev` รับค่าจาก `docker build --build-arg VERSION=...` ถ้าไม่ส่งจะได้ `dev` และค่านี้จะโผล่ใน log ตอน start
+
+### Runtime stage
+
+`gcr.io/distroless/static-debian12:nonroot` คือ image ที่แทบไม่มีอะไรเลย
+
+- **ไม่มี shell และ package manager** ผู้บุกรุกที่เจาะเข้ามาได้จะไม่มีเครื่องมือให้ใช้ต่อ และ vulnerability scanner แทบไม่เจออะไร
+- มีแค่สิ่งที่ static binary ต้องการ: CA certificates (เรียก HTTPS ออกไปได้), timezone data และ `/etc/passwd` ที่มี user `nonroot` (UID 65532)
+- `USER nonroot:nonroot` รัน process เป็น non-root ถ้ามีช่องโหว่ ความเสียหายจะจำกัดกว่ารันเป็น root
+- `ENTRYPOINT ["/api"]` แบบ exec form ทำให้ binary เป็น PID 1 ได้รับ `SIGTERM` ตรง ๆ graceful shutdown จึงทำงาน (ดู [Graceful Shutdown](/web-api/graceful-shutdown/))
+
+<Aside type="tip">
+ไม่มี shell แปลว่า `docker exec -it ... sh` ใช้ไม่ได้ ถ้าต้อง debug ให้เปลี่ยนเป็น tag `:debug-nonroot` ชั่วคราว ซึ่งมี busybox shell มาให้
+</Aside>
+
+### ขนาด image
+
+ตัวเลขจากการ build tasks-api จริง
+
+| สิ่งที่วัด | ขนาด |
+| --- | --- |
+| binary ไม่ใส่ `-s -w` | ~16 MB |
+| binary ใส่ `-s -w` | ~11 MB |
+| image สุดท้าย (`docker images`) | ~21 MB |
+| image `golang:1.26-alpine` ที่ใช้ build | หลายร้อย MB |
+
+ถ้าใช้ `golang` image เป็น runtime ตรง ๆ จะได้ image ใหญ่กว่าหลายสิบเท่า พร้อม compiler และ source code ทั้งหมดติดไปด้วย
+
+<Aside type="caution" title="อย่าลืม .dockerignore">
+ถ้าไม่มี `.dockerignore` คำสั่ง `COPY . .` จะส่งทุกอย่างในโฟลเดอร์เข้า build context รวมถึง `.env` (ถ้ามี) แม้ไฟล์เหล่านั้นจะไม่ไปอยู่ใน image สุดท้าย แต่ก็อยู่ใน build cache และทำให้ build ช้าลง tasks-api จึงมีไฟล์นี้
+
+<Code code={dockerignoreSrc} lang="text" title=".dockerignore" />
+</Aside>
+
+## Docker Compose สำหรับ dev
+
+<Code code={composeSrc} lang="yaml" title="compose.yaml" />
+
+**service `db`**
+
+- `postgres:18-alpine` ได้ PostgreSQL 18 ที่มี `uuidv7()` ในตัว
+- volume mount ที่ **`/var/lib/postgresql`** ไม่ใช่ `/var/lib/postgresql/data` แบบ version เก่า เพราะตั้งแต่ image ของ PostgreSQL 18 ที่เก็บข้อมูลเปลี่ยนเป็น subdirectory ตาม major version (เช่น `/var/lib/postgresql/18/docker`) ซึ่งช่วยให้อัปเกรด major version ด้วย `pg_upgrade` ง่ายขึ้น ถ้ายัง mount ที่ path เก่าตามตัวอย่างบนอินเทอร์เน็ตส่วนใหญ่ ข้อมูลจะไม่ได้ถูกเก็บใน volume อย่างที่ตั้งใจ (image จะแจ้ง error เตือนเรื่องนี้)
+- `healthcheck` ใช้ `pg_isready` เช็กทุก 2 วินาที
+
+**service `api`**
+
+- `build: .` build จาก `Dockerfile` ในโฟลเดอร์เดียวกัน
+- `env_file: .env.example` อ่าน config ทั้งหมดจากไฟล์ตัวอย่าง แล้ว `environment` เขียนทับ `DATABASE_URL` ให้ชี้ไปที่ host `db` (ชื่อ service) แทน `localhost`
+- `depends_on` + `condition: service_healthy` รอจน `pg_isready` ผ่านก่อนค่อย start API ไม่อย่างนั้น API อาจ start ก่อน database พร้อม แล้ว `postgres.Open` ping ไม่ผ่าน
+- `restart: unless-stopped` ถ้า process ตายจะถูก start ใหม่ เว้นแต่เราสั่ง stop เอง
+
+**port ฝั่ง host ปรับได้** `${DB_HOST_PORT:-5433}` แปลว่าใช้ค่าจาก environment variable `DB_HOST_PORT` ถ้าไม่มีใช้ `5433` (ไม่ใช่ 5432 เพื่อไม่ชนกับ PostgreSQL ที่หลายคนติดตั้งไว้ในเครื่อง) เช่นเดียวกับ `API_HOST_PORT` (default `8080`)
+
+```bash
+DB_HOST_PORT=5434 API_HOST_PORT=8090 docker compose up --build -d
+```
+
+<Aside type="caution">
+`env_file: .env.example` และรหัสผ่าน `tasks` / `tasks` มีไว้สำหรับ dev บนเครื่องเท่านั้น `JWT_SECRET` ในไฟล์นั้นเป็นค่าสาธารณะที่ใครก็อ่านได้จาก repo ห้ามใช้ compose file นี้กับ production ตรง ๆ
+</Aside>
+
+## ทดลอง
+
+<Steps>
+
+1. build และรันทั้ง API และ database
+
+   ```bash
+   docker compose up --build -d   # หรือ make docker-up
+   ```
+
+2. ตรวจว่าพร้อม
+
+   ```bash
+   curl -s localhost:8080/readyz
+   ```
+
+   ```json title="Output"
+   {"status":"ready"}
+   ```
+
+3. ดู log
+
+   ```bash
+   docker compose logs api
+   ```
+
+   ```text title="Output"
+   api-1  | {"time":"2026-11-16T04:34:42.781921833Z","level":"INFO","msg":"database migrated"}
+   api-1  | {"time":"2026-11-16T04:34:42.835529125Z","level":"INFO","msg":"http server listening","addr":":8080","env":"development","version":"dev"}
+   ```
+
+4. ปิดทั้งหมด (`-v` ลบ volume ข้อมูลด้วย ถ้าอยากเริ่มใหม่)
+
+   ```bash
+   docker compose down
+   ```
+
+</Steps>
+
+build image พร้อม version จริง
+
+```bash
+docker build --build-arg VERSION=1.0.0 -t tasks-api:1.0.0 .
+```
+
+เมื่อรัน image นี้ log บรรทัด `http server listening` จะมี `"version":"1.0.0"` แทน `"dev"` ใน CI นิยมใช้ git tag หรือ commit SHA เช่น `--build-arg VERSION=$(git describe --tags --always)`
+
+## เรื่องที่ต้องคิดก่อนขึ้น production
+
+### Secrets มาจาก platform ไม่ใช่ image
+
+image ควรเหมือนกันทุก environment ต่างกันแค่ config ที่ inject ตอนรัน (12-factor) **ห้าม** `COPY .env` หรือใส่ secret ใน `ENV` / `ARG` ของ Dockerfile เพราะใครที่ pull image ได้ก็อ่านได้ (ผ่าน `docker history`, `docker inspect` หรือแตก layer ออกมาดู) ให้ใช้ระบบของ platform เช่น Kubernetes Secret, AWS Secrets Manager / SSM Parameter Store, Google Secret Manager หรือ secret ของ CI/CD แทน (ดู [Configuration](/web-api/configuration/))
+
+### Migration เป็นขั้นตอนแยก
+
+ตั้ง `DB_AUTO_MIGRATE=false` บน production แล้วรัน migration ก่อน deploy app version ใหม่ เช่น Kubernetes Job หรือ step ใน pipeline และเขียน migration แบบ backward-compatible (ดู [Migrations](/web-api/migrations/))
+
+### หลาย replica
+
+- **Rate limit** ของ tasks-api เก็บ counter ใน memory ของแต่ละ process ถ้ามี 3 replica ผู้โจมตีจะได้โควตา 3 เท่า ต้องย้าย counter ไปไว้ที่ที่ทุก replica เห็นร่วมกัน เช่น Redis หรือใช้ rate limit ของ API gateway แทน
+- JWT ไม่ต้องย้ายอะไร เพราะ stateless ทุก replica ใช้ `JWT_SECRET` เดียวกันก็ตรวจได้
+- connection pool: `MaxConns = 10` ต่อ replica ถ้ามี 20 replica คือ 200 connection ต้องไม่เกิน `max_connections` ของ PostgreSQL (หรือใช้ PgBouncer)
+
+### Reverse proxy และ TLS
+
+ปกติ API ไม่ได้รับ traffic จาก internet ตรง ๆ แต่อยู่หลัง load balancer หรือ reverse proxy (Nginx, Traefik, Caddy, cloud LB) ที่ทำ **TLS termination** API ฟัง HTTP ธรรมดาใน network ภายใน และ proxy เป็นคนจัดการ certificate และ HTTPS
+
+### `X-Forwarded-For` และ IP ของ client
+
+เมื่ออยู่หลัง proxy `r.RemoteAddr` จะเป็น IP ของ proxy ไม่ใช่ของ client
+
+```go title="internal/middleware/ratelimit.go"
+// clientIP uses the TCP peer address. Do NOT trust X-Forwarded-For unless
+// the API sits behind a proxy you control that overwrites that header.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+```
+
+ผลคือ **ทุก client จะใช้โควตา rate limit ก้อนเดียวกัน** ส่วนการไปอ่าน `X-Forwarded-For` ตรง ๆ ก็อันตราย เพราะ client ตั้ง header นี้เองได้ ปลอม IP ใหม่ทุก request เพื่อหลบ rate limit ได้สบาย
+
+ทางที่ถูกคือเชื่อ header นี้ **เฉพาะเมื่อ request มาจาก proxy ที่เราควบคุม** (เช็ก `RemoteAddr` ว่าอยู่ในรายการ IP ของ proxy) และอ่านค่า **จากขวาสุด** ซึ่งเป็นค่าที่ proxy ของเราเพิ่มเข้าไป ไม่ใช่ค่าซ้ายสุดที่ client เขียนมาเองได้ tasks-api ยังไม่ได้ทำส่วนนี้
+
+### Health check และ grace period
+
+ใช้ `/healthz` เป็น liveness และ `/readyz` เป็น readiness probe ตั้ง grace period ให้มากกว่า `SHUTDOWN_TIMEOUT` (15s) อย่างที่ `compose.yaml` ตั้ง `stop_grace_period: 20s` ไว้ หรือ `terminationGracePeriodSeconds` ใน Kubernetes เนื่องจาก image ไม่มี `curl` จึงใช้ `healthcheck` แบบ CMD ใน compose ไม่ได้ ให้ใช้ HTTP probe ของ orchestrator แทน
+
+## Makefile
+
+<Code code={makefileSrc} lang="makefile" title="Makefile" />
+
+| target | ใช้เมื่อ |
+| --- | --- |
+| `make run` | รัน API บนเครื่อง (ต้อง `make db-up` ก่อน) |
+| `make test` | unit test พร้อม race detector |
+| `make test-integration` | test ทั้งหมดรวม integration กับ PostgreSQL ที่ port `DB_HOST_PORT` (default 5433) |
+| `make lint` | `go vet` + `govulncheck` หาช่องโหว่ใน dependency |
+| `make sqlc` | generate Go code ใหม่หลังแก้ query (ใช้ Docker ไม่ต้องติดตั้ง sqlc) |
+| `make db-up` / `make db-down` | start เฉพาะ PostgreSQL / ปิด container ทั้งหมด |
+| `make docker-up` / `make docker-down` | build และรันทั้งระบบ / ปิด |
+
+`-include .env` กับ `export` ทำให้ทุก target ได้ environment variable จาก `.env` (ถ้ามี) อัตโนมัติ `make run` จึงอ่าน config ได้โดยไม่ต้อง `source .env` เอง เครื่องหมาย `-` ข้างหน้าหมายถึง "ถ้าไม่มีไฟล์ก็ไม่ต้อง error"
+
+## สรุป
+
+- multi-stage build: stage แรกมี Go toolchain, stage สุดท้ายมีแค่ static binary บน distroless image ได้ image ราว 21 MB
+- COPY `go.mod` / `go.sum` และ `go mod download` ก่อนโค้ด เพื่อใช้ layer cache
+- `CGO_ENABLED=0`, `-trimpath`, `-ldflags="-s -w -X main.version=..."` ให้ binary static, เล็ก, reproducible และรู้ version
+- distroless `nonroot`: ไม่มี shell, ไม่รันเป็น root, `ENTRYPOINT` แบบ exec form รับ SIGTERM ได้
+- compose ใช้ healthcheck + `depends_on: condition: service_healthy`, port ปรับได้ด้วย `DB_HOST_PORT` / `API_HOST_PORT`, volume ของ PostgreSQL 18 อยู่ที่ `/var/lib/postgresql`
+- production: secret จาก platform, migration เป็นขั้นตอนแยก, rate limit แบบ shared store, TLS ที่ proxy และเชื่อ `X-Forwarded-For` เฉพาะจาก proxy ของเรา

@@ -1,0 +1,198 @@
+---
+title: Channel
+description: สื่อสารระหว่าง goroutine ด้วย channel ทั้งแบบ unbuffered และ buffered พร้อมเรื่อง close, range, directional channel และ deadlock
+sidebar:
+  order: 2
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/concurrency/channels/main.go?raw';
+
+> Don't communicate by sharing memory; share memory by communicating.
+
+คำขวัญของ Go บอกว่าแทนที่หลาย goroutine จะแย่งกันแก้ตัวแปรเดียวกัน ให้ **ส่งข้อมูลหากัน** ผ่าน **channel**
+channel คือท่อที่มี type กำกับ goroutine หนึ่งส่งค่าเข้า อีก goroutine รับค่าออก อย่างปลอดภัย
+
+## สร้างและใช้งาน channel
+
+```go
+ch := make(chan int)       // unbuffered channel ของ int
+buf := make(chan string, 3) // buffered channel จุได้ 3 ค่า
+
+ch <- 42      // ส่ง (send)
+v := <-ch     // รับ (receive)
+v, ok := <-ch // รับพร้อมเช็คว่า channel ปิดหรือยัง
+close(ch)     // ปิด channel
+```
+
+ลูกศร `<-` ชี้ไปทางที่ข้อมูลไหล: `ch <- v` ข้อมูลไหลเข้า channel, `<-ch` ข้อมูลไหลออกจาก channel
+
+zero value ของ channel คือ `nil` ต้องสร้างด้วย `make` ก่อนใช้เสมอ
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/concurrency/channels/main.go" />
+
+```text title="Output"
+work finished
+len: 2 cap: 3
+a b
+42 true
+0 false
+0 1 4 9 16 
+```
+
+## Unbuffered channel
+
+channel ที่ไม่มี buffer จะ **block ทั้งผู้ส่งและผู้รับ** จนกว่าอีกฝั่งจะพร้อม
+การส่งจึงเหมือนการ "ส่งของถึงมือ" — ผู้ส่งรู้แน่ว่ามีคนรับไปแล้ว
+
+ในส่วนที่ 1 ของตัวอย่าง `fmt.Println(<-done)` จะรอจน goroutine ส่ง `"work finished"` มา
+เป็นวิธี **synchronize** ที่ไม่ต้องใช้ `time.Sleep`
+
+## Buffered channel
+
+```go
+queue := make(chan string, 3)
+```
+
+- ส่งได้โดยไม่ block **จนกว่า buffer จะเต็ม**
+- รับได้โดยไม่ block **จนกว่า buffer จะว่าง**
+- `len(ch)` = จำนวนค่าที่รออยู่, `cap(ch)` = ขนาด buffer
+
+ใช้เมื่อผู้ส่งกับผู้รับทำงานเร็วไม่เท่ากันและอยากให้มีช่องพักชั่วคราว หรือใช้เป็น [semaphore](/concurrency/patterns/)
+
+<Aside type="tip">
+เริ่มจาก unbuffered ก่อนเสมอ ใส่ buffer เมื่อมีเหตุผลชัดเจน (และรู้ว่าทำไมต้องเป็นขนาดนั้น)
+การใส่ buffer เพื่อ "แก้" deadlock มักแค่ซ่อนปัญหาไว้ให้ไปโผล่ทีหลัง
+</Aside>
+
+## close และการ range
+
+`close(ch)` บอกว่า "จะไม่มีค่าใหม่ส่งมาอีกแล้ว" หลังจากปิด
+
+- ค่าที่ค้างอยู่ใน buffer **ยังรับได้ตามปกติ** (`42 true`)
+- เมื่อหมดแล้ว การรับจะ **ไม่ block** แต่ได้ zero value และ `ok == false` (`0 false`)
+- `for v := range ch` จะวนรับไปเรื่อยๆ และ **จบ loop เมื่อ channel ถูกปิดและว่าง**
+
+```go
+for v := range in { // จบเองเมื่อ in ถูก close
+	out <- v * v
+}
+```
+
+<Aside type="caution" title="กฎของการ close">
+- **ผู้ส่งเป็นคนปิด** ไม่ใช่ผู้รับ เพราะผู้รับไม่รู้ว่าผู้ส่งจะส่งอีกไหม
+- ส่งเข้า channel ที่ปิดแล้ว → `panic: send on closed channel`
+- ปิด channel ซ้ำ → `panic: close of closed channel`
+- **ไม่จำเป็นต้องปิดทุก channel** ปิดเฉพาะเมื่อต้องบอกผู้รับว่าจบแล้ว (เช่น ผู้รับใช้ `range`) channel ที่ไม่ได้ใช้แล้วจะถูก garbage collect เองแม้ไม่ปิด
+</Aside>
+
+## Directional channel
+
+ตอนส่ง channel เข้า function ระบุได้ว่า function นั้น **ส่งอย่างเดียว** หรือ **รับอย่างเดียว**
+
+| type | ทำได้ |
+|---|---|
+| `chan T` | ส่งและรับ |
+| `chan<- T` | ส่งอย่างเดียว |
+| `<-chan T` | รับอย่างเดียว |
+
+```go
+func producer(n int, out chan<- int)      // ส่งได้อย่างเดียว
+func square(in <-chan int, out chan<- int) // รับจาก in, ส่งไป out
+```
+
+ถ้า `square` เผลอเขียน `in <- 1` จะ **compile ไม่ผ่าน** ทำให้ API ชัดเจนและกันบั๊กได้ตั้งแต่ต้น
+`chan T` แปลงเป็น `chan<- T` หรือ `<-chan T` ได้อัตโนมัติตอนส่งเป็น argument
+
+ส่วนที่ 4 ของตัวอย่างต่อ `producer → square → main` เป็น **pipeline** แต่ละขั้นทำงานใน goroutine ของตัวเอง
+(ดู pattern เต็มๆ ใน [Concurrency patterns](/concurrency/patterns/))
+
+## Deadlock
+
+ถ้าทุก goroutine ต่างรอกันโดยไม่มีใครขยับได้ Go runtime จะตรวจพบและหยุดโปรแกรม
+
+```go
+func main() {
+	ch := make(chan int)
+	ch <- 1 // ไม่มีใครรับ → main block ตลอดไป
+	<-ch
+}
+```
+
+```text title="Output"
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [chan send]:
+main.main()
+	.../main.go:5 +0x38
+exit status 2
+```
+
+สาเหตุที่เจอบ่อย
+
+- ส่งเข้า unbuffered channel ใน goroutine เดียวกับที่จะรับ
+- ใช้ `range ch` แต่ผู้ส่งลืม `close(ch)` loop จึงรอค่าถัดไปตลอดกาล
+- `wg.Wait()` ใน goroutine เดียวกับที่ต้องรับค่าจาก worker ที่กำลังรอส่ง
+
+<Aside type="caution" title="runtime ไม่ได้จับ deadlock ทุกกรณี">
+ข้อความ `all goroutines are asleep` ขึ้นเฉพาะเมื่อ **ทุก** goroutine ติด
+ถ้ายังมี goroutine อื่นทำงานอยู่ (เช่น HTTP server) goroutine ที่ติดจะค้างเงียบๆ กลายเป็น goroutine leak
+(ดู [Race detector](/concurrency/race-detector/))
+</Aside>
+
+## nil channel
+
+การส่งหรือรับกับ `nil` channel จะ **block ตลอดไป** ฟังดูไร้ประโยชน์ แต่ใช้ปิด case ใน
+[select](/concurrency/select/) ได้ (กำหนด channel ให้เป็น nil เพื่อไม่ให้ case นั้นถูกเลือกอีก)
+
+## แบบฝึกหัด
+
+1. เขียน function `func gen(words ...string) <-chan string` ที่ส่งแต่ละคำเข้า channel แล้วปิด จากนั้นใช้ `range` พิมพ์ทุกคำใน `main`
+2. ต่อ pipeline เพิ่มอีกขั้น `func upper(in <-chan string) <-chan string` ที่แปลงเป็นตัวพิมพ์ใหญ่
+3. code นี้ deadlock หรือไม่ เพราะอะไร
+
+   ```go
+   ch := make(chan int, 1)
+   ch <- 1
+   fmt.Println(<-ch)
+   ```
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+func gen(words ...string) <-chan string {
+	out := make(chan string)
+	go func() {
+		defer close(out)
+		for _, w := range words {
+			out <- w
+		}
+	}()
+	return out
+}
+
+// 2
+func upper(in <-chan string) <-chan string {
+	out := make(chan string)
+	go func() {
+		defer close(out)
+		for w := range in {
+			out <- strings.ToUpper(w)
+		}
+	}()
+	return out
+}
+
+for w := range upper(gen("go", "is", "fun")) {
+	fmt.Println(w)
+}
+```
+
+3. ไม่ deadlock เพราะ buffer มีที่ว่าง 1 ช่อง การส่งจึงไม่ block จากนั้นรับค่าออกมาพิมพ์ `1` ได้ปกติ
+   (แต่ถ้าเปลี่ยนเป็น `make(chan int)` จะ deadlock)
+
+</details>

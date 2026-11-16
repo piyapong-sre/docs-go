@@ -1,0 +1,214 @@
+---
+title: Memory และ GC
+description: เข้าใจ stack กับ heap, escape analysis, เทคนิคลด allocation และการปรับ GC ด้วย GOGC และ GOMEMLIMIT
+sidebar:
+  order: 6
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/advanced/memory/main.go?raw';
+import testSrc from '../../../../examples/learn/advanced/memory/main_test.go?raw';
+
+## ทำไมต้องสนใจ allocation
+
+Go มี garbage collector (GC) คอยคืน memory ให้ เราจึงไม่ต้อง `free` เอง แต่ GC ไม่ได้ฟรี ยิ่งโปรแกรมสร้างของบน heap บ่อย GC ก็ยิ่งต้องทำงานบ่อย กิน CPU และอาจเพิ่ม latency
+
+ข่าวดีคือส่วนใหญ่ไม่ต้องคิดเรื่องนี้เลย ให้เขียนโค้ดที่อ่านง่ายก่อน แล้วค่อยกลับมาใช้เทคนิคในหน้านี้**เฉพาะจุดที่ profile บอกว่าเป็นปัญหา** (ดู [Profiling ด้วย pprof](/advanced/profiling/))
+
+## Stack vs Heap
+
+| | Stack | Heap |
+| --- | --- | --- |
+| เป็นของใคร | goroutine แต่ละตัว | ใช้ร่วมกันทั้งโปรแกรม |
+| จอง/คืน | เร็วมาก แค่ขยับ pointer | ช้ากว่า และต้องรอ GC เก็บ |
+| อายุ | หมดเมื่อฟังก์ชัน return | อยู่จนไม่มีใครอ้างถึง |
+
+ใน Go **เราไม่ได้เลือกเอง** ว่าตัวแปรจะอยู่ที่ไหน compiler ตัดสินใจผ่านกระบวนการที่เรียกว่า **escape analysis** ถ้าพิสูจน์ได้ว่าค่าไม่ถูกใช้หลังฟังก์ชันจบ ก็วางบน stack ถ้าไม่แน่ใจ (ค่า "หนี" ออกไป) ก็ย้ายไป heap
+
+## ดู escape analysis ด้วย `-gcflags=-m`
+
+```go title="main.go"
+package main
+
+import "fmt"
+
+type User struct{ Name string }
+
+func sum(a, b int) int {
+	total := a + b // อยู่บน stack
+	return total
+}
+
+func newUser(name string) *User {
+	u := User{Name: name} // ถูกย้ายไป heap เพราะคืน pointer ออกไป
+	return &u
+}
+
+func main() {
+	s := sum(1, 2)
+	u := newUser("gopher")
+	fmt.Println(s, u.Name)
+}
+```
+
+```sh
+go build -gcflags=-m .
+```
+
+```text title="Output"
+./main.go:7:6: can inline sum
+./main.go:12:6: can inline newUser
+./main.go:18:10: inlining call to sum
+./main.go:19:14: inlining call to newUser
+./main.go:20:13: inlining call to fmt.Println
+./main.go:12:14: leaking param: name
+./main.go:13:2: moved to heap: u
+./main.go:20:13: ... argument does not escape
+./main.go:20:14: s escapes to heap
+./main.go:20:18: u.Name escapes to heap
+```
+
+อ่านอย่างไร
+
+- `moved to heap: u` ตัวแปร `u` ต้องอยู่บน heap เพราะเราคืน `&u` ออกไป
+- `s escapes to heap` การส่งค่าเข้า `fmt.Println` (ซึ่งรับ `...any`) ทำให้ค่าถูก box เป็น interface และมักต้อง allocate
+- `leaking param: name` ค่า parameter ไหลออกไปกับผลลัพธ์
+- `can inline` ฟังก์ชันเล็กพอจะถูก inline ซึ่งบางครั้งทำให้ค่าที่ควรหนีกลับอยู่บน stack ได้
+
+ใช้ `-gcflags=-m=2` เพื่อดูเหตุผลละเอียดขึ้น หรือ `-gcflags='./internal/user=-m'` เพื่อจำกัดเฉพาะ package
+
+สาเหตุที่ทำให้ค่าหนีไป heap บ่อย ๆ
+
+- คืน pointer ไปยังตัวแปร local
+- เก็บค่าลงใน interface (`any`, `error`, `fmt.Stringer`)
+- closure จับตัวแปรแล้วถูกเก็บไว้ใช้ภายหลัง หรือถูกส่งให้ goroutine
+- slice/map ที่ขนาดไม่รู้ตอน compile หรือใหญ่เกินกว่าจะวางบน stack
+
+## ตัวอย่าง: เทคนิคลด allocation
+
+<Code code={src} lang="go" title="examples/learn/advanced/memory/main.go" />
+
+```text title="Output"
+newPointValue         0 allocs/op
+newPointPtr           1 allocs/op
+appendNoPrealloc      9 allocs/op
+appendPrealloc        1 allocs/op
+concatPlus            8 allocs/op
+concatBuilder         1 allocs/op
+render (sync.Pool)    0 allocs/op
+```
+
+`testing.AllocsPerRun` เรียกฟังก์ชันซ้ำแล้วนับ allocation เฉลี่ย ใช้ใน `main` หรือใน test เพื่อ assert ว่าโค้ดไม่ allocate เกินที่คาดได้
+
+### ยืนยันด้วย benchmark
+
+<Code code={testSrc} lang="go" title="examples/learn/advanced/memory/main_test.go" />
+
+```sh
+go test -run '^$' -bench . -benchmem
+```
+
+```text title="Output (ตัดหัว)"
+BenchmarkAppendNoPrealloc-12    	  466880	      2477 ns/op	   25208 B/op	      12 allocs/op
+BenchmarkAppendPrealloc-12      	  873684	      1374 ns/op	    8192 B/op	       1 allocs/op
+BenchmarkConcatPlus-12          	 7788952	       155.2 ns/op	     168 B/op	       8 allocs/op
+BenchmarkConcatBuilder-12       	26864192	        49.33 ns/op	      64 B/op	       1 allocs/op
+```
+
+ตัวเลขเวลาขึ้นกับเครื่อง แต่จำนวน allocation ควรใกล้เคียงกัน
+
+## อธิบายทีละเทคนิค
+
+### 1. คืนค่าเป็น value เมื่อ struct เล็ก
+
+`newPointValue` คืน `Point` ตรง ๆ จึงไม่ต้อง allocate ส่วน `newPointPtr` คืน `*Point` ทำให้ต้องจองบน heap struct ขนาดเล็ก (ไม่กี่ field) การ copy ถูกกว่าการให้ GC ดูแล
+
+<Aside type="caution">
+อย่าเปลี่ยน pointer เป็น value ทุกที่โดยไม่คิด ถ้า struct ใหญ่ ต้องแก้ไขค่าร่วมกัน หรือมี `sync.Mutex` อยู่ข้างใน ยังควรใช้ pointer เหมือนเดิม ความถูกต้องสำคัญกว่าประหยัด allocation
+</Aside>
+
+### 2. Preallocate slice และ map
+
+`append` บน slice ที่ cap ไม่พอจะจอง array ใหม่ที่ใหญ่ขึ้นแล้ว copy ของเดิม ถ้ารู้ขนาดล่วงหน้า (หรือประมาณได้) ให้ใช้ `make([]T, 0, n)` เหลือการจองครั้งเดียว map ก็เช่นกัน `make(map[K]V, n)`
+
+### 3. ต่อ string ด้วย `strings.Builder`
+
+string ใน Go เป็น immutable การใช้ `+=` ในลูปจึงสร้าง string ใหม่ทุกรอบ `strings.Builder` เขียนลง buffer ภายในแล้วแปลงเป็น string ตอนท้ายโดยไม่ copy ซ้ำ ใช้ `b.Grow(n)` ถ้าประมาณขนาดได้ ถ้าเป็น `[]byte` ใช้ `bytes.Buffer`
+
+### 4. `sync.Pool` สำหรับของชั่วคราวที่สร้างบ่อย
+
+`sync.Pool` เก็บ object ที่ใช้เสร็จแล้วไว้ให้ request ถัดไปหยิบมาใช้ซ้ำ เหมาะกับ buffer ขนาดกลางใน hot path เช่น encode JSON ทุก request
+
+กฎการใช้
+
+- `Get()` อาจได้ object ใหม่จาก `New` หรือของเก่าที่มีข้อมูลค้าง **ต้อง reset ก่อนใช้เสมอ**
+- `Put()` คืนเมื่อใช้เสร็จ และห้ามใช้ object นั้นต่อหลัง `Put`
+- GC อาจล้าง pool ได้ทุกเมื่อ ห้ามใช้เป็น cache ที่ต้องเก็บข้อมูลจริง
+
+<Aside type="caution">
+ระวังการ `Put` buffer ที่โตใหญ่มาก (เช่น ครั้งหนึ่งเคยเขียน 10 MB) กลับเข้า pool เพราะมันจะค้างอยู่และกิน memory นาน หลายโปรเจกต์จึงเช็กขนาดก่อน เช่น `if buf.Cap() <= 64<<10 { pool.Put(buf) }`
+</Aside>
+
+### เทคนิคอื่นที่ควรรู้
+
+- ใช้ `[]byte` ↔ `string` ให้น้อยที่สุด การแปลงแต่ละครั้งมัก copy
+- `strconv.AppendInt` แทน `fmt.Sprintf` ใน hot path
+- ส่ง `io.Writer` เข้าฟังก์ชันแทนการคืน string ใหญ่ ๆ
+- ใช้ `slices.Grow` เมื่ออยากขยาย cap ของ slice ที่มีอยู่แล้ว
+
+## GC, GOGC และ GOMEMLIMIT
+
+GC ของ Go เป็นแบบ concurrent mark-and-sweep ทำงานไปพร้อมโปรแกรม หยุดโลก (stop-the-world) สั้นมาก ปรับได้สองค่าหลัก
+
+| ค่า | ความหมาย | ค่าเริ่มต้น |
+| --- | --- | --- |
+| `GOGC` | เริ่ม GC รอบใหม่เมื่อ heap โตขึ้นกี่ % จากขนาดที่ยังใช้อยู่หลังรอบก่อน | `100` |
+| `GOMEMLIMIT` | soft limit ของ memory ทั้งหมดที่ runtime จัดการ เข้าใกล้เมื่อไหร่ GC จะทำงานถี่ขึ้น | ไม่จำกัด |
+
+```sh
+GOGC=200 ./api              # GC น้อยลง ใช้ memory มากขึ้น
+GOGC=50 ./api               # GC บ่อยขึ้น ประหยัด memory แต่กิน CPU
+GOMEMLIMIT=900MiB ./api     # สำหรับ container ที่ limit 1 GiB
+GOGC=off GOMEMLIMIT=900MiB ./api  # GC เฉพาะเมื่อใกล้ limit (ต้องมั่นใจเรื่อง limit)
+```
+
+ตั้งจากในโค้ดได้ด้วย `debug.SetGCPercent(200)` และ `debug.SetMemoryLimit(900 << 20)` จาก `runtime/debug`
+
+<Aside type="tip">
+สำหรับ service ใน container ให้ตั้ง `GOMEMLIMIT` ไว้ราว 80-90% ของ memory limit ของ container ช่วยลดโอกาสโดน OOM kill ได้มาก โดยแทบไม่ต้องแตะ `GOGC` ส่วน CPU ตั้งแต่ Go 1.25 runtime ปรับ `GOMAXPROCS` ตาม CPU limit ของ cgroup ให้เองแล้ว
+</Aside>
+
+<Aside type="caution">
+`GOMEMLIMIT` เป็น soft limit ถ้าข้อมูลที่ใช้งานจริงเกิน limit โปรแกรมจะไม่ crash ทันที แต่ GC จะทำงานหนักมากจน CPU พุ่ง (runtime มีกลไกจำกัดเวลา GC ไว้ราว 50% ของ CPU) ถ้าเห็นอาการนี้แปลว่าต้องเพิ่ม memory หรือลดการใช้ ไม่ใช่ลด limit
+</Aside>
+
+ดูการทำงานของ GC แบบสด ๆ ได้ด้วย `GODEBUG=gctrace=1 ./api` ซึ่งพิมพ์หนึ่งบรรทัดต่อ GC หนึ่งรอบ บอกขนาด heap และเวลาที่ใช้
+
+## แบบฝึกหัด
+
+1. รัน `go build -gcflags=-m` กับ `examples/learn/advanced/memory` แล้วหาบรรทัดที่บอกว่า `p` ใน `newPointPtr` ถูกย้ายไป heap
+2. เขียนฟังก์ชัน `joinIDs(ids []int) string` ที่คืน `"1,2,3"` โดยใช้ `strings.Builder` และ `strconv.AppendInt` แล้ววัด allocation ด้วย `testing.AllocsPerRun`
+3. service ของคุณรันใน container ที่ limit memory 512 MiB และโดน OOM kill บ่อยตอน traffic สูง ลองเสนอการตั้งค่า runtime ที่ช่วยได้
+
+<details>
+<summary>เฉลย</summary>
+
+1. จะเห็นบรรทัดประมาณ `./main.go:23:2: moved to heap: p`
+2. ```go
+   func joinIDs(ids []int) string {
+   	var b strings.Builder
+   	b.Grow(len(ids) * 4)
+   	var num [20]byte // buffer บน stack สำหรับแปลงตัวเลข
+   	for i, id := range ids {
+   		if i > 0 {
+   			b.WriteByte(',')
+   		}
+   		b.Write(strconv.AppendInt(num[:0], int64(id), 10))
+   	}
+   	return b.String()
+   }
+   ```
+   ถ้าค่าที่ `Grow` ไว้พอ จะได้ 1 allocation (ตอนจอง buffer ของ Builder)
+3. ตั้ง `GOMEMLIMIT=450MiB` (ประมาณ 85-90% ของ limit) ให้ GC เร่งทำงานก่อนจะชน limit จากนั้นใช้ heap profile (`inuse_space`) หาว่าอะไรกิน memory เผื่อมี leak หรือ cache ที่โตไม่หยุด
+
+</details>

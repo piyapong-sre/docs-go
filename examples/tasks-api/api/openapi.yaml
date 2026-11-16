@@ -1,0 +1,306 @@
+openapi: 3.1.0
+info:
+  title: Tasks API
+  version: 1.0.0
+  description: |
+    ตัวอย่าง REST API สำหรับจัดการ task ของผู้ใช้ เขียนด้วย Go `net/http`.
+
+    - ทุก response สำเร็จอยู่ใน envelope `{ "data": ..., "meta": { "request_id": ... } }`
+    - ทุก error อยู่ในรูป `{ "error": { "code", "message", "details", "request_id" } }`
+    - JSON field เป็น snake_case, เวลาเป็น ISO 8601 UTC
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/auth/register:
+    post:
+      summary: สมัครสมาชิก
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: สร้างผู้ใช้แล้ว
+          headers:
+            Location: { schema: { type: string }, description: /v1/me }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/auth/login:
+    post:
+      summary: เข้าสู่ระบบและรับ access token
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { $ref: '#/components/schemas/Token' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/me:
+    get:
+      summary: ข้อมูลผู้ใช้ที่ login อยู่
+      tags: [auth]
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /v1/tasks:
+    get:
+      summary: รายการ task ของฉัน (ใหม่สุดก่อน, cursor pagination)
+      tags: [tasks]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/Status' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: cursor, in: query, schema: { type: string }, description: ค่า next_cursor จากหน้าก่อน (opaque) }
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Task' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    post:
+      summary: สร้าง task
+      tags: [tasks]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTaskRequest' }
+      responses:
+        '201':
+          description: สร้างแล้ว
+          headers:
+            Location: { schema: { type: string }, description: /v1/tasks/{id} }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /v1/tasks/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      summary: ดู task
+      tags: [tasks]
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: แก้ไขบาง field ของ task
+      tags: [tasks]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateTaskRequest' }
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      summary: ลบ task
+      tags: [tasks]
+      responses:
+        '204': { description: ลบแล้ว }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Status:
+      type: string
+      enum: [todo, in_progress, done]
+    Meta:
+      type: object
+      properties:
+        request_id: { type: string, example: req_4f1c2a9be0d3a7c1e8f05b6d }
+    Pagination:
+      type: object
+      required: [limit, has_more]
+      properties:
+        limit: { type: integer, example: 20 }
+        next_cursor: { type: string, description: ส่งกลับมาใน query `cursor` เพื่อดึงหน้าถัดไป }
+        has_more: { type: boolean }
+    User:
+      type: object
+      required: [id, email, name, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+    UserEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/User' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    Token:
+      type: object
+      required: [access_token, token_type, expires_in, expires_at]
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer, description: วินาที }
+        expires_at: { type: string, format: date-time }
+    Task:
+      type: object
+      required: [id, title, description, status, due_at, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 5000 }
+        status: { $ref: '#/components/schemas/Status' }
+        due_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    TaskEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/Task' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, name, password]
+      properties:
+        email: { type: string, format: email, example: somchai@example.com }
+        name: { type: string, maxLength: 100, example: สมชาย }
+        password: { type: string, minLength: 8, example: correct-horse-battery }
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    CreateTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title: { type: string, maxLength: 200, example: เขียนบท Go concurrency }
+        description: { type: string, maxLength: 5000 }
+        status: { $ref: '#/components/schemas/Status' }
+        due_at: { type: string, format: date-time }
+    UpdateTaskRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 5000 }
+        status: { $ref: '#/components/schemas/Status' }
+        due_at: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [BAD_REQUEST, UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, CONFLICT,
+                     PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, VALIDATION_ERROR,
+                     RATE_LIMIT_EXCEEDED, TIMEOUT, INTERNAL_ERROR]
+            message: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  issue: { type: string }
+            request_id: { type: string }
+
+  responses:
+    BadRequest:
+      description: request อ่านไม่ได้ (JSON พัง)
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthenticated:
+      description: ไม่มี token หรือ token ไม่ถูกต้อง
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: ไม่พบ resource
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: ข้อมูลซ้ำ
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    ValidationError:
+      description: ข้อมูลไม่ผ่านการตรวจสอบ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: ข้อมูลไม่ผ่านการตรวจสอบ
+              details: [{ field: title, issue: ห้ามว่าง }]
+              request_id: req_4f1c2a9be0d3a7c1e8f05b6d
+    RateLimited:
+      description: เรียกบ่อยเกินไป
+      headers:
+        Retry-After: { schema: { type: integer }, description: วินาทีที่ต้องรอ }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

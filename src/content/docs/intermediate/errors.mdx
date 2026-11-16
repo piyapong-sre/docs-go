@@ -1,0 +1,205 @@
+---
+title: Error handling
+description: จัดการ error แบบ Go ด้วย error value, sentinel error, custom error type, การ wrap ด้วย %w และ errors.Is/As/Join
+sidebar:
+  order: 3
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/intermediate/errors/main.go?raw';
+
+Go ไม่มี exception ให้ `try/catch` แต่ถือว่า **error เป็นค่า (value) ธรรมดา** ที่ function คืนออกมา
+ผู้เรียกต้องตัดสินใจเองว่าจะจัดการอย่างไร ทำให้เส้นทางของ error ชัดเจนในทุกบรรทัดที่อ่าน
+
+## error คือ interface
+
+```go
+type error interface {
+	Error() string
+}
+```
+
+type ไหนมี method `Error() string` ก็เป็น error ได้ ตามธรรมเนียม error จะเป็น **ค่าสุดท้าย** ที่ function คืน
+
+```go
+f, err := os.Open("config.json")
+if err != nil {
+	return fmt.Errorf("open config: %w", err)
+}
+defer f.Close()
+```
+
+รูปแบบ `if err != nil` จะเห็นบ่อยมาก นี่คือสไตล์ปกติของ Go ไม่ใช่ code smell
+ข้อดีคือเห็นได้ทันทีว่าบรรทัดไหนพังได้และพังแล้วจะเกิดอะไรขึ้น
+
+## สร้าง error
+
+```go
+errors.New("something went wrong")             // ข้อความคงที่
+fmt.Errorf("user %d not found", id)            // จัดรูปแบบข้อความ
+fmt.Errorf("load user %d: %w", id, err)        // ห่อ (wrap) error เดิมไว้
+```
+
+ข้อความ error ควร **ขึ้นต้นด้วยตัวพิมพ์เล็กและไม่ลงท้ายด้วยจุด** เพราะมักถูกต่อกันเป็นสาย เช่น
+`load config: open config.json: no such file or directory`
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/intermediate/errors/main.go" />
+
+```text title="Output"
+error: find user 99: not found
+is ErrNotFound? true
+validation failed on field: age
+error: parse age "abc": strconv.Atoi: parsing "abc": invalid syntax
+is strconv.ErrSyntax? true
+is fs.ErrNotExist? true
+validate:
+name: required
+age: must be at least 18
+valid input -> <nil>
+```
+
+## Sentinel error
+
+**sentinel error** คือ error ที่ประกาศเป็นตัวแปรระดับ package ให้คนอื่นเอาไปเทียบได้
+ชื่อขึ้นต้นด้วย `Err` เช่น `io.EOF`, `sql.ErrNoRows`, `fs.ErrNotExist`
+
+```go
+var ErrNotFound = errors.New("not found")
+```
+
+ใช้เมื่อผู้เรียกต้อง **แยกกรณี** ได้ เช่น ไม่เจอข้อมูลให้ตอบ 404 แต่ error อื่นให้ตอบ 500
+
+## Custom error type
+
+ถ้าต้องส่งข้อมูลเพิ่มไปกับ error ให้สร้าง type เอง
+
+```go
+type ValidationError struct {
+	Field string
+	Msg   string
+}
+
+func (e *ValidationError) Error() string {
+	return e.Field + ": " + e.Msg
+}
+```
+
+ปกติจะใช้ pointer receiver และคืนเป็น `&ValidationError{...}`
+(ระวังกับดัก nil interface ใน [บท Interface](/intermediate/interfaces/) — เวลาไม่มี error ให้ `return nil` ตรงๆ)
+
+## Wrapping ด้วย `%w`
+
+`fmt.Errorf` กับ `%w` จะ **ห่อ** error เดิมไว้ข้างใน พร้อมเพิ่ม context ข้างหน้า
+
+```go
+return "", fmt.Errorf("find user %d: %w", id, ErrNotFound)
+// error: find user 99: not found
+```
+
+ข้อความดีขึ้นเพราะบอกว่าพังที่ไหน และ **ยังตรวจได้** ว่าข้างในคือ `ErrNotFound`
+ถ้าใช้ `%v` แทน `%w` จะได้ข้อความเหมือนกัน แต่สาย error ขาด `errors.Is` จะหาไม่เจอ
+
+## `errors.Is` และ `errors.As`
+
+| function | ใช้เมื่อ | ตัวอย่าง |
+|---|---|---|
+| `errors.Is(err, target)` | เช็คว่าในสาย error มี **ค่า** นี้ไหม (sentinel) | `errors.Is(err, ErrNotFound)` |
+| `errors.As(err, &target)` | เช็คว่าในสาย error มี **type** นี้ไหม แล้วดึงออกมา | `errors.As(err, &ve)` |
+
+ทั้งสองตัวจะ "แกะ" error ที่ถูก wrap ไว้ทีละชั้นจนกว่าจะเจอ
+
+```go
+var ve *ValidationError
+if errors.As(err, &ve) {
+	fmt.Println(ve.Field) // ใช้ข้อมูลใน custom error ได้
+}
+```
+
+<Aside type="caution" title="อย่าเทียบด้วย == หรือดูจากข้อความ">
+- `err == ErrNotFound` จะเป็น `false` ทันทีที่ error ถูก wrap ให้ใช้ `errors.Is`
+- `strings.Contains(err.Error(), "not found")` เปราะบางมาก ข้อความเปลี่ยนเมื่อไรก็พัง
+- type assertion `err.(*ValidationError)` ก็ไม่แกะ wrap ให้ใช้ `errors.As`
+</Aside>
+
+## `errors.Join`
+
+รวมหลาย error เป็นก้อนเดียว (Go 1.20+) เหมาะกับ validation ที่อยากรายงานทุกข้อพร้อมกัน
+
+```go
+err := errors.Join(err1, err2)  // nil ทั้งหมดจะได้ nil
+errors.Is(err, err1)            // true — เช็คได้ทุกตัวที่อยู่ข้างใน
+```
+
+`Error()` ของผลลัพธ์จะเอาข้อความแต่ละตัวมาต่อกันด้วยขึ้นบรรทัดใหม่ ดังที่เห็นใน output
+
+## เพิ่ม context ทุกชั้น แต่อย่าซ้ำ
+
+แต่ละชั้นควรบอกว่า **ตัวเองกำลังทำอะไร** ไม่ต้องพูดซ้ำสิ่งที่ชั้นล่างบอกแล้ว
+
+```go
+// ❌ ไม่มี context — log มาแค่ "no such file or directory" ไม่รู้ว่าไฟล์ไหน
+if err != nil {
+	return err
+}
+
+// ❌ ซ้ำซาก
+return fmt.Errorf("error: failed to open file: error: %w", err)
+
+// ✅ สั้น ได้ใจความ
+return fmt.Errorf("load config %s: %w", path, err)
+```
+
+<Aside type="tip" title="จัดการ error ครั้งเดียว">
+error หนึ่งตัวควรถูก **จัดการแค่ครั้งเดียว** คือ "log แล้วจบ" หรือ "wrap แล้ว return" อย่างใดอย่างหนึ่ง
+ถ้าทั้ง log และ return ทุกชั้น จะได้ log ซ้ำหลายบรรทัดสำหรับปัญหาเดียว
+ปกติจะ log ที่ชั้นบนสุด เช่น HTTP handler หรือ `main`
+</Aside>
+
+## อย่าใช้ panic แทน error
+
+`panic` มีไว้สำหรับ **บั๊กของโปรแกรม** ที่ไม่ควรเกิดขึ้น เช่น index เกิน หรือ invariant พัง
+ไม่ใช่สำหรับเหตุการณ์ที่คาดได้ เช่น ไฟล์ไม่มี input ผิด network ล่ม — กรณีเหล่านี้ให้คืน `error`
+(ดูรายละเอียดใน [defer, panic และ recover](/intermediate/defer-panic-recover/))
+
+<Aside type="caution" title="อย่าเพิกเฉย error">
+`f, _ := os.Open(name)` ทิ้ง error ไปเฉยๆ ถ้าเปิดไม่ได้ `f` จะเป็น nil แล้วไป panic ที่อื่นซึ่งหาสาเหตุยาก
+ถ้าตั้งใจไม่สนจริงๆ ควรเขียน comment บอกเหตุผลไว้
+</Aside>
+
+## แบบฝึกหัด
+
+1. เขียน `func Withdraw(balance, amount int) (int, error)` ที่คืน sentinel error `ErrInsufficientFunds` ถ้าเงินไม่พอ แล้วใน `main` ใช้ `errors.Is` เช็ค
+2. สร้าง custom error `HTTPError{Code int}` แล้ว wrap มันสองชั้นด้วย `fmt.Errorf("...: %w", ...)` จากนั้นใช้ `errors.As` ดึง `Code` ออกมา
+3. ถ้าเปลี่ยน `%w` เป็น `%v` ใน `findUser` แล้ว `errors.Is(err, ErrNotFound)` จะได้ค่าอะไร
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+var ErrInsufficientFunds = errors.New("insufficient funds")
+
+func Withdraw(balance, amount int) (int, error) {
+	if amount > balance {
+		return balance, fmt.Errorf("withdraw %d: %w", amount, ErrInsufficientFunds)
+	}
+	return balance - amount, nil
+}
+
+// 2
+type HTTPError struct{ Code int }
+
+func (e *HTTPError) Error() string { return fmt.Sprintf("http %d", e.Code) }
+
+err := fmt.Errorf("handler: %w", fmt.Errorf("call api: %w", &HTTPError{Code: 503}))
+var he *HTTPError
+if errors.As(err, &he) {
+	fmt.Println(he.Code) // 503
+}
+```
+
+3. ได้ `false` เพราะ `%v` แปลง error เป็นข้อความเฉยๆ ไม่ได้ห่อ error เดิมไว้
+
+</details>

@@ -1,0 +1,219 @@
+---
+title: โครงสร้างโปรเจกต์
+description: จัดโฟลเดอร์ของ API ตาม feature กำหนดทิศทางของ dependency ให้ชัด และประกอบทุกชิ้นด้วย dependency injection แบบเขียนเอง
+sidebar:
+  order: 4
+---
+
+import { Aside, Code, FileTree } from '@astrojs/starlight/components';
+import mainSrc from '../../../../examples/tasks-api/cmd/api/main.go?raw';
+
+โครงสร้างที่ดีทำให้ตอบคำถาม "โค้ดส่วนนี้ควรอยู่ที่ไหน" ได้ทันที และทำให้เปลี่ยนส่วนหนึ่งได้โดยไม่กระทบส่วนอื่น หน้านี้อธิบายว่า tasks-api จัดโค้ดอย่างไรและทำไม (หลักการทั่วไปทบทวนได้ที่ [โครงสร้างโปรเจกต์](/advanced/project-layout/) ในส่วนขั้นสูง)
+
+## โครงสร้างทั้งหมด
+
+<FileTree>
+- examples/tasks-api/
+  - cmd/
+    - api/
+      - main.go จุดเริ่มโปรแกรม: โหลด config และประกอบทุกชิ้นเข้าด้วยกัน
+  - api/
+    - embed.go
+    - openapi.yaml สเปก OpenAPI (embed เข้า binary)
+  - internal/
+    - task/ feature: task
+      - task.go domain model, error และ interface Repository
+      - service.go business rules
+      - handler.go HTTP handler และ DTO
+      - cursor.go
+    - user/ feature: user
+      - user.go
+      - handler.go
+    - auth/ JWT, bcrypt และ middleware RequireAuth
+    - config/ อ่าน environment variable
+    - httpx/ helper ด้าน HTTP: envelope, error, decode, validate
+    - middleware/ middleware ที่ใช้ทุก route และ rate limiter
+    - postgres/ implement repository ด้วย pgx + sqlc
+      - migrations/ ไฟล์ SQL ของ goose
+      - queries/ SQL ที่ให้ sqlc generate
+      - sqlc/ โค้ดที่ generate แล้ว (ห้ามแก้มือ)
+      - postgres.go
+      - repos.go
+    - server/ ลงทะเบียน route, ห่อ middleware และสร้าง http.Server
+  - .env.example
+  - compose.yaml
+  - Dockerfile
+  - Makefile
+  - sqlc.yaml
+  - go.mod
+</FileTree>
+
+โฟลเดอร์ใน `internal/` แบ่งเป็นสองกลุ่ม
+
+| กลุ่ม | package | หน้าที่ |
+| --- | --- | --- |
+| **Feature** (ธุรกิจ) | `task`, `user` | ทุกอย่างของ feature นั้น: model, กฎ, contract ของ storage และ HTTP handler |
+| **Infrastructure** (เทคนิค) | `postgres`, `httpx`, `middleware`, `auth`, `config`, `server` | เรื่องเทคนิคที่หลาย feature ใช้ร่วมกัน หรือการเชื่อมกับโลกภายนอก |
+
+ทุกอย่างอยู่ใต้ `internal/` เพื่อให้ module อื่น import ไม่ได้ ทำให้เราเปลี่ยน API ภายในได้อิสระ
+
+## แบ่งตาม feature ไม่ใช่ตาม layer
+
+อีกแบบที่พบบ่อยคือแบ่งตาม layer เช่น `handlers/`, `services/`, `models/`, `repositories/` ปัญหาคือเมื่อจะเพิ่ม field ให้ task หนึ่งตัว ต้องเปิดไฟล์กระจายอยู่ 4 โฟลเดอร์ และ package `models` มักกลายเป็นที่รวมของทุกอย่าง
+
+เมื่อแบ่งตาม feature ทุกอย่างของ task อยู่ใน `internal/task/` และชื่อที่ใช้ก็อ่านเป็นธรรมชาติ
+
+```go
+task.Task          // ไม่ใช่ models.Task
+task.NewService    // ไม่ใช่ services.NewTaskService
+task.ErrNotFound   // แต่ละ feature มี ErrNotFound ของตัวเอง
+```
+
+## ทิศทางของ dependency
+
+กฎข้อเดียวที่สำคัญที่สุด: **feature ไม่รู้จัก infrastructure ที่เก็บข้อมูล** แต่ infrastructure รู้จัก feature
+
+```text
+cmd/api ──┬──► config
+          ├──► postgres ──► task, user, sqlc
+          ├──► server ────► task, user, middleware, auth, httpx
+          └──► task, user, auth, middleware
+
+task, user ──────► auth, httpx
+middleware, auth ► httpx
+```
+
+(ลูกศร A ──► B หมายถึง "A import B")
+
+- `task` import แค่ `httpx` และ `auth` (สำหรับเรื่อง HTTP ใน handler) ไม่ import `postgres` เลย
+- `postgres` import `task` และ `user` เพื่อ implement interface `Repository` และคืนค่า `task.Task`
+- `main` เป็นที่เดียวที่รู้จักทุก package และทำหน้าที่ประกอบ
+
+ทิศทางนี้ทำให้ business logic ไม่ผูกกับ PostgreSQL วันหนึ่งจะเปลี่ยนไปใช้ฐานข้อมูลอื่น หรือใช้ repository ใน memory ตอน test ก็ไม่ต้องแตะ `task` เลย
+
+## Interface ประกาศโดยผู้ใช้
+
+`task.Repository` ถูกประกาศไว้ใน package `task` ซึ่งเป็น **ผู้ใช้** interface ไม่ใช่ใน `postgres` ซึ่งเป็นผู้ implement
+
+```go title="internal/task/task.go"
+// Repository is the storage contract the service depends on.
+// It is defined here, by the consumer, so the service does not know
+// whether data lives in PostgreSQL, memory or anywhere else.
+type Repository interface {
+	Create(ctx context.Context, p CreateParams) (Task, error)
+	Get(ctx context.Context, userID, id string) (Task, error)
+	List(ctx context.Context, p ListParams) ([]Task, error)
+	Update(ctx context.Context, p UpdateParams) (Task, error)
+	Delete(ctx context.Context, userID, id string) error
+}
+```
+
+และ service พึ่งแค่ interface นี้
+
+```go title="internal/task/service.go"
+// Service holds the business rules for tasks. It knows nothing about HTTP.
+type Service struct {
+	repo Repository
+}
+
+func NewService(repo Repository) *Service {
+	return &Service{repo: repo}
+}
+```
+
+นี่คือสำนวนของ Go: "accept interfaces, return structs" interface ใน Go ถูก implement โดยปริยาย (ไม่ต้องเขียน `implements`) ผู้ใช้จึงประกาศ interface เล็กๆ ที่มีเฉพาะ method ที่ตัวเองต้องการได้ โปรเจกต์นี้ใช้แนวคิดเดียวกันหลายที่
+
+| Interface | ประกาศใน | ผู้ implement |
+| --- | --- | --- |
+| `task.Repository` | `task` | `postgres.TaskRepo` |
+| `user.Repository` | `user` | `postgres.UserRepo` |
+| `user.TokenIssuer` | `user` | `auth.TokenManager` |
+| `auth.Verifier` | `auth` (middleware) | `auth.TokenManager` |
+| `server.Pinger` | `server` | `*pgxpool.Pool` |
+
+สังเกต `auth.Verifier` ที่มีแค่ `Verify` และ `user.TokenIssuer` ที่มีแค่ `Issue` แม้ว่าทั้งคู่จะ implement โดย `TokenManager` ตัวเดียวกัน แต่ละฝั่งขอแค่ส่วนที่ตัวเองใช้ ทำให้ test ง่ายมาก
+
+### Compile-time interface check
+
+เพราะ implement โดยปริยาย ถ้าวันหนึ่งเราเพิ่ม method ใน `task.Repository` แต่ลืม implement ใน `TaskRepo` error จะไปโผล่ที่ `main.go` ซึ่งอยู่ไกลจากต้นเหตุ เราจึงใส่บรรทัดนี้ไว้ข้าง struct
+
+```go title="internal/postgres/repos.go"
+// TaskRepo implements task.Repository.
+type TaskRepo struct {
+	q *sqlc.Queries
+}
+
+var _ task.Repository = (*TaskRepo)(nil)
+```
+
+บรรทัดนี้ไม่สร้างอะไรตอน runtime (`_` คือทิ้งค่า และ `(*TaskRepo)(nil)` คือ pointer nil ที่ไม่ต้องจองหน่วยความจำ) แต่ทำให้ compiler ตรวจตั้งแต่ตอน build ว่า `*TaskRepo` มี method ครบตาม `task.Repository` ถ้าไม่ครบ build จะล้มที่บรรทัดนี้พร้อมบอกชื่อ method ที่ขาด
+
+## main.go: ประกอบทุกอย่างด้วยมือ
+
+<Code code={mainSrc} lang="go" title="cmd/api/main.go" />
+
+### Pattern `run() error`
+
+`main` มีหน้าที่เดียวคือเรียก `run` แล้วรายงาน error งานจริงทั้งหมดอยู่ใน `run` ซึ่งคืน `error` แบบฟังก์ชัน Go ทั่วไป
+
+```go title="cmd/api/main.go"
+func main() {
+	// main only reports errors; all real work happens in run, which is
+	// easy to test and lets deferred cleanups run before the process exits.
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+```
+
+เหตุผลหลักคือ `os.Exit` (และ `log.Fatal` ซึ่งเรียก `os.Exit`) **ไม่รัน `defer`** ถ้าเรา `log.Fatal` กลาง `main` หลังเปิด connection pool ไปแล้ว `defer pool.Close()` จะไม่ถูกเรียก การรวม error ไว้ที่ `run` ทำให้ทุก defer ทำงานครบก่อนออกจากโปรแกรม และเขียน `return fmt.Errorf(...)` ได้ตามปกติ
+
+### Dependency injection แบบเขียนเอง
+
+ส่วนกลางของ `run` สร้าง object ทีละชั้นแล้วส่งเข้าไปใน constructor ของชั้นถัดไป
+
+```go title="cmd/api/main.go"
+	// ---- Features (dependency injection by hand) ----
+	userSvc, err := user.NewService(postgres.NewUserRepo(pool), tokens)
+	if err != nil {
+		return err
+	}
+	taskSvc := task.NewService(postgres.NewTaskRepo(pool))
+```
+
+นี่คือ dependency injection ทั้งหมดที่เราต้องการ: ไม่มี container, ไม่มี reflection, ไม่มี global อ่านจากบนลงล่างก็รู้ว่าอะไรพึ่งอะไร และถ้าลืมส่ง dependency ตัวไหน compiler จะบอกทันที
+
+dependency ของชั้น HTTP ถูกรวมไว้ใน struct `server.Deps` เพื่อให้ `NewHandler` มี parameter เดียวที่อ่านง่าย
+
+```go title="internal/server/server.go"
+// Deps is everything the routes need. Passing dependencies explicitly
+// (no globals) makes the wiring obvious and the server easy to test.
+type Deps struct {
+	Logger         *slog.Logger
+	DB             Pinger
+	Tokens         auth.Verifier
+	Users          *user.Handler
+	Tasks          *task.Handler
+	AuthLimiter    *mw.RateLimiter
+	CORSOrigins    []string
+	RequestTimeout time.Duration
+}
+```
+
+<Aside type="tip">
+library สำหรับ DI อย่าง wire หรือ fx มีประโยชน์เมื่อโปรเจกต์มี dependency เป็นร้อยตัว แต่สำหรับ API ส่วนใหญ่ การเขียนเองใน `main` อ่านง่ายกว่าและ debug ง่ายกว่ามาก เริ่มจากเขียนเองก่อน แล้วค่อยพิจารณาเครื่องมือเมื่อเจ็บจริง
+</Aside>
+
+<Aside type="caution">
+หลีกเลี่ยง global variable สำหรับ dependency เช่น `var DB *pgxpool.Pool` ที่ package อื่นเรียกใช้ตรงๆ มันทำให้ test แบบขนานไม่ได้ (ทุก test แชร์ตัวเดียวกัน) และซ่อนว่าโค้ดส่วนไหนพึ่งฐานข้อมูลบ้าง
+</Aside>
+
+ส่วนท้ายของ `run` (รอ signal แล้ว `Shutdown`) อธิบายในหน้า [Graceful shutdown](/web-api/graceful-shutdown/)
+
+## สรุป
+
+- แบ่ง package ตาม feature (`task`, `user`) และแยก infrastructure (`postgres`, `httpx`, `middleware`, `auth`, `config`, `server`) ไว้ใต้ `internal/`
+- dependency ชี้เข้าหา feature: `postgres` รู้จัก `task` แต่ `task` ไม่รู้จัก `postgres`
+- interface ประกาศโดยผู้ใช้และเล็กที่สุดเท่าที่จำเป็น และใช้ `var _ task.Repository = (*TaskRepo)(nil)` ให้ compiler ตรวจตอน build
+- `main` เรียก `run() error` เพื่อให้ defer ทำงานครบ และประกอบ dependency ทั้งหมดด้วยมือแบบอ่านจากบนลงล่างได้

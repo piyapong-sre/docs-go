@@ -1,0 +1,245 @@
+---
+title: ภาพรวมโปรเจกต์ tasks-api
+description: รู้จักโปรเจกต์ REST API ที่เราจะสร้างทั้งส่วนนี้ ตั้งแต่ endpoint, สถาปัตยกรรม, เครื่องมือที่เลือก ไปจนถึงวิธีรันให้เห็นผลภายในไม่กี่นาที
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+ส่วนนี้จะพาสร้าง **REST API สำหรับจัดการ task (to-do list)** ด้วย Go แบบที่ใช้งานจริงได้ ไม่ใช่แค่ demo โค้ดทั้งหมดอยู่ใน repo นี้ที่ `examples/tasks-api` ซึ่งผ่านการทดสอบแล้ว ทุกหน้าในส่วนนี้จะอ้างอิงโค้ดจากโปรเจกต์นี้ตรงๆ
+
+## สิ่งที่จะสร้าง
+
+ผู้ใช้สมัครสมาชิก, login เพื่อรับ access token (JWT) แล้วใช้ token นั้นสร้าง ดู แก้ไข และลบ task **ของตัวเอง** ได้ โดยมองไม่เห็น task ของคนอื่น
+
+ระหว่างทางเราจะได้ใช้แนวปฏิบัติที่ API จริงควรมี เช่น
+
+- response และ error มีรูปแบบ (envelope) เดียวกันทุก endpoint พร้อม `request_id` สำหรับตามรอย
+- ตรวจ input ละเอียด รายงาน error ทุก field ในครั้งเดียว
+- middleware สำหรับ log, recover panic, CORS, security headers, timeout และ rate limit
+- query ฐานข้อมูลแบบ type-safe และ cursor pagination ที่เร็วแม้ข้อมูลเยอะ
+- graceful shutdown, health check, Docker image ขนาดเล็ก และ test ทั้ง unit และ integration
+
+## Endpoint ทั้งหมด
+
+| Method | Path | Auth | คำอธิบาย |
+| --- | --- | --- | --- |
+| `GET` | `/healthz` | - | liveness: process ยังทำงานอยู่ไหม |
+| `GET` | `/readyz` | - | readiness: ต่อฐานข้อมูลได้ไหม (พร้อมรับ traffic) |
+| `GET` | `/openapi.yaml` | - | สเปก OpenAPI ของ API นี้ |
+| `POST` | `/v1/auth/register` | - (มี rate limit) | สมัครสมาชิก |
+| `POST` | `/v1/auth/login` | - (มี rate limit) | login แล้วรับ access token |
+| `GET` | `/v1/me` | Bearer | ข้อมูลผู้ใช้ที่ login อยู่ |
+| `GET` | `/v1/tasks` | Bearer | รายการ task ของฉัน กรองด้วย `status` และแบ่งหน้าด้วย `cursor` |
+| `POST` | `/v1/tasks` | Bearer | สร้าง task |
+| `GET` | `/v1/tasks/{id}` | Bearer | ดู task หนึ่งรายการ |
+| `PATCH` | `/v1/tasks/{id}` | Bearer | แก้บาง field ของ task |
+| `DELETE` | `/v1/tasks/{id}` | Bearer | ลบ task (ตอบ `204 No Content`) |
+
+endpoint ทางธุรกิจทั้งหมดขึ้นต้นด้วย `/v1` เพื่อให้วันหนึ่งออก `/v2` ได้โดยไม่ทำให้ client เดิมพัง ส่วน `/healthz` และ `/readyz` เป็น endpoint สำหรับระบบ (load balancer, Kubernetes) จึงไม่ใส่ version
+
+## สถาปัตยกรรม
+
+โค้ดแบ่งเป็นชั้น (layer) ที่แต่ละชั้นมีหน้าที่ชัดเจน และเรียกกันได้ทางเดียวจากบนลงล่าง
+
+```text
+            HTTP request
+                 │
+                 ▼
+┌──────────────────────────────────┐
+│  Middleware chain                │  request id, log, recover, CORS,
+│  (internal/middleware, auth)     │  security headers, timeout, auth
+└──────────────────────────────────┘
+                 │
+                 ▼
+┌──────────────────────────────────┐
+│  Handler   (task.Handler)        │  JSON ⇄ struct, validate input,
+│                                  │  แปลง domain error เป็น HTTP error
+└──────────────────────────────────┘
+                 │  task.CreateParams, task.Task
+                 ▼
+┌──────────────────────────────────┐
+│  Service   (task.Service)        │  business rules (ไม่รู้จัก HTTP)
+└──────────────────────────────────┘
+                 │  task.Repository (interface)
+                 ▼
+┌──────────────────────────────────┐
+│  Repository (postgres.TaskRepo)  │  SQL ที่ generate ด้วย sqlc + pgx
+└──────────────────────────────────┘
+                 │
+                 ▼
+           PostgreSQL 18
+```
+
+- **Handler** รู้เรื่อง HTTP อย่างเดียว: อ่าน request, ตรวจ input, เรียก service แล้วเขียน response
+- **Service** เก็บกฎทางธุรกิจ เช่น ค่า status เริ่มต้น หรือจำนวนรายการต่อหน้าสูงสุด ไม่ import `net/http` เลย
+- **Repository** คุยกับฐานข้อมูล service ไม่รู้ว่าข้างหลังเป็น PostgreSQL เพราะมันพึ่งแค่ interface `task.Repository`
+
+ผลคือแต่ละชั้น test แยกกันได้ง่าย และเปลี่ยนรายละเอียดของชั้นล่างได้โดยไม่กระทบชั้นบน รายละเอียดอยู่ในหน้า [โครงสร้างโปรเจกต์](/web-api/project-structure/)
+
+## เครื่องมือที่เลือกและเหตุผล
+
+| เรื่อง | ใช้ | เหตุผล |
+| --- | --- | --- |
+| HTTP router | `net/http` (stdlib) | ตั้งแต่ Go 1.22 `ServeMux` รองรับ method และ path parameter เช่น `GET /v1/tasks/{id}` แล้ว |
+| Database driver | `github.com/jackc/pgx/v5` | driver PostgreSQL ที่เร็วและครบที่สุดใน Go มี connection pool ในตัว |
+| Query | `sqlc` | เขียน SQL ตรงๆ แล้ว generate โค้ด Go ที่ type-safe ไม่ต้องใช้ ORM |
+| Migration | `github.com/pressly/goose/v3` | migration เป็นไฟล์ `.sql` ธรรมดา embed เข้า binary ได้ |
+| Auth | `github.com/golang-jwt/jwt/v5` + `bcrypt` | library มาตรฐานของชุมชนสำหรับ JWT และ hash รหัสผ่าน |
+| Logging | `log/slog` (stdlib) | structured log แบบ JSON ไม่ต้องพึ่ง library ภายนอก |
+
+### ทำไมไม่ใช้ framework
+
+Go ต่างจากหลายภาษาตรงที่ standard library มีของพร้อมใช้ทำ web server ระดับ production อยู่แล้ว ทั้ง router, HTTP/2, TLS, timeout และ graceful shutdown การใช้ `net/http` ตรงๆ จึงได้ข้อดีหลายอย่าง
+
+- **dependency น้อย** ลดความเสี่ยงด้าน security และไม่ต้องตามอัปเกรด framework
+- **ทุกอย่างเป็น `http.Handler`** middleware หรือ library ที่เขียนสำหรับ `net/http` ใช้ร่วมกันได้หมด
+- **ความรู้ไม่ล้าสมัย** สิ่งที่เรียนในส่วนนี้ใช้ได้กับทุก router ที่ compatible กับ `net/http` เช่น chi
+
+framework อย่าง Gin หรือ Echo ไม่ใช่ตัวเลือกที่ผิด แต่สำหรับการเรียนรู้และ API ขนาดนี้ เราไม่ต้องใช้มัน ส่วนที่ framework ช่วย (เช่น การเขียน JSON response หรือ bind request) เราเขียน helper เล็กๆ เองในไม่กี่สิบบรรทัด ดูได้ในหน้า [JSON และ response](/web-api/json-and-responses/)
+
+## รันให้เห็นผลก่อน
+
+สิ่งที่ต้องมีคือ Docker (พร้อม Docker Compose) เท่านั้น ถ้าจะรันโค้ดบนเครื่องโดยตรงต้องมี Go 1.26 ขึ้นไปด้วย
+
+<Tabs>
+<TabItem label="Docker Compose (ง่ายที่สุด)">
+
+```bash
+cd examples/tasks-api
+docker compose up --build
+```
+
+คำสั่งนี้ build image ของ API แล้วรันคู่กับ PostgreSQL โดย API จะรอจนฐานข้อมูลพร้อม (health check) และรัน migration เองตอนเริ่ม
+
+</TabItem>
+<TabItem label="รัน Go บนเครื่อง">
+
+```bash
+cd examples/tasks-api
+cp .env.example .env   # ค่าตั้งต้นสำหรับ development
+make db-up             # รันเฉพาะ PostgreSQL ใน Docker
+make run               # go run ./cmd/api
+```
+
+</TabItem>
+</Tabs>
+
+<Aside type="tip" title="port ชนกับโปรแกรมอื่น">
+ค่าเริ่มต้น PostgreSQL เปิดที่ port `5433` และ API ที่ `8080` ของเครื่อง ถ้า port ไม่ว่าง เปลี่ยนได้ด้วยตัวแปร `DB_HOST_PORT` และ `API_HOST_PORT` เช่น
+
+```bash
+DB_HOST_PORT=5434 API_HOST_PORT=8081 docker compose up --build
+```
+
+ถ้ารัน Go บนเครื่องและเปลี่ยน `DB_HOST_PORT` อย่าลืมแก้ port ใน `DATABASE_URL` ของไฟล์ `.env` ให้ตรงกัน
+</Aside>
+
+### ลองเรียก API
+
+<Steps>
+
+1. เช็กว่า server ทำงาน
+
+   ```bash
+   curl -s localhost:8080/healthz
+   ```
+
+   ```json
+   {"status":"ok"}
+   ```
+
+2. สมัครสมาชิก
+
+   ```bash
+   curl -s -X POST localhost:8080/v1/auth/register \
+     -H 'Content-Type: application/json' \
+     -d '{"email":"somchai@example.com","name":"สมชาย","password":"supersecret"}'
+   ```
+
+   ```json
+   {
+     "data": {
+       "id": "01a1e29f-d248-77f0-9743-5cde600d1093",
+       "email": "somchai@example.com",
+       "name": "สมชาย",
+       "created_at": "2026-11-16T04:31:27.304397Z"
+     },
+     "meta": { "request_id": "req_e72149c643b940b0d07e603e" }
+   }
+   ```
+
+3. login แล้วเก็บ token ไว้ในตัวแปร (ใช้ `jq` ดึงค่า)
+
+   ```bash
+   TOKEN=$(curl -s -X POST localhost:8080/v1/auth/login \
+     -H 'Content-Type: application/json' \
+     -d '{"email":"somchai@example.com","password":"supersecret"}' \
+     | jq -r .data.access_token)
+   ```
+
+4. สร้าง task แล้วดูรายการ
+
+   ```bash
+   curl -s -X POST localhost:8080/v1/tasks \
+     -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"title":"เรียน Go","due_at":"2026-12-01T09:00:00+07:00"}'
+
+   curl -s "localhost:8080/v1/tasks?limit=5" -H "Authorization: Bearer $TOKEN"
+   ```
+
+   ```json
+   {
+     "data": [
+       {
+         "id": "01a1e29f-d325-7bf7-b957-179ae14d9519",
+         "title": "เรียน Go",
+         "description": "",
+         "status": "todo",
+         "due_at": "2026-12-01T02:00:00Z",
+         "created_at": "2026-11-16T04:31:27.525654Z",
+         "updated_at": "2026-11-16T04:31:27.525654Z"
+       }
+     ],
+     "pagination": { "limit": 5, "has_more": false },
+     "meta": { "request_id": "req_..." }
+   }
+   ```
+
+</Steps>
+
+สังเกตว่า `due_at` ที่ส่งไปเป็นเวลาไทย (`+07:00`) ถูกเก็บและตอบกลับเป็น UTC (`Z`) ซึ่งเป็นเวลาเดียวกัน เหตุผลอยู่ในหน้า [JSON และ response](/web-api/json-and-responses/)
+
+<Aside type="note">
+`make docker-up` ทำเหมือน `docker compose up --build` แต่รันแบบ background (`-d`) ส่วน `make docker-down` ใช้หยุดทั้งหมด
+</Aside>
+
+## ลำดับบทในส่วนนี้
+
+แต่ละบทต่อยอดจากบทก่อนหน้า แนะนำให้อ่านตามลำดับ
+
+1. **ภาพรวม** (หน้านี้)
+2. [พื้นฐาน net/http](/web-api/http-basics/) handler, ServeMux และ routing แบบ Go 1.22
+3. [JSON และ response](/web-api/json-and-responses/) envelope มาตรฐานและการ render error ที่เดียว
+4. [โครงสร้างโปรเจกต์](/web-api/project-structure/) แบ่ง package ตาม feature และ dependency injection
+5. [Configuration](/web-api/configuration/) อ่านค่าจาก environment variable แบบ 12-factor
+6. [Middleware](/web-api/middleware/) request id, logging, recover, CORS, timeout
+7. [Validation และ error](/web-api/validation-and-errors/) ตรวจ input และแปลง error เป็น HTTP status
+8. [ฐานข้อมูล](/web-api/database/) PostgreSQL, pgx และ sqlc
+9. [Migration](/web-api/migrations/) จัดการ schema ด้วย goose
+10. [Authentication](/web-api/authentication/) bcrypt, JWT และ rate limit
+11. [Pagination](/web-api/pagination/) cursor (keyset) pagination
+12. [Graceful shutdown](/web-api/graceful-shutdown/) timeout ของ server และการปิดอย่างนุ่มนวล
+13. [Testing](/web-api/testing/) unit test และ integration test
+14. [OpenAPI](/web-api/openapi/) เขียนเอกสาร API
+15. [Docker และ deploy](/web-api/docker-deploy/) multi-stage build
+16. [Production checklist](/web-api/production-checklist/) เช็กลิสต์ก่อนขึ้นระบบจริง
+
+## สรุป
+
+- เราจะสร้าง tasks-api: REST API ที่มี auth, CRUD ของ task และ pagination โดยใช้ `net/http` ของ standard library
+- โค้ดแบ่งเป็น handler → service → repository → PostgreSQL โดยชั้นบนพึ่ง interface ของชั้นล่าง
+- เครื่องมือหลักคือ pgx, sqlc, goose, golang-jwt และ slog เลือกเพราะเรียบง่ายและเป็นมาตรฐานของชุมชน
+- รันทั้งระบบได้ด้วย `docker compose up --build` และเปลี่ยน port ได้ด้วย `DB_HOST_PORT` / `API_HOST_PORT`

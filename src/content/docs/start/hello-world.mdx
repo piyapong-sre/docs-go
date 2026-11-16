@@ -1,0 +1,175 @@
+---
+title: Hello World
+description: เขียนโปรแกรม Go แรก ทำความเข้าใจ package main, import, func main และคำสั่ง go run กับ go build
+sidebar:
+  order: 3
+---
+
+import { Aside, Code, FileTree, Steps } from '@astrojs/starlight/components';
+import helloSrc from '../../../../examples/learn/start/hello/main.go?raw';
+
+ธรรมเนียมของการเรียนภาษาใหม่คือเริ่มจากโปรแกรมที่พิมพ์ข้อความทักทาย ในบทนี้เราจะสร้างโปรเจกต์ Go ตั้งแต่ศูนย์ เขียนโปรแกรมแรก แล้วรันมันด้วย 2 วิธี
+
+## สร้างโปรเจกต์
+
+<Steps>
+
+1. สร้างโฟลเดอร์ใหม่แล้วเข้าไปข้างใน
+
+   ```bash
+   mkdir hello
+   cd hello
+   ```
+
+2. สร้าง module ด้วย `go mod init` ตามด้วยชื่อ module (รายละเอียดอยู่ในบท [Modules และ toolchain](/start/modules-and-toolchain/))
+
+   ```bash
+   go mod init example.com/hello
+   ```
+
+   ```text title="Output"
+   go: creating new go.mod: module example.com/hello
+   ```
+
+3. สร้างไฟล์ `main.go` ในโฟลเดอร์เดียวกัน
+
+</Steps>
+
+โครงสร้างโปรเจกต์จะเป็นแบบนี้
+
+<FileTree>
+- hello/
+  - go.mod
+  - main.go
+</FileTree>
+
+## เขียนโปรแกรม
+
+ใส่ code นี้ลงใน `main.go`
+
+<Code code={helloSrc} lang="go" title="main.go" />
+
+## อธิบายทีละส่วน
+
+### `package main`
+
+ทุกไฟล์ `.go` **ต้อง** ขึ้นต้นด้วยการประกาศ package ไฟล์ที่อยู่ในโฟลเดอร์เดียวกันต้องอยู่ใน package เดียวกัน
+
+`main` เป็นชื่อพิเศษ: บอก compiler ว่า package นี้คือ **โปรแกรมที่รันได้** (executable) ไม่ใช่ library ถ้าตั้งชื่ออื่น เช่น `package utils` จะ build เป็นโปรแกรมไม่ได้ แต่ให้ package อื่น import ไปใช้ได้
+
+### `import`
+
+ดึง package อื่นเข้ามาใช้ ในตัวอย่างนี้ใช้ 2 package จาก **standard library**:
+
+- `fmt` — format และพิมพ์ข้อความ (`Println`, `Printf`, `Sprintf` ...)
+- `os` — ติดต่อกับระบบปฏิบัติการ เช่น `os.Args` ที่เก็บ argument จาก command line
+
+ถ้า import หลาย package นิยมเขียนแบบกลุ่มในวงเล็บ `import ( ... )`
+
+### `func main()`
+
+function ชื่อ `main` ใน `package main` คือ **จุดเริ่มต้นของโปรแกรม** ไม่รับ parameter และไม่คืนค่า เมื่อ `main` จบ โปรแกรมก็จบ
+
+### ภายใน `main`
+
+- `fmt.Println(...)` พิมพ์ข้อความแล้วขึ้นบรรทัดใหม่ — สังเกตว่าเรียกผ่านชื่อ package เสมอ (`fmt.`)
+- `name := "Gopher"` ประกาศตัวแปรแบบสั้น (`:=`) ให้ Go อนุมาน type เป็น `string` เอง (เรียนละเอียดในบท [ตัวแปรและชนิดข้อมูล](/basics/variables-and-types/))
+- `os.Args` เป็น slice ของ string โดย `os.Args[0]` คือชื่อโปรแกรม ส่วน argument ที่ผู้ใช้ส่งมาเริ่มที่ `os.Args[1]`
+- `fmt.Printf` พิมพ์แบบกำหนดรูปแบบ `%s` คือที่วางของ string และต้องใส่ `\n` เองถ้าต้องการขึ้นบรรทัดใหม่
+
+<Aside type="tip" title="ชื่อที่ขึ้นต้นด้วยตัวพิมพ์ใหญ่ = exported">
+สังเกตว่า `Println` และ `Args` ขึ้นต้นด้วยตัวพิมพ์ใหญ่ ใน Go ชื่อที่ขึ้นต้นด้วยตัวพิมพ์ใหญ่จะถูก **export** (package อื่นเรียกใช้ได้) ส่วนตัวพิมพ์เล็กใช้ได้เฉพาะภายใน package นั้น ไม่มี keyword `public`/`private`
+</Aside>
+
+## รันด้วย `go run`
+
+`go run` จะ compile แล้วรันทันที เหมาะกับตอนพัฒนา (ไฟล์ binary ถูกสร้างในโฟลเดอร์ชั่วคราวแล้วลบทิ้ง)
+
+```bash
+go run .
+```
+
+```text title="Output"
+สวัสดี Go!
+ยินดีต้อนรับ Gopher
+```
+
+`.` หมายถึง "package ในโฟลเดอร์ปัจจุบัน" ส่ง argument ให้โปรแกรมได้โดยต่อท้าย
+
+```bash
+go run . สมชาย
+```
+
+```text title="Output"
+สวัสดี Go!
+ยินดีต้อนรับ สมชาย
+```
+
+## Build ด้วย `go build`
+
+`go build` จะ compile แล้วได้ไฟล์ executable เก็บไว้ ชื่อไฟล์ค่าเริ่มต้นมาจากส่วนสุดท้ายของชื่อ module (ในที่นี้คือ `hello` และบน Windows จะเป็น `hello.exe`)
+
+```bash
+go build
+./hello สมหญิง     # Windows: .\hello.exe สมหญิง
+```
+
+```text title="Output"
+สวัสดี Go!
+ยินดีต้อนรับ สมหญิง
+```
+
+กำหนดชื่อไฟล์ output เองได้ด้วย `-o`
+
+```bash
+go build -o bin/greeter .
+```
+
+ไฟล์ที่ได้เป็น **native binary ที่รันได้ทันที** เอาไป copy ไปเครื่องอื่นที่ OS และ CPU เดียวกันได้โดยไม่ต้องติดตั้ง Go
+
+### Cross-compile
+
+อยาก build ให้ OS อื่น? แค่ตั้ง `GOOS` และ `GOARCH`
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o hello-linux .
+GOOS=windows GOARCH=amd64 go build -o hello.exe .
+```
+
+(บน PowerShell ให้ตั้งตัวแปรด้วย `$env:GOOS="linux"` ก่อน แล้วค่อยรัน `go build`)
+
+| คำสั่ง | ทำอะไร | ใช้เมื่อ |
+| --- | --- | --- |
+| `go run .` | compile ไปที่ temp แล้วรันทันที | ระหว่างพัฒนา ลองโปรแกรมเร็ว ๆ |
+| `go build` | compile แล้วเก็บไฟล์ executable | ต้องการไฟล์ไปใช้งานหรือ deploy |
+
+<Aside type="caution" title="Error ที่มือใหม่เจอบ่อย">
+Go เข้มงวดกว่าหลายภาษา สิ่งต่อไปนี้ทำให้ **compile ไม่ผ่าน**:
+
+- **import แล้วไม่ใช้** → `"os" imported and not used`
+- **ประกาศตัวแปร local แล้วไม่ใช้** → `declared and not used: x`
+- **วาง `{` ไว้บรรทัดใหม่** — Go ใส่ `;` ให้อัตโนมัติท้ายบรรทัด การเขียน `func main()` แล้วขึ้นบรรทัดใหม่ก่อน `{` จึงเป็น syntax error ต้องวาง `{` ไว้บรรทัดเดียวกันเสมอ
+- **รัน `go run .` นอกโฟลเดอร์ที่มี `go.mod`** → error ประมาณ `go.mod file not found`
+
+ข้อดีคือ editor ที่ติดตั้ง gopls จะเตือนและแก้ import ให้อัตโนมัติ
+</Aside>
+
+## แบบฝึกหัด
+
+1. แก้โปรแกรมให้รับ argument กี่ตัวก็ได้ แล้วทักทายทุกคน เช่น `go run . ก ข ค` พิมพ์ "ยินดีต้อนรับ ก", "ยินดีต้อนรับ ข", "ยินดีต้อนรับ ค" (ใช้ `for _, n := range os.Args[1:]`)
+2. ลองลบบรรทัดที่ใช้ `os.Args` ออกทั้งหมด (แต่ยังเก็บ `"os"` ไว้ใน import) แล้วรัน อ่าน error ที่ได้
+3. ใช้ `go build` สร้างไฟล์สำหรับ OS อื่นที่ไม่ใช่ OS ของคุณ แล้วดูขนาดไฟล์ที่ได้
+
+<details>
+<summary>เฉลยข้อ 1</summary>
+
+```go
+func main() {
+	fmt.Println("สวัสดี Go!")
+	for _, n := range os.Args[1:] {
+		fmt.Printf("ยินดีต้อนรับ %s\n", n)
+	}
+}
+```
+
+</details>

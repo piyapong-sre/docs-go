@@ -1,0 +1,242 @@
+---
+title: Configuration
+description: อ่านค่าตั้งค่าจาก environment variable แบบ 12-factor พร้อมค่าเริ่มต้น การตรวจสอบ และรายงาน error ทุกตัวในครั้งเดียว
+sidebar:
+  order: 5
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import configSrc from '../../../../examples/tasks-api/internal/config/config.go?raw';
+
+API ตัวเดียวกันต้องรันได้หลายที่: เครื่อง developer, CI, staging และ production แต่ละที่ใช้ฐานข้อมูลคนละตัว secret คนละค่า เราจึงต้องแยก **ค่าตั้งค่า (config)** ออกจากโค้ด
+
+## แนวคิด 12-factor: เก็บ config ใน environment
+
+แนวทาง [The Twelve-Factor App](https://12factor.net/config) แนะนำให้เก็บ config ไว้ใน **environment variable** เพราะ
+
+- **เปลี่ยนได้โดยไม่ต้อง build ใหม่** image เดียวกันใช้ได้ทุก environment
+- **ทุกแพลตฟอร์มรองรับ** Docker, Kubernetes, systemd, Cloud Run, CI ต่างก็ตั้ง env ได้
+- **ไม่หลุดเข้า git** ต่างจากไฟล์ config ที่มักเผลอ commit ไปพร้อม secret
+
+tasks-api อ่าน config ทั้งหมด **ครั้งเดียวตอนเริ่มโปรแกรม** ใน `config.Load()` แล้วส่ง struct `Config` ต่อไปให้ส่วนอื่น ไม่มีโค้ดส่วนไหนเรียก `os.Getenv` เองระหว่างทำงาน
+
+## internal/config/config.go
+
+<Code code={configSrc} lang="go" title="internal/config/config.go" />
+
+### struct Config: config ที่มี type
+
+```go title="internal/config/config.go"
+type Config struct {
+	Env             string // "development" or "production"
+	Addr            string // listen address, e.g. ":8080"
+	DatabaseURL     string // postgres://user:pass@host:5432/db?sslmode=disable
+	AutoMigrate     bool   // apply migrations on startup
+	JWTSecret       string // >= 32 bytes, keep it secret
+	// ...
+	JWTTTL          time.Duration // access token lifetime
+	CORSOrigins     []string
+	LogLevel        slog.Level
+	// ...
+}
+```
+
+env มีแต่ string แต่ `Config` เก็บเป็น type ที่ถูกต้อง: `time.Duration`, `bool`, `[]string`, `slog.Level` การแปลงทั้งหมดเกิดที่ `Load` ที่เดียว ส่วนอื่นของโปรแกรมใช้ `cfg.JWTTTL` ได้ทันทีโดยไม่ต้อง parse ซ้ำหรือกลัวค่าผิดรูปแบบ
+
+### helper แบบ closure ที่เก็บ error ไว้
+
+```go title="internal/config/config.go"
+	var errs []error
+	env := func(key, def string) string {
+		if v, ok := os.LookupEnv(key); ok && v != "" {
+			return v
+		}
+		return def
+	}
+	duration := func(key, def string) time.Duration {
+		d, err := time.ParseDuration(env(key, def))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", key, err))
+		}
+		return d
+	}
+```
+
+- `env` คืนค่าเริ่มต้นเมื่อ **ไม่ได้ตั้ง หรือ ตั้งเป็นค่าว่าง** (`JWT_TTL=` ถือว่าใช้ default)
+- `duration`, `integer`, `boolean` แปลงชนิดด้วย `time.ParseDuration`, `strconv.Atoi`, `strconv.ParseBool` และ **ไม่ return ทันทีเมื่อเจอ error** แต่เก็บลง `errs` แล้วทำต่อ
+- เพราะเป็น closure จึงเข้าถึงตัวแปร `errs` ของ `Load` ได้โดยตรง ทำให้โค้ดที่สร้าง `Config` อ่านเป็นบรรทัดเดียวต่อค่า
+
+```go title="internal/config/config.go"
+	cfg := Config{
+		Env:             env("APP_ENV", "development"),
+		Addr:            env("HTTP_ADDR", ":8080"),
+		DatabaseURL:     env("DATABASE_URL", ""),
+		AutoMigrate:     boolean("DB_AUTO_MIGRATE", "true"),
+		// ...
+	}
+```
+
+### ค่าเริ่มต้นที่ปลอดภัย และค่าที่ต้องตั้งเสมอ
+
+ค่าส่วนใหญ่มี default ที่เหมาะกับการพัฒนา เช่น `HTTP_ADDR=:8080` หรือ `REQUEST_TIMEOUT=10s` แต่มีสองค่าที่ **ไม่มี default** โดยตั้งใจ
+
+- `DATABASE_URL` ไม่มีทางเดาได้ว่าฐานข้อมูลอยู่ที่ไหน
+- `JWT_SECRET` ถ้ามี default ที่ฝังในโค้ด ใครอ่าน source ได้ก็ปลอม token ได้ทันที
+
+```go title="internal/config/config.go"
+	if cfg.DatabaseURL == "" {
+		errs = append(errs, errors.New("DATABASE_URL is required"))
+	}
+	if len(cfg.JWTSecret) < 32 {
+		errs = append(errs, errors.New("JWT_SECRET is required and must be at least 32 bytes"))
+	}
+```
+
+`JWT_SECRET` ต้องยาวอย่างน้อย 32 bytes เพราะ HS256 ใช้ HMAC-SHA256 ซึ่ง secret ที่สั้นเกินไปถูกเดา (brute force) ได้ การตรวจตั้งแต่ตอนเริ่มทำให้ไม่มีทางเผลอ deploy ด้วย secret อย่าง `secret` หรือ `123456`
+
+### errors.Join: รายงานทุกปัญหาในครั้งเดียว
+
+บรรทัดสุดท้ายของ `Load`
+
+```go title="internal/config/config.go"
+	return cfg, errors.Join(errs...)
+```
+
+`errors.Join` (Go 1.20) รวม error หลายตัวเป็นตัวเดียว ถ้า `errs` ว่างจะคืน `nil` ข้อความของ error ที่รวมแล้วคือข้อความของแต่ละตัวคั่นด้วยขึ้นบรรทัดใหม่ ลองรันโดยไม่ตั้ง env อะไรเลย
+
+```bash
+$ env -i HOME=$HOME PATH=$PATH go run ./cmd/api   # ล้าง env ทั้งหมด
+error: load config: DATABASE_URL is required
+JWT_SECRET is required and must be at least 32 bytes
+exit status 1
+```
+
+หรือตั้งค่าผิดหลายตัวพร้อมกัน
+
+```bash
+$ DATABASE_URL=postgres://x JWT_SECRET=short JWT_TTL=15 LOG_LEVEL=verbose go run ./cmd/api
+error: load config: JWT_TTL: time: missing unit in duration "15"
+LOG_LEVEL: slog: level string "verbose": unknown name
+JWT_SECRET is required and must be at least 32 bytes
+exit status 1
+```
+
+ถ้าเรา return ที่ error แรก ผู้ใช้ต้องแก้แล้วรันใหม่ทีละตัว การรวบรวมแล้วแจ้งทีเดียวช่วยประหยัดเวลามาก โดยเฉพาะตอน deploy ครั้งแรก (ทบทวน `errors.Join` ได้ที่ [Error handling](/intermediate/errors/))
+
+<Aside type="tip" title="Fail fast">
+ตรวจ config ให้ครบตั้งแต่ตอนเริ่ม ถ้าผิดให้ออกจากโปรแกรมทันทีด้วย exit code ที่ไม่ใช่ 0 ดีกว่าปล่อยให้ server เปิดขึ้นมาแล้วไปพังตอนมี request แรก เพราะ orchestrator อย่าง Kubernetes จะเห็นว่า deploy ล้มเหลวทันที และไม่ส่ง traffic ไปหา instance ที่ตั้งค่าผิด
+</Aside>
+
+### LOG_LEVEL ด้วย slog.Level.UnmarshalText
+
+```go title="internal/config/config.go"
+	if err := cfg.LogLevel.UnmarshalText([]byte(env("LOG_LEVEL", "info"))); err != nil {
+		errs = append(errs, fmt.Errorf("LOG_LEVEL: %w", err))
+	}
+```
+
+`slog.Level` มี method `UnmarshalText` ในตัว เราจึงไม่ต้องเขียน `switch` แปลง string เอง มันรับ `debug`, `info`, `warn`, `error` แบบไม่สนตัวพิมพ์เล็กใหญ่ และรับรูปแบบมี offset อย่าง `info+2` ได้ด้วย ค่า level นี้ถูกส่งต่อให้ `slog.HandlerOptions` ใน `main.go`
+
+```go title="cmd/api/main.go"
+func newLogger(cfg config.Config) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
+	var h slog.Handler = slog.NewJSONHandler(os.Stdout, opts)
+	if cfg.LogFormat == "text" {
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	return slog.New(h)
+}
+```
+
+`LOG_FORMAT=text` อ่านง่ายตอนพัฒนา ส่วน `json` (ค่าเริ่มต้น) เหมาะกับ production ที่ส่ง log เข้าระบบรวม log รายละเอียดเรื่อง slog ดูที่ [Structured Logging ด้วย slog](/advanced/logging-slog/)
+
+### CORS_ALLOWED_ORIGINS: ค่าหลายตัวใน env เดียว
+
+```go title="internal/config/config.go"
+	for o := range strings.SplitSeq(env("CORS_ALLOWED_ORIGINS", ""), ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			cfg.CORSOrigins = append(cfg.CORSOrigins, o)
+		}
+	}
+```
+
+ใช้ comma คั่นหลายค่า เช่น `CORS_ALLOWED_ORIGINS=https://app.example.com, https://admin.example.com` โดย `strings.SplitSeq` (Go 1.24) คืน iterator แทน slice และเรา trim ช่องว่าง/ข้ามค่าว่างเพื่อให้ทนต่อการพิมพ์ผิดเล็กน้อย
+
+## ตัวแปรทั้งหมด
+
+| ตัวแปร | ค่าเริ่มต้น | ความหมาย |
+| --- | --- | --- |
+| `APP_ENV` | `development` | ชื่อ environment (ใช้แสดงใน log) |
+| `HTTP_ADDR` | `:8080` | address ที่ server listen |
+| `DATABASE_URL` | (ต้องตั้ง) | connection string ของ PostgreSQL |
+| `DB_AUTO_MIGRATE` | `true` | รัน migration ตอนเริ่มโปรแกรม |
+| `JWT_SECRET` | (ต้องตั้ง, 32 bytes ขึ้นไป) | secret สำหรับเซ็น JWT |
+| `JWT_ISSUER` | `tasks-api` | ค่า `iss` ใน token |
+| `JWT_TTL` | `15m` | อายุของ access token |
+| `CORS_ALLOWED_ORIGINS` | (ว่าง = ไม่อนุญาต origin ใด) | origin ที่เรียก API จาก browser ได้ คั่นด้วย comma |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `LOG_FORMAT` | `json` | `json` หรือ `text` |
+| `REQUEST_TIMEOUT` | `10s` | deadline ของแต่ละ request |
+| `SHUTDOWN_TIMEOUT` | `15s` | เวลารอ request ที่ค้างอยู่ตอนปิด server |
+| `AUTH_RATE_LIMIT` | `10` | จำนวนครั้งต่อนาทีต่อ IP สำหรับ register/login |
+
+## .env.example และการจัดการ secret
+
+```bash title=".env.example"
+# Copy to .env and adjust. Never commit a real .env file.
+APP_ENV=development
+HTTP_ADDR=:8080
+DATABASE_URL=postgres://tasks:tasks@localhost:5433/tasks?sslmode=disable
+DB_AUTO_MIGRATE=true
+
+# Generate a real secret with: openssl rand -base64 48
+JWT_SECRET=dev-only-secret-change-me-0123456789abcdef
+JWT_ISSUER=tasks-api
+JWT_TTL=15m
+
+CORS_ALLOWED_ORIGINS=http://localhost:3000
+LOG_LEVEL=info
+LOG_FORMAT=json
+REQUEST_TIMEOUT=10s
+SHUTDOWN_TIMEOUT=15s
+AUTH_RATE_LIMIT=10
+```
+
+`.env.example` เป็นไฟล์ตัวอย่างที่ **commit ได้** เพราะมีแต่ค่าสำหรับ development ส่วนไฟล์ `.env` จริงถูกใส่ไว้ใน `.gitignore` แล้ว ขั้นตอนใช้งานคือ
+
+```bash
+cp .env.example .env   # แล้วแก้ค่าตามเครื่องตัวเอง
+make run
+```
+
+`Makefile` โหลด `.env` ให้อัตโนมัติ (ถ้ามี) และ export ทุกตัวแปรให้คำสั่งที่รัน
+
+```makefile title="Makefile"
+# Load .env if it exists (copy from .env.example).
+-include .env
+export
+```
+
+ส่วน `compose.yaml` ใช้ `.env.example` เป็นค่าตั้งต้นของ container แล้ว override เฉพาะ `DATABASE_URL` ให้ชี้ไปที่ service `db` ภายใน network ของ compose
+
+```yaml title="compose.yaml"
+  api:
+    build: .
+    env_file: .env.example
+    environment:
+      DATABASE_URL: postgres://tasks:tasks@db:5432/tasks?sslmode=disable
+```
+
+<Aside type="caution" title="ห้าม commit secret">
+- ห้าม commit ไฟล์ `.env` หรือ secret จริงเข้า git เด็ดขาด แม้จะเป็น repo ส่วนตัว (ประวัติ git ลบยาก และ repo อาจถูกเปิดสาธารณะในภายหลัง)
+- ค่าใน `.env.example` เป็นของ development เท่านั้น production ต้องสร้าง secret ใหม่ เช่น `openssl rand -base64 48` แล้วเก็บใน secret manager ของแพลตฟอร์ม (Kubernetes Secret, AWS Secrets Manager, ฯลฯ)
+- อย่า log struct `Config` ทั้งก้อน เพราะมี `JWTSecret` และรหัสผ่านใน `DatabaseURL` อยู่ด้วย `main.go` จึง log เฉพาะ `addr`, `env` และ `version`
+</Aside>
+
+## สรุป
+
+- เก็บ config ใน environment variable อ่านครั้งเดียวตอนเริ่มโปรแกรมเป็น struct ที่มี type ถูกต้อง
+- ค่าทั่วไปมี default ที่ปลอดภัย ส่วน `DATABASE_URL` และ `JWT_SECRET` ต้องตั้งเสมอ และ secret ต้องยาว 32 bytes ขึ้นไป
+- รวบรวม error ทุกตัวแล้วคืนด้วย `errors.Join` ให้ผู้ใช้เห็นปัญหาทั้งหมดในครั้งเดียว และ fail fast ตั้งแต่ตอนเริ่ม
+- ใช้ `slog.Level.UnmarshalText` แปลง `LOG_LEVEL` แทนการเขียน switch เอง
+- commit แค่ `.env.example` ไม่เคย commit `.env` หรือ secret จริง

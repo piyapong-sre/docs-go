@@ -1,0 +1,271 @@
+---
+title: Database Migrations
+description: จัดการ schema ของ PostgreSQL ด้วย goose แบบมี version ฝัง migration ไว้ใน binary และเปลี่ยน schema อย่างปลอดภัยบน production
+sidebar:
+  order: 9
+---
+
+import { Code, Aside, FileTree, Steps } from '@astrojs/starlight/components';
+import usersMigration from '../../../../examples/tasks-api/internal/postgres/migrations/00001_create_users.sql?raw';
+import tasksMigration from '../../../../examples/tasks-api/internal/postgres/migrations/00002_create_tasks.sql?raw';
+
+## ทำไมต้องมี migration
+
+ตอนเริ่มโปรเจกต์ เราอาจสร้างตารางด้วยการเปิด `psql` แล้วพิมพ์ `CREATE TABLE` เอง แต่พอมีหลายคนหรือหลาย environment ก็จะเจอปัญหาทันที
+
+- เครื่อง dev ของแต่ละคน, staging และ production มี schema ไม่ตรงกัน
+- ไม่มีใครรู้ว่าฐานข้อมูลตอนนี้ "อยู่ที่ version ไหน"
+- เพิ่ม column ใหม่แล้วไม่มีบันทึกว่าใครเพิ่ม เพิ่มเมื่อไร และเพิ่มเพราะอะไร
+
+**Migration** คือไฟล์ SQL ที่มีลำดับ version ชัดเจน แต่ละไฟล์อธิบาย "การเปลี่ยนแปลงหนึ่งก้าว" ของ schema และถูกเก็บใน Git ร่วมกับโค้ด เครื่องมือ migration จะบันทึกในตารางพิเศษว่า apply ไฟล์ไหนไปแล้ว รอบถัดไปจะรันเฉพาะไฟล์ที่ยังไม่เคยรัน
+
+tasks-api ใช้ [goose](https://github.com/pressly/goose) เพราะเขียน migration เป็น SQL ล้วน ใช้เป็น library ใน Go ได้ (ฝังไว้ใน binary) และมี CLI ให้ใช้ตอน dev
+
+## ไฟล์อยู่ตรงไหน
+
+<FileTree>
+- internal/postgres/
+  - migrations/
+    - 00001_create_users.sql
+    - 00002_create_tasks.sql
+  - queries/ query สำหรับ sqlc
+  - postgres.go Open และ Migrate
+</FileTree>
+
+ชื่อไฟล์ขึ้นต้นด้วย **version** (`00001`, `00002`) ตามด้วยคำอธิบาย goose เรียงลำดับตาม version นี้ ส่วน `sqlc.yaml` ก็ชี้ `schema: internal/postgres/migrations` ทำให้ sqlc อ่าน schema จากไฟล์ชุดเดียวกัน (ดูเรื่อง sqlc ได้ที่ [เชื่อมต่อฐานข้อมูล](/web-api/database/))
+
+## รูปแบบไฟล์ของ goose
+
+<Code code={usersMigration} lang="sql" title="internal/postgres/migrations/00001_create_users.sql" />
+
+<Code code={tasksMigration} lang="sql" title="internal/postgres/migrations/00002_create_tasks.sql" />
+
+- `-- +goose Up` คือ SQL ที่รันตอน migrate ขึ้น
+- `-- +goose Down` คือ SQL สำหรับย้อนกลับ (rollback) ต้องเป็นสิ่งที่ "หักล้าง" Up ได้พอดี
+- สำหรับ PostgreSQL goose รันแต่ละไฟล์ใน **transaction** ให้อัตโนมัติ ถ้าคำสั่งไหนพัง ทั้งไฟล์จะถูก rollback ไม่เหลือ schema ครึ่ง ๆ กลาง ๆ
+- ถ้ามี statement ที่มี `;` อยู่ข้างใน เช่น `CREATE FUNCTION ... $$ ... $$` ให้ครอบด้วย `-- +goose StatementBegin` และ `-- +goose StatementEnd`
+- คำสั่งที่รันใน transaction ไม่ได้ เช่น `CREATE INDEX CONCURRENTLY` ให้ใส่ `-- +goose NO TRANSACTION` ไว้บนสุดของไฟล์
+
+### `uuidv7()` ของ PostgreSQL 18
+
+primary key ทั้งสองตารางใช้ `DEFAULT uuidv7()` ซึ่งเป็นฟังก์ชันที่มีมาในตัวตั้งแต่ **PostgreSQL 18**
+
+| | UUID v4 (`gen_random_uuid()`) | UUID v7 (`uuidv7()`) |
+| --- | --- | --- |
+| ที่มาของค่า | สุ่มล้วน | 48 bit แรกคือเวลา (millisecond) ตามด้วยค่าสุ่ม |
+| ลำดับ | ไม่มี | เรียงตามเวลาที่สร้างโดยประมาณ |
+| ผลต่อ B-tree index | insert กระจายทั่ว index, page split บ่อย | insert ต่อท้าย index เหมือน auto-increment |
+| เดา id คนอื่นได้ไหม | ไม่ได้ | ไม่ได้ (ยังมีส่วนสุ่มอีกหลายสิบ bit) แต่ถอดเวลาที่สร้างออกมาได้ |
+
+เราได้ id ที่เดายาก (ต่างจาก `bigserial` ที่ไล่เลขได้) และยังเป็นมิตรกับ index ด้วย
+
+<Aside type="caution">
+`uuidv7()` ไม่มีใน PostgreSQL 17 หรือเก่ากว่า ถ้าต้องใช้ version เก่า ให้เปลี่ยนเป็น `gen_random_uuid()` (มีในตัวตั้งแต่ PostgreSQL 13) หรือสร้าง UUID v7 จากฝั่ง Go แทน
+</Aside>
+
+### Index สำหรับ query จริง
+
+```sql
+CREATE INDEX tasks_user_created_idx ON tasks (user_id, created_at DESC, id DESC);
+```
+
+index นี้ออกแบบมาเพื่อ query เดียวที่ใช้บ่อยที่สุด คือ "task ของฉัน เรียงใหม่สุดก่อน" แบบ cursor pagination อธิบายละเอียดในหน้า [Pagination](/web-api/pagination/)
+
+## ฝัง migration ไว้ใน binary
+
+```go title="internal/postgres/postgres.go"
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+// ...
+
+// Migrate applies all pending migrations embedded in the binary.
+func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	db := stdlib.OpenDBFromPool(pool)
+	defer db.Close()
+
+	// A PostgreSQL advisory lock makes concurrent Migrate calls (several
+	// replicas starting at once) wait for each other instead of racing.
+	locker, err := lock.NewPostgresSessionLocker()
+	if err != nil {
+		return fmt.Errorf("create migration lock: %w", err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, mustSub(migrationsFS, "migrations"),
+		goose.WithSessionLocker(locker),
+	)
+	if err != nil {
+		return fmt.Errorf("create migration provider: %w", err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		return fmt.Errorf("apply migrations: %w", err)
+	}
+	return nil
+}
+```
+
+```go title="internal/postgres/repos.go"
+func mustSub(fsys fs.FS, dir string) fs.FS {
+	sub, err := fs.Sub(fsys, dir)
+	if err != nil {
+		panic(err) // only possible with an invalid, hard-coded dir name
+	}
+	return sub
+}
+```
+
+อธิบายทีละส่วน
+
+1. `//go:embed migrations/*.sql` ให้ compiler อ่านไฟล์ SQL ทั้งหมดตอน build แล้วฝังลงใน binary deploy แค่ไฟล์เดียวก็มี migration ครบ ไม่ต้อง copy โฟลเดอร์ตามไป (ทบทวนได้ที่ [embed](/advanced/embed/))
+2. ไฟล์ใน `embed.FS` ยังมี prefix `migrations/` อยู่ `fs.Sub` ตัด prefix ออกให้ goose เห็นไฟล์อยู่ที่ root
+3. goose ทำงานผ่าน `database/sql` แต่แอปเราใช้ `pgxpool` จึงใช้ `stdlib.OpenDBFromPool(pool)` แปลง pool เดิมเป็น `*sql.DB` ไม่ต้องเปิด connection ชุดใหม่
+4. `lock.NewPostgresSessionLocker()` + `goose.WithSessionLocker` ใช้ advisory lock ของ PostgreSQL ถ้าหลาย replica start พร้อมกัน ตัวแรกได้ lock และ migrate ตัวอื่นรอจนเสร็จ ไม่ชนกัน
+5. `goose.NewProvider` เป็น API แบบใหม่ของ goose v3 ที่ไม่มี global state (ต่างจาก `goose.Up` แบบเก่า) ทดสอบง่ายและใช้พร้อมกันหลาย database ได้
+6. `provider.Up(ctx)` apply ทุกไฟล์ที่ยังไม่เคยรัน แล้วบันทึก version ลงตาราง `goose_db_version`
+
+## รัน migration ตอน start: `DB_AUTO_MIGRATE`
+
+```go title="cmd/api/main.go"
+	if cfg.AutoMigrate {
+		if err := postgres.Migrate(ctx, pool); err != nil {
+			return err
+		}
+		logger.Info("database migrated")
+	}
+```
+
+ค่า default ของ `DB_AUTO_MIGRATE` คือ `true` สะดวกมากตอน dev แค่ `make run` หรือ `docker compose up` ก็ได้ schema ล่าสุดทันที
+
+| สถานการณ์ | auto-migrate ตอน start | แยกเป็น step ต่างหาก |
+| --- | --- | --- |
+| dev บนเครื่อง | เหมาะ | ยุ่งเกินไป |
+| production instance เดียว | ใช้ได้ | ดีกว่าเล็กน้อย |
+| production หลาย replica | เสี่ยง | แนะนำ |
+
+ทำไมหลาย replica ถึงเสี่ยง
+
+- ทุก replica start พร้อมกันและพยายาม migrate พร้อมกัน tasks-api ใช้ advisory lock กันการชนไว้แล้ว แต่ replica ที่เหลือต้องรอ ทำให้ start ช้าลงทั้งชุด
+- migration ที่ใช้เวลานาน (เช่น backfill ข้อมูลหลายล้านแถว) ทำให้ app start ช้าจน health check ของ orchestrator ตัดสินว่าพัง แล้ว restart วนไปเรื่อย ๆ
+- ถ้า migration พัง app ทุกตัวจะ start ไม่ได้ แทนที่จะพังแค่ขั้นตอน deploy
+
+ทางที่แนะนำบน production คือตั้ง `DB_AUTO_MIGRATE=false` แล้วรัน migration เป็น **ขั้นตอนแยก** ก่อนปล่อย version ใหม่ เช่น step ใน CI/CD pipeline, Kubernetes `Job` หรือ pre-deploy command ของ platform ด้วย goose CLI
+
+```bash
+go run github.com/pressly/goose/v3/cmd/goose@latest \
+  -dir internal/postgres/migrations \
+  postgres "$DATABASE_URL" up
+```
+
+<Aside type="tip">
+เพราะ `Migrate` ใช้ `goose.WithSessionLocker` อยู่แล้ว การเปิด `DB_AUTO_MIGRATE=true` บนหลาย replica จึงไม่ทำให้ migration รันซ้อนกัน แต่ปัญหาเรื่อง migration นานเกินไปจนโดน health check ยังอยู่เหมือนเดิม จึงยังแนะนำให้แยกเป็นขั้นตอน deploy
+</Aside>
+
+## สร้าง migration ใหม่
+
+สมมติอยากเพิ่ม field `priority` ให้ task
+
+```bash
+go run github.com/pressly/goose/v3/cmd/goose@latest \
+  -dir internal/postgres/migrations -s create add_priority sql
+```
+
+```text title="Output"
+Created new file: internal/postgres/migrations/00003_add_priority.sql
+```
+
+flag `-s` สั่งให้ใช้เลข version แบบเรียงลำดับ (`00003`) ให้เข้ากับไฟล์เดิม ถ้าไม่ใส่ goose จะตั้งชื่อด้วย timestamp เช่น `20261116043500_add_priority.sql` ซึ่งก็ใช้ได้ แต่ทั้งโปรเจกต์ควรเลือกแบบเดียว
+
+goose สร้างไฟล์ template ให้ เราแก้เป็น SQL จริง (ไฟล์นี้เป็นตัวอย่าง ยังไม่มีใน tasks-api)
+
+```sql title="internal/postgres/migrations/00003_add_priority.sql"
+-- +goose Up
+ALTER TABLE tasks
+    ADD COLUMN priority smallint NOT NULL DEFAULT 0
+    CHECK (priority BETWEEN 0 AND 3);
+
+-- +goose Down
+ALTER TABLE tasks DROP COLUMN priority;
+```
+
+จากนั้น
+
+<Steps>
+
+1. แก้ query ใน `internal/postgres/queries/tasks.sql` ให้ใช้ column ใหม่
+2. `make sqlc` เพื่อ generate Go code ใหม่จาก schema และ query
+3. อัปเดต domain model, DTO, validation และ `api/openapi.yaml`
+4. `make run` (auto-migrate) หรือรัน goose CLI แล้วทดสอบ
+
+</Steps>
+
+## กฎเหล็กของ migration
+
+### ห้ามแก้ไฟล์ที่ apply ไปแล้ว
+
+goose จำแค่ว่า version `00002` "รันแล้ว" ไม่ได้เก็บเนื้อหาของไฟล์ ถ้าเราแก้ไฟล์ `00002` หลังจาก production รันไปแล้ว production จะไม่รันซ้ำ เครื่อง dev ที่สร้าง database ใหม่จะได้ schema ที่ต่างจาก production โดยไม่มีใครรู้ตัว
+
+กฎง่าย ๆ คือ **ไฟล์ไหน merge เข้า main แล้ว ถือว่า immutable** อยากเปลี่ยนอะไรให้เขียน migration ใหม่เสมอ
+
+<Aside type="caution">
+ไฟล์ Down มีประโยชน์ตอน dev (ย้อนแล้วรันใหม่) แต่บน production การ rollback ที่ `DROP COLUMN` คือการลบข้อมูลทิ้งจริง ทีมส่วนใหญ่จึงเลือก **roll forward** คือเขียน migration ใหม่เพื่อแก้ แทนการรัน Down
+</Aside>
+
+### เปลี่ยน schema แบบ backward-compatible (expand / contract)
+
+ระหว่าง deploy จะมีช่วงที่ app version เก่าและใหม่รันพร้อมกัน (rolling update) และ migration มักรันก่อน app ใหม่ขึ้น schema ใหม่จึงต้อง **ใช้ได้กับโค้ดทั้งสอง version**
+
+ตัวอย่าง: อยากเปลี่ยนชื่อ column `title` เป็น `name` ถ้าใช้ `RENAME COLUMN` ตรง ๆ app version เก่าที่ยังรันอยู่จะพังทันที ให้แบ่งเป็นหลายรอบ
+
+<Steps>
+
+1. **Expand** เพิ่ม column `name` (nullable) แล้ว deploy โค้ดที่เขียนทั้ง `title` และ `name`
+2. **Migrate data** backfill `UPDATE tasks SET name = title WHERE name IS NULL` (ถ้าข้อมูลเยอะให้ทำเป็น batch)
+3. ใส่ `NOT NULL` แล้ว deploy โค้ดที่อ่านจาก `name` อย่างเดียว
+4. **Contract** เมื่อไม่มีโค้ดไหนใช้ `title` แล้ว ค่อยเขียน migration `DROP COLUMN title`
+
+</Steps>
+
+หลักทั่วไปที่ช่วยได้
+
+- เพิ่ม column ใหม่ให้เป็น nullable หรือมี `DEFAULT` ค่าคงที่ (ตั้งแต่ PostgreSQL 11 การเพิ่ม column ที่มี default คงที่ไม่ต้อง rewrite ทั้งตาราง)
+- สร้าง index บนตารางใหญ่ด้วย `CREATE INDEX CONCURRENTLY` คู่กับ `-- +goose NO TRANSACTION` เพื่อไม่ lock การเขียน
+- อย่ารวม "เปลี่ยน schema" กับ "ลบของเก่า" ไว้ใน release เดียวกัน
+
+## ทดลอง
+
+```bash
+make db-up   # start PostgreSQL 18 (host port 5433)
+make run     # DB_AUTO_MIGRATE=true จาก .env
+```
+
+ใน log จะเห็นบรรทัดนี้ก่อน server เริ่มรับ request
+
+```json
+{"time":"2026-11-16T04:34:42.781921833Z","level":"INFO","msg":"database migrated"}
+```
+
+ดูว่า database อยู่ที่ version ไหน
+
+```bash
+docker compose exec db psql -U tasks -d tasks \
+  -c "SELECT version_id, is_applied FROM goose_db_version ORDER BY id;"
+```
+
+```text title="Output"
+ version_id | is_applied
+------------+------------
+          0 | t
+          1 | t
+          2 | t
+(3 rows)
+```
+
+แถว version `0` คือแถวเริ่มต้นที่ goose สร้างพร้อมตาราง ส่วน `1` และ `2` คือไฟล์ทั้งสองของเรา ถ้ารัน `make run` ซ้ำ goose จะเห็นว่าไม่มีอะไรค้าง และไม่ทำอะไรเพิ่ม
+
+## สรุป
+
+- migration คือการเปลี่ยน schema ทีละก้าวที่มี version และอยู่ใน Git ร่วมกับโค้ด
+- ไฟล์ goose แบ่งเป็น `-- +goose Up` / `-- +goose Down` และรันใน transaction ให้อัตโนมัติ
+- tasks-api ฝัง migration ด้วย `embed.FS` แล้วรันผ่าน `goose.NewProvider` ใน `postgres.Migrate`
+- `DB_AUTO_MIGRATE=true` เหมาะกับ dev และ instance เดียว ถ้ามีหลาย replica ให้รัน migration เป็นขั้นตอนแยก
+- สร้างไฟล์ใหม่ด้วย `goose -dir internal/postgres/migrations -s create ชื่อ sql`
+- ห้ามแก้ไฟล์ที่ apply แล้ว และเปลี่ยน schema แบบ expand / contract ให้โค้ดเก่าและใหม่ทำงานได้พร้อมกัน

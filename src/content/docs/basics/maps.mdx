@@ -1,0 +1,213 @@
+---
+title: Map
+description: สร้างและใช้งาน map, comma-ok idiom, การลบ, ลำดับการวนที่สุ่ม, package maps และกับดัก nil map
+sidebar:
+  order: 6
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import mapsSrc from '../../../../examples/learn/basics/maps/main.go?raw';
+
+`map` คือโครงสร้างแบบ key-value (หรือที่ภาษาอื่นเรียกว่า dictionary, hash map, associative array) ใช้เมื่อต้องการค้นหาข้อมูลจาก key ได้รวดเร็ว — เฉลี่ยแล้วเพิ่ม ค้นหา และลบได้ในเวลาคงที่ไม่ว่า map จะใหญ่แค่ไหน
+
+type ของ map เขียนว่า `map[K]V` เช่น `map[string]int` คือ key เป็น string และ value เป็น int
+
+## ตัวอย่างรวม
+
+<Code code={mapsSrc} lang="go" title="examples/learn/basics/maps/main.go" />
+
+```text title="Output"
+apple: 5 grape: 0
+banana มีใน map, qty = 0
+ไม่มี grape ใน map
+len: 3
+apple  8
+grape  7
+mango  12
+map[apple:8 grape:7 mango:12]
+map[and:1 fast:1 fun:1 go:2 is:2]
+2 [คะน้า]
+backup: map[mango:12] stock: map[apple:8 grape:7 mango:12]
+equal: false
+after clear: map[] 0
+true 0 0
+```
+
+## สร้าง map
+
+```go
+// map literal
+stock := map[string]int{
+	"apple":  5,
+	"banana": 0, // ต้องมี , ปิดท้ายบรรทัดสุดท้ายด้วย
+}
+
+// make
+prices := make(map[string]float64)
+prices["apple"] = 25.5
+
+// make พร้อมบอกขนาดโดยประมาณ (ช่วยลดการขยายภายหลัง)
+big := make(map[int]string, 1000)
+
+// map ว่างแบบ literal
+counts := map[string]int{}
+```
+
+**key ต้องเป็น type ที่เปรียบเทียบด้วย `==` ได้** เช่น ตัวเลข, string, bool, pointer, array หรือ struct ที่ทุก field เปรียบเทียบได้ แต่ **ใช้ slice, map หรือ function เป็น key ไม่ได้** ส่วน value เป็น type อะไรก็ได้
+
+## อ่านค่าและ comma-ok idiom
+
+อ่านค่าด้วย `m[key]` ถ้าไม่มี key นั้นจะได้ **zero value** ของ value type (ไม่ panic, ไม่ error)
+
+```go
+stock["apple"] // 5
+stock["grape"] // 0 — ไม่มี key นี้
+```
+
+ปัญหาคือแยกไม่ออกว่า "ไม่มี key" หรือ "มี key แต่ค่าเป็น 0" จึงต้องใช้ **comma-ok idiom**
+
+```go
+qty, ok := stock["banana"]
+if ok {
+	// มี key "banana" (ค่าอาจเป็น 0 ก็ได้)
+}
+
+// รูปแบบที่นิยม: รวมกับ if init statement
+if _, ok := stock["grape"]; !ok {
+	fmt.Println("ไม่มี grape ใน map")
+}
+```
+
+<Aside type="tip" title="ใช้ zero value ให้เป็นประโยชน์">
+การที่ key ใหม่ได้ zero value ทำให้นับจำนวนได้ในบรรทัดเดียว `counts[w]++` และต่อ slice ได้โดยไม่ต้องเช็คก่อน `groups[k] = append(groups[k], v)` เพราะ `append` กับ nil slice ใช้ได้
+</Aside>
+
+## เพิ่ม แก้ไข ลบ
+
+```go
+stock["grape"] = 7    // เพิ่ม (หรือแทนที่ถ้ามีอยู่แล้ว)
+stock["apple"] += 3   // แก้ไขจากค่าเดิม
+delete(stock, "banana")
+delete(stock, "durian") // ลบ key ที่ไม่มี: ไม่ error
+len(stock)            // จำนวน key
+clear(stock)          // ลบทุก key (Go 1.21+)
+```
+
+## ลำดับการวน map เป็นแบบสุ่ม
+
+```go
+for k, v := range stock {
+	fmt.Println(k, v) // ลำดับไม่แน่นอน และต่างกันได้ในแต่ละครั้งที่รัน
+}
+```
+
+Go **ตั้งใจสุ่มลำดับการวน map** เพื่อไม่ให้ใครเขียน code ที่พึ่งพาลำดับ ถ้าต้องการลำดับที่แน่นอน ให้ดึง key ออกมาเรียงก่อน
+
+```go
+for _, k := range slices.Sorted(maps.Keys(stock)) {
+	fmt.Printf("%-6s %d\n", k, stock[k])
+}
+```
+
+`maps.Keys` คืน **iterator** ของ key (Go 1.23+) และ `slices.Sorted` รับ iterator แล้วคืน slice ที่เรียงแล้ว (รายละเอียดเรื่อง iterator อยู่ในส่วนระดับกลาง)
+
+<Aside type="note">
+`fmt.Println(m)` จะพิมพ์ map โดย **เรียง key ให้** (ตั้งแต่ Go 1.12) เพื่อให้ output ทดสอบได้ แต่นั่นเป็นแค่ตอนพิมพ์ ไม่ได้หมายความว่า map มีลำดับ
+</Aside>
+
+## Package `maps`
+
+| Function | ทำอะไร |
+| --- | --- |
+| `maps.Keys(m)` | iterator ของ key |
+| `maps.Values(m)` | iterator ของ value |
+| `maps.Clone(m)` | สำเนาแบบตื้น (shallow copy) |
+| `maps.Copy(dst, src)` | copy ทุกคู่จาก `src` ไปทับใน `dst` |
+| `maps.Equal(m1, m2)` | เทียบว่ามี key-value ตรงกันทั้งหมดหรือไม่ |
+| `maps.DeleteFunc(m, f)` | ลบคู่ที่ `f(k, v)` คืน `true` |
+
+## Map เป็น reference-like type
+
+ตัวแปร map เก็บแค่ "ตัวชี้" ไปยังโครงสร้างข้อมูลจริง การ assign หรือส่ง map เข้า function **ไม่ได้ copy ข้อมูล**
+
+```go
+a := map[string]int{"x": 1}
+b := a
+b["x"] = 100
+fmt.Println(a["x"]) // 100 — a กับ b คือ map เดียวกัน
+```
+
+ถ้าต้องการสำเนาที่แยกกันจริง ใช้ `maps.Clone`
+
+## กับดัก: nil map
+
+zero value ของ map คือ `nil` ซึ่ง **อ่านได้แต่เขียนไม่ได้**
+
+```go
+var m map[string]int // nil map
+fmt.Println(m["x"])  // 0 — อ่านได้
+fmt.Println(len(m))  // 0
+m["x"] = 1           // panic: assignment to entry in nil map
+```
+
+<Aside type="caution" title="nil map panic">
+พบบ่อยใน struct ที่มี field เป็น map แล้วลืม initialize
+
+```go
+type Cache struct {
+	data map[string]string
+}
+
+var c Cache
+c.data["k"] = "v" // panic!
+```
+
+แก้โดย `make` ก่อนใช้เสมอ เช่น เขียน constructor `func NewCache() *Cache { return &Cache{data: make(map[string]string)} }`
+</Aside>
+
+<Aside type="caution" title="map ไม่ปลอดภัยต่อ concurrency">
+ถ้าหลาย goroutine อ่านและเขียน map เดียวกันพร้อมกัน โปรแกรมจะ crash ด้วย `fatal error: concurrent map writes` (หรือ concurrent map read and map write) ต้องป้องกันด้วย `sync.Mutex` หรือใช้ `sync.Map` ซึ่งจะเรียนในบท [Concurrency](/concurrency/goroutines/)
+</Aside>
+
+## แก้ไข struct ที่อยู่ใน map
+
+value ใน map **ไม่สามารถอ้างที่อยู่ได้** จึงแก้ field ของ struct ใน map ตรง ๆ ไม่ได้
+
+```go
+type Item struct{ Qty int }
+items := map[string]Item{"a": {Qty: 1}}
+
+items["a"].Qty++ // compile error: cannot assign to struct field items["a"].Qty in map
+
+// วิธีแก้ 1: อ่านออกมา แก้ แล้วใส่กลับ
+it := items["a"]
+it.Qty++
+items["a"] = it
+
+// วิธีแก้ 2: เก็บเป็น pointer
+ptrs := map[string]*Item{"a": {Qty: 1}}
+ptrs["a"].Qty++
+```
+
+## แบบฝึกหัด
+
+1. เขียนโปรแกรมนับความถี่ของตัวอักษรใน `"hello world"` (ไม่นับช่องว่าง) แล้วพิมพ์เรียงตามตัวอักษร
+2. มี `map[string][]string` เก็บรายชื่อนักเรียนตามห้อง เขียน function คืนจำนวนนักเรียนทั้งหมด
+3. เขียน function `invert(m map[string]int) map[int]string` ที่สลับ key กับ value ถ้ามี value ซ้ำจะเกิดอะไรขึ้น
+
+<details>
+<summary>เฉลยข้อ 1</summary>
+
+```go
+counts := map[rune]int{}
+for _, r := range "hello world" {
+	if r != ' ' {
+		counts[r]++
+	}
+}
+for _, r := range slices.Sorted(maps.Keys(counts)) {
+	fmt.Printf("%c: %d\n", r, counts[r])
+}
+```
+
+</details>

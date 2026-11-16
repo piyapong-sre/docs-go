@@ -1,0 +1,336 @@
+---
+title: เครื่องมือของนักพัฒนา Go
+description: รู้จัก gofmt, go vet, staticcheck, golangci-lint, govulncheck, gopls, delve และการรวมทุกอย่างไว้ใน Makefile และ CI
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## ทำไมต้องรู้เครื่องมือ
+
+จุดแข็งของ Go ไม่ได้อยู่แค่ภาษา แต่อยู่ที่ **toolchain มาตรฐาน** ที่ทุกทีมใช้เหมือนกัน format แบบเดียว, vet แบบเดียว, test แบบเดียว ทำให้ย้ายโปรเจกต์ไหนก็คุ้นเคยทันที หน้านี้รวมเครื่องมือที่ควรมีติดเครื่อง และวิธีผูกเข้ากับ CI
+
+| เครื่องมือ | ทำอะไร | มากับ Go? |
+| --- | --- | --- |
+| `gofmt` | จัดรูปแบบโค้ด | ✓ |
+| `goimports` | gofmt + เพิ่ม/ลบ import อัตโนมัติ | ติดตั้งเพิ่ม |
+| `go vet` | หาบั๊กที่ compile ผ่านแต่น่าจะผิด | ✓ |
+| `staticcheck` | static analysis เชิงลึก | ติดตั้งเพิ่ม |
+| `golangci-lint` | รวม linter หลายสิบตัวในคำสั่งเดียว | ติดตั้งเพิ่ม |
+| `govulncheck` | หาช่องโหว่ใน dependency ที่โค้ดเรียกใช้จริง | ติดตั้งเพิ่ม |
+| `gopls` | language server สำหรับ editor | ติดตั้งเพิ่ม (editor มักติดตั้งให้) |
+| `dlv` (Delve) | debugger | ติดตั้งเพิ่ม |
+
+## Format: gofmt และ goimports
+
+```sh
+gofmt -l .        # แสดงรายชื่อไฟล์ที่ format ไม่ถูก
+gofmt -w .        # แก้ไฟล์ให้ถูกเลย
+go fmt ./...      # เหมือน gofmt -l -w กับทุก package
+```
+
+`goimports` ทำทุกอย่างที่ gofmt ทำ และเพิ่ม import ที่ขาด ลบ import ที่ไม่ได้ใช้ และจัดกลุ่ม stdlib แยกจาก third-party
+
+```sh
+go install golang.org/x/tools/cmd/goimports@latest
+goimports -w .
+```
+
+<Aside type="tip">
+ตั้ง editor ให้ format ตอน save (VS Code ส่วนขยาย Go ทำให้โดยค่าเริ่มต้นผ่าน gopls) แล้วจะไม่ต้องคิดเรื่องนี้อีกเลย ไม่มีการเถียงเรื่อง tab หรือ space ในโลก Go
+</Aside>
+
+## ตรวจโค้ด: go vet, staticcheck, golangci-lint
+
+### go vet
+
+```sh
+go vet ./...
+```
+
+จับปัญหาอย่าง `fmt.Printf("%d", "text")` ที่ argument ไม่ตรง format, copy `sync.Mutex` โดยไม่ตั้งใจ, struct tag ผิดรูปแบบ, คู่ key/value ของ `slog` ไม่ครบ ฯลฯ `go test` รัน vet ชุดย่อยให้อัตโนมัติอยู่แล้ว แต่ควรรันเต็มใน CI
+
+### staticcheck
+
+```sh
+go install honnef.co/go/tools/cmd/staticcheck@latest
+staticcheck ./...
+```
+
+ตรวจลึกกว่า vet เช่น โค้ดที่ไม่มีวันถูกเรียก, ใช้ API ที่ deprecated, error ที่ถูกทิ้ง, เงื่อนไขที่เป็นจริงเสมอ
+
+### golangci-lint
+
+ในทีมส่วนใหญ่ใช้ `golangci-lint` ซึ่งรวม linter หลายตัว (รวมถึง staticcheck) ไว้ในไฟล์ config เดียว ตัวอย่าง config ของ v2
+
+```yaml title=".golangci.yml"
+version: "2"
+
+linters:
+  default: standard        # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose            # ลืมปิด resp.Body
+    - errorlint            # เปรียบเทียบ error แบบผิด (ควรใช้ errors.Is/As)
+    - gosec                # ปัญหาด้านความปลอดภัย
+    - misspell
+    - revive
+    - sloglint             # ตรวจการใช้ log/slog ให้สม่ำเสมอ
+  settings:
+    errcheck:
+      check-type-assertions: true
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [gosec]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+```
+
+```sh
+golangci-lint run ./...
+golangci-lint fmt          # format ด้วย formatter ที่ตั้งไว้
+```
+
+<Aside type="caution">
+อย่าเปิด linter ทุกตัว (`default: all`) ในโปรเจกต์ที่มีอยู่แล้ว จะได้คำเตือนเป็นพันจนทีมเลิกสนใจ เริ่มจาก `standard` แล้วเพิ่มทีละตัวที่ทีมเห็นด้วย linter ที่มีประโยชน์คือ linter ที่ทีมยอมแก้ตาม
+</Aside>
+
+## หาช่องโหว่: govulncheck
+
+```sh
+go install golang.org/x/vuln/cmd/govulncheck@latest
+govulncheck ./...
+```
+
+govulncheck เทียบ dependency กับฐานข้อมูลช่องโหว่ของ Go (vuln.go.dev) และที่ต่างจากเครื่องมือทั่วไปคือ มันวิเคราะห์ว่า **โค้ดของเราเรียกฟังก์ชันที่มีช่องโหว่จริงหรือไม่** จึงมี false positive น้อยมาก ช่องโหว่ใน Go standard library ก็ตรวจด้วย (แก้โดยอัปเดต Go version)
+
+## Editor: gopls
+
+`gopls` (อ่านว่า "go please") คือ language server อย่างเป็นทางการ ให้ autocomplete, go to definition, rename, หา references, แสดง error ทันที ใช้ได้กับ VS Code, GoLand (มี engine ของตัวเอง), Neovim, Zed, Helix ฯลฯ
+
+```sh
+go install golang.org/x/tools/gopls@latest
+```
+
+gopls ยังมี analyzer `modernize` ที่แนะนำให้ใช้ฟีเจอร์ใหม่ของภาษา เช่น เปลี่ยน `for i := 0; i < n; i++` เป็น `for i := range n` หรือใช้ `slices.Contains` แทนลูปเขียนเอง
+
+## Debugger: Delve
+
+```sh
+go install github.com/go-delve/delve/cmd/dlv@latest
+```
+
+<Tabs>
+<TabItem label="debug โปรแกรม">
+```sh
+dlv debug ./cmd/api -- --port 8080   # หลัง -- คือ argument ของโปรแกรม
+```
+</TabItem>
+<TabItem label="debug test">
+```sh
+dlv test ./internal/user -- -test.run TestCreate
+```
+</TabItem>
+<TabItem label="attach โปรเซส">
+```sh
+dlv attach <pid>
+```
+</TabItem>
+</Tabs>
+
+คำสั่งที่ใช้บ่อยในหน้า `(dlv)`
+
+| คำสั่ง | ย่อ | ทำอะไร |
+| --- | --- | --- |
+| `break main.go:42` | `b` | ตั้ง breakpoint |
+| `continue` | `c` | รันจนถึง breakpoint ถัดไป |
+| `next` | `n` | ไปบรรทัดถัดไป (ไม่เข้าไปในฟังก์ชัน) |
+| `step` | `s` | เข้าไปในฟังก์ชัน |
+| `print user` | `p` | ดูค่าตัวแปร |
+| `locals` | | ดูตัวแปร local ทั้งหมด |
+| `goroutines` | `grs` | ดู goroutine ทั้งหมด |
+| `stack` | `bt` | ดู call stack |
+
+ในทางปฏิบัติส่วนใหญ่ใช้ผ่าน editor (VS Code กด F5) ซึ่งเรียก delve ให้เบื้องหลัง
+
+<Aside type="note">
+binary ที่ build ด้วย `-ldflags "-s -w"` ไม่มีข้อมูล debug จึงใช้กับ delve ได้ไม่ดี และ optimization ของ compiler อาจทำให้บางตัวแปรดูค่าไม่ได้ `dlv debug` จึง build ด้วย `-gcflags="all=-N -l"` (ปิด optimization และ inline) ให้เอง
+</Aside>
+
+## รวมคำสั่งไว้ที่เดียว: Makefile / Taskfile
+
+แทนที่จะจำคำสั่งยาว ๆ ให้รวมไว้ในไฟล์เดียว ทีมและ CI ใช้คำสั่งเดียวกัน
+
+<Tabs>
+<TabItem label="Makefile">
+```makefile title="Makefile"
+VERSION ?= $(shell git describe --tags --always --dirty)
+LDFLAGS := -s -w -X main.version=$(VERSION)
+
+.PHONY: all fmt lint test vuln build run clean
+
+all: fmt lint test build
+
+fmt:
+	gofmt -l -w .
+
+lint:
+	go vet ./...
+	golangci-lint run ./...
+
+test:
+	go test -race -cover ./...
+
+vuln:
+	govulncheck ./...
+
+build:
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/api ./cmd/api
+
+run:
+	go run ./cmd/api
+
+clean:
+	rm -rf bin
+```
+
+รันด้วย `make test`, `make build` (Makefile ต้องใช้ **tab** นำหน้าคำสั่ง ไม่ใช่ space)
+</TabItem>
+<TabItem label="Taskfile.yml">
+```yaml title="Taskfile.yml"
+version: '3'
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty
+
+tasks:
+  lint:
+    cmds:
+      - go vet ./...
+      - golangci-lint run ./...
+
+  test:
+    cmds:
+      - go test -race -cover ./...
+
+  build:
+    env:
+      CGO_ENABLED: 0
+    cmds:
+      - go build -trimpath -ldflags "-s -w -X main.version={{.VERSION}}" -o bin/api ./cmd/api
+
+  default:
+    deps: [lint, test]
+```
+
+[Task](https://taskfile.dev) เป็นทางเลือกที่เขียนด้วย Go ใช้ YAML แทน Makefile รันด้วย `task build` เหมาะกับทีมที่มีคนใช้ Windows
+</TabItem>
+</Tabs>
+
+## CI ด้วย GitHub Actions
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod   # ใช้ Go version ตาม go.mod
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Check generated code is up to date
+        run: |
+          go generate ./...
+          git diff --exit-code
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest           # แนะนำให้ pin version จริงในโปรเจกต์
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+```
+
+<Steps>
+
+1. **test** format ถูก, vet ผ่าน, test ผ่านทั้งหมดพร้อม race detector และไฟล์ที่ generate ไม่ล้าสมัย
+2. **lint** รัน golangci-lint ตาม `.golangci.yml`
+3. **vuln** ตรวจช่องโหว่ใน dependency
+
+</Steps>
+
+แยกเป็นสาม job เพื่อให้รันขนานกันและเห็นชัดว่าขั้นไหนพัง
+
+<Aside type="tip">
+version ของ action และเครื่องมือในตัวอย่างเป็น version ล่าสุด ณ ตอนเขียน ควรตรวจและอัปเดตเป็นระยะ หรือใช้ Dependabot ช่วยอัปเดต GitHub Actions ให้อัตโนมัติ
+</Aside>
+
+## แบบฝึกหัด
+
+1. สร้างไฟล์ที่มี `fmt.Printf("%d\n", "hello")` แล้วรัน `go vet` ดูข้อความที่ได้
+2. เพิ่ม target `cover` ใน Makefile ที่รัน test แล้วเปิดรายงาน coverage เป็น HTML
+3. แก้ workflow CI ให้รัน test บนทั้ง Go version ใน `go.mod` และ `stable` (ใบ้: `strategy.matrix`)
+
+<details>
+<summary>เฉลย</summary>
+
+1. จะได้ข้อความประมาณ `fmt.Printf format %d has arg "hello" of wrong type string`
+2. ```makefile
+   cover:
+   	go test -coverprofile=coverage.out ./...
+   	go tool cover -html=coverage.out
+   ```
+3. ```yaml
+   jobs:
+     test:
+       runs-on: ubuntu-latest
+       strategy:
+         matrix:
+           go: ['1.25', 'stable']
+       steps:
+         - uses: actions/checkout@v5
+         - uses: actions/setup-go@v6
+           with:
+             go-version: ${{ matrix.go }}
+         - run: go test -race ./...
+   ```
+
+</details>

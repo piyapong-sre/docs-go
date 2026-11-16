@@ -1,0 +1,333 @@
+---
+title: Pagination
+description: เปรียบเทียบ offset กับ cursor pagination และดูว่า tasks-api ทำ keyset pagination ที่เร็วและไม่ข้ามข้อมูลได้อย่างไร
+sidebar:
+  order: 11
+---
+
+import { Code, Aside } from '@astrojs/starlight/components';
+import cursorSrc from '../../../../examples/tasks-api/internal/task/cursor.go?raw';
+
+## ทำไมต้องแบ่งหน้า
+
+endpoint ที่คืน "รายการ" ห้ามคืนทุกแถวในครั้งเดียว วันนี้ผู้ใช้มี 10 task อีกปีอาจมี 50,000 response จะใหญ่ขึ้นเรื่อย ๆ ทั้ง database, network และ client รับไม่ไหว ทุก list endpoint จึงต้องมี **limit ที่ server บังคับ** และมีวิธีขอ "หน้าถัดไป"
+
+## Offset vs Cursor
+
+| | Offset (`?page=3&limit=20`) | Cursor / keyset (`?cursor=...&limit=20`) |
+| --- | --- | --- |
+| วิธีทำ | `LIMIT 20 OFFSET 40` | `WHERE (created_at, id) < (ค่าจากแถวสุดท้าย) LIMIT 20` |
+| กระโดดไปหน้าที่ N | ทำได้ | ทำไม่ได้ ไปได้แค่หน้าถัดไป |
+| ความเร็วเมื่อหน้าลึก ๆ | ช้าลงเรื่อย ๆ database ต้องอ่านแล้วทิ้ง N แถวก่อน | คงที่ ใช้ index กระโดดไปตำแหน่งนั้นได้เลย |
+| มีแถวใหม่แทรกระหว่างเลื่อนหน้า | ข้อมูลเลื่อน ได้แถวซ้ำหรือข้ามแถว | ไม่ซ้ำ ไม่ข้าม |
+| จำนวนทั้งหมด (total) | มักคู่กับ `COUNT(*)` ซึ่งแพงเมื่อข้อมูลเยอะ | ไม่ต้องใช้ |
+| เหมาะกับ | ตาราง admin ที่มีเลขหน้า ข้อมูลไม่เยอะ | feed, infinite scroll, mobile app, API สาธารณะ, ข้อมูลโตเรื่อย ๆ |
+
+tasks-api เลือก **cursor (keyset) pagination** เพราะรายการ task เรียงจากใหม่ไปเก่าและถูกเพิ่มอยู่ตลอด ซึ่งเป็นกรณีที่ offset ให้ผลผิดบ่อยที่สุด
+
+## ลำดับที่แน่นอน + index ที่ตรงกัน
+
+keyset pagination ต้องการ **ลำดับที่ไม่กำกวม** tasks-api เรียงด้วย `created_at DESC, id DESC` เพราะ `created_at` อาจซ้ำกันได้ (insert พร้อมกัน) จึงต้องมี `id` เป็นตัวตัดสินเสมอ
+
+```sql title="internal/postgres/migrations/00002_create_tasks.sql"
+-- Supports "list my tasks, newest first" with keyset (cursor) pagination.
+CREATE INDEX tasks_user_created_idx ON tasks (user_id, created_at DESC, id DESC);
+```
+
+index ประกอบนี้มี column และทิศทางตรงกับ `WHERE user_id = ... ORDER BY created_at DESC, id DESC` ทุกตัว PostgreSQL จึงเดิน index ไปตามลำดับแล้วหยุดเมื่อครบ `LIMIT` ได้เลย ไม่ต้อง sort
+
+## Query
+
+```sql title="internal/postgres/queries/tasks.sql"
+-- name: ListTasks :many
+-- Keyset pagination: rows strictly "after" the cursor (created_at, id), newest first.
+SELECT * FROM tasks
+WHERE user_id = sqlc.arg(user_id)
+  AND (sqlc.narg(status)::text IS NULL OR status = sqlc.narg(status))
+  AND (
+        sqlc.narg(cursor_created_at)::timestamptz IS NULL
+        OR (created_at, id) < (sqlc.narg(cursor_created_at), sqlc.narg(cursor_id)::uuid)
+      )
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.arg(row_limit);
+```
+
+- `(created_at, id) < (a, b)` คือ **row comparison** ของ SQL หมายถึง `created_at < a OR (created_at = a AND id < b)` เขียนสั้นกว่าและ PostgreSQL ใช้ index ได้ตรง ๆ
+- ใช้ `<` เพราะเรียง `DESC` คือ "เก่ากว่าแถวสุดท้ายของหน้าก่อน" ถ้าเรียง `ASC` ต้องใช้ `>`
+- `sqlc.narg(...) IS NULL OR ...` คือ "ถ้าไม่ส่ง cursor (หน้าแรก) หรือไม่ส่ง status ก็ไม่กรอง" query เดียวใช้ได้ทุกกรณี
+- `user_id` อยู่ใน `WHERE` เสมอ ผู้ใช้จึงไม่มีทางเลื่อนหน้าไปเจอ task ของคนอื่น
+
+<Aside type="caution">
+row comparison ใช้ได้เมื่อ **ทุก column เรียงทิศทางเดียวกัน** ถ้าต้องเรียงแบบผสม เช่น `due_at ASC, id DESC` จะต้องเขียนเงื่อนไขแยกเป็น `due_at > a OR (due_at = a AND id < b)` เอง และสร้าง index ให้ตรงกับทิศทางนั้น
+</Aside>
+
+## Cursor แบบ opaque
+
+<Code code={cursorSrc} lang="go" title="internal/task/cursor.go" />
+
+```go title="internal/task/task.go"
+// Cursor marks a position in a list ordered by (CreatedAt DESC, ID DESC).
+type Cursor struct {
+	CreatedAt time.Time `json:"t"`
+	ID        string    `json:"id"`
+}
+```
+
+cursor คือ `(created_at, id)` ของแถวสุดท้ายในหน้าปัจจุบัน แปลงเป็น JSON แล้ว encode ด้วย **base64url แบบไม่มี padding** (`RawURLEncoding`) ได้ string ที่ใส่ใน query string ได้โดยไม่ต้อง escape
+
+ที่สำคัญคือมันเป็น **opaque** client ต้องมองเป็นกล่องดำ แค่ส่งกลับมาเหมือนเดิม วันหนึ่งถ้าเราเปลี่ยนวิธีเรียงหรือเพิ่ม field ใน cursor client ก็ไม่พัง
+
+<Aside type="tip">
+cursor นี้ไม่ได้ sign ไว้ client แก้เองได้ แต่ก็ไม่อันตราย เพราะผลของมันคือ "เริ่มอ่านจากตำแหน่งอื่น" ภายในข้อมูลของตัวเองเท่านั้น ถ้า cursor ของคุณมีข้อมูลที่ต้องห้ามแก้ (เช่น filter ด้านสิทธิ์) ให้ sign ด้วย HMAC หรือ encrypt
+</Aside>
+
+## เคล็ดลับ limit + 1 ใน service
+
+```go title="internal/task/service.go"
+const (
+	DefaultPageSize = 20
+	MaxPageSize     = 100
+)
+
+// ...
+
+// List returns one page. It asks the repository for limit+1 rows: if the
+// extra row exists there is another page, and no COUNT(*) is needed.
+func (s *Service) List(ctx context.Context, p ListParams) (Page, error) {
+	p.Limit = clampLimit(p.Limit)
+	limit := p.Limit
+	p.Limit++
+
+	tasks, err := s.repo.List(ctx, p)
+	if err != nil {
+		return Page{}, fmt.Errorf("list tasks: %w", err)
+	}
+
+	page := Page{Tasks: tasks}
+	if len(tasks) > limit {
+		page.Tasks = tasks[:limit]
+		last := page.Tasks[limit-1]
+		page.Next = &Cursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	return page, nil
+}
+
+// ...
+
+// clampLimit applies the default and the server-side maximum.
+// Never trust a page size sent by the client.
+func clampLimit(n int) int {
+	if n <= 0 {
+		return DefaultPageSize
+	}
+	return min(n, MaxPageSize)
+}
+```
+
+- ขอ `limit + 1` แถว ถ้าได้มาเกิน `limit` แปลว่ายังมีหน้าถัดไป ตัดแถวเกินทิ้งแล้วสร้าง cursor จากแถวสุดท้าย **ที่ส่งให้ client** ไม่ต้อง `COUNT(*)` เลย
+- ถ้าได้ไม่เกิน `limit` แปลว่าหน้าสุดท้าย `Next` เป็น `nil`
+- `clampLimit` ใส่ค่า default 20 และเพดาน 100 ไว้ที่ service ด้วย แม้ handler จะ validate แล้วก็ตาม กฎทางธุรกิจอยู่ที่ service ไม่ว่าใครเรียกก็ได้ผลเหมือนกัน
+
+## Handler: validate query string
+
+```go title="internal/task/handler.go"
+// List handles GET /v1/tasks?status=todo&limit=20&cursor=...
+func (h *Handler) List(w http.ResponseWriter, r *http.Request) error {
+	q := r.URL.Query()
+	p := ListParams{UserID: mustUserID(r)}
+
+	var v httpx.Validator
+	if s := q.Get("status"); s != "" {
+		st := Status(s)
+		v.Check(st.Valid(), "status", "ต้องเป็น todo, in_progress หรือ done")
+		p.Status = &st
+	}
+	if s := q.Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		v.Check(err == nil && n >= 1 && n <= MaxPageSize, "limit", "ต้องเป็นตัวเลข 1-100")
+		p.Limit = n
+	}
+	if s := q.Get("cursor"); s != "" {
+		c, err := DecodeCursor(s)
+		v.Check(err == nil && httpx.IsUUID(c.ID), "cursor", "cursor ไม่ถูกต้อง")
+		p.After = &c
+	}
+	if err := v.Err(); err != nil {
+		return err
+	}
+
+	page, err := h.svc.List(r.Context(), p)
+	if err != nil {
+		return err
+	}
+
+	items := make([]taskResponse, 0, len(page.Tasks))
+	for _, t := range page.Tasks {
+		items = append(items, toResponse(t))
+	}
+	pg := httpx.Pagination{Limit: clampLimit(p.Limit), HasMore: page.Next != nil}
+	if page.Next != nil {
+		pg.NextCursor = EncodeCursor(*page.Next)
+	}
+	httpx.List(w, r, items, pg)
+	return nil
+}
+```
+
+- `limit` ที่เกิน 100 ได้ **422** ไม่ใช่แอบลดให้เงียบ ๆ client จะได้รู้ว่าส่งค่าผิด
+- `httpx.IsUUID(c.ID)` สำคัญ ถ้า cursor ถูกแก้จน id ไม่ใช่ UUID แล้วส่งต่อไปถึง database จะเกิด error ตอน cast `::uuid` กลายเป็น 500 ตรวจไว้ก่อนจึงได้ 422 ที่ถูกต้อง
+- `Validator` เก็บ error ทุก field แล้วตอบครั้งเดียว (ดู [Validation และ Error](/web-api/validation-and-errors/))
+- `items` สร้างด้วย `make(..., 0, ...)` ถ้าไม่มี task จะได้ `"data": []` ไม่ใช่ `null`
+
+response ใช้ envelope เดียวกับ endpoint อื่น เพิ่ม `pagination`
+
+```go title="internal/httpx/respond.go"
+// Pagination describes a cursor-paginated list.
+type Pagination struct {
+	Limit      int    `json:"limit"`
+	NextCursor string `json:"next_cursor,omitempty"`
+	HasMore    bool   `json:"has_more"`
+}
+```
+
+## ทดลอง
+
+สร้าง task 3 ตัว (ใช้ `TOKEN` จากหน้า [Authentication](/web-api/authentication/)) แล้วขอทีละ 2
+
+```bash
+for t in "อ่านบท goroutine" "เขียน handler" "ทำ pagination"; do
+  curl -s -X POST localhost:8080/v1/tasks \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"title\":\"$t\"}" > /dev/null
+done
+
+curl -s "localhost:8080/v1/tasks?limit=2" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+```json title="หน้า 1"
+{
+  "data": [
+    {
+      "id": "01a1e2a3-04ab-7c0b-8be1-50ff2f8acbb8",
+      "title": "ทำ pagination",
+      "description": "",
+      "status": "todo",
+      "due_at": null,
+      "created_at": "2026-11-16T04:34:56.811655Z",
+      "updated_at": "2026-11-16T04:34:56.811655Z"
+    },
+    {
+      "id": "01a1e2a3-0499-7fc4-8c66-324e47cc5168",
+      "title": "เขียน handler",
+      "description": "",
+      "status": "todo",
+      "due_at": null,
+      "created_at": "2026-11-16T04:34:56.793918Z",
+      "updated_at": "2026-11-16T04:34:56.793918Z"
+    }
+  ],
+  "pagination": {
+    "limit": 2,
+    "next_cursor": "eyJ0IjoiMjAyNi0xMS0xNlQwNDozNDo1Ni43OTM5MThaIiwiaWQiOiIwMWExZTJhMy0wNDk5LTdmYzQtOGM2Ni0zMjRlNDdjYzUxNjgifQ",
+    "has_more": true
+  },
+  "meta": {
+    "request_id": "req_95392835e63b878820fd6013"
+  }
+}
+```
+
+ส่ง `next_cursor` กลับไปเพื่อขอหน้าถัดไป
+
+```bash
+CURSOR=eyJ0IjoiMjAyNi0xMS0xNlQwNDozNDo1Ni43OTM5MThaIiwiaWQiOiIwMWExZTJhMy0wNDk5LTdmYzQtOGM2Ni0zMjRlNDdjYzUxNjgifQ
+curl -s "localhost:8080/v1/tasks?limit=2&cursor=$CURSOR" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+```json title="หน้า 2 (หน้าสุดท้าย)"
+{
+  "data": [
+    {
+      "id": "01a1e2a3-047f-7aaf-b719-17eeb458696d",
+      "title": "อ่านบท goroutine",
+      "description": "",
+      "status": "todo",
+      "due_at": null,
+      "created_at": "2026-11-16T04:34:56.767584Z",
+      "updated_at": "2026-11-16T04:34:56.767584Z"
+    }
+  ],
+  "pagination": {
+    "limit": 2,
+    "has_more": false
+  },
+  "meta": {
+    "request_id": "req_5d0e298d0a3b129ac7c7e741"
+  }
+}
+```
+
+หน้าสุดท้ายไม่มี `next_cursor` (`omitempty`) และ `has_more` เป็น `false` ถ้าอยากรู้ว่าข้างใน cursor มีอะไร ลอง decode ดู (แต่อย่าให้ client พึ่งรูปแบบนี้)
+
+```bash
+echo "$CURSOR" | base64 -d
+```
+
+```text title="Output"
+{"t":"2026-11-16T04:34:56.793918Z","id":"01a1e2a3-0499-7fc4-8c66-324e47cc5168"
+```
+
+ตัวสุดท้าย `}` หายไปเพราะ cursor ไม่มี padding `=` ซึ่ง `base64 -d` ต้องการ ฝั่ง Go ใช้ `RawURLEncoding` ถอดได้ครบ
+
+ส่ง parameter ผิดพร้อมกันหลายตัว ได้ error ครบทุก field ในครั้งเดียว
+
+```bash
+curl -s "localhost:8080/v1/tasks?limit=500&status=later&cursor=xyz" -H "Authorization: Bearer $TOKEN"
+```
+
+```json title="422 Unprocessable Entity"
+{"error":{"code":"VALIDATION_ERROR","message":"ข้อมูลไม่ผ่านการตรวจสอบ","details":[{"field":"status","issue":"ต้องเป็น todo, in_progress หรือ done"},{"field":"limit","issue":"ต้องเป็นตัวเลข 1-100"},{"field":"cursor","issue":"cursor ไม่ถูกต้อง"}],"request_id":"req_ccc9a7e8c95e5fb981bfeedd"}}
+```
+
+## ทางเลือก: ถ้าจะทำแบบ offset
+
+บางหน้าจอต้องการเลขหน้าจริง ๆ เช่น ตาราง admin ที่ข้อมูลไม่เยอะ โค้ดด้านล่างเป็น **ตัวอย่างทางเลือก ไม่ได้อยู่ใน tasks-api**
+
+```sql
+-- name: ListTasksOffset :many
+SELECT * FROM tasks
+WHERE user_id = $1
+ORDER BY created_at DESC, id DESC
+LIMIT $2 OFFSET $3;
+
+-- name: CountTasks :one
+SELECT count(*) FROM tasks WHERE user_id = $1;
+```
+
+```go
+// GET /v1/tasks?page=3&page_size=20  (alternative, not in tasks-api)
+// atoiOr(s, def) is a small helper: strconv.Atoi with a default value.
+page := max(1, atoiOr(q.Get("page"), 1))
+size := clampLimit(atoiOr(q.Get("page_size"), DefaultPageSize))
+offset := (page - 1) * size
+
+rows, err := queries.ListTasksOffset(ctx, sqlc.ListTasksOffsetParams{
+	UserID: userID, Limit: int32(size), Offset: int32(offset),
+})
+// ...
+total, err := queries.CountTasks(ctx, userID)
+// response: "pagination": {"page": 3, "page_size": 20, "total": 1234, "total_pages": 62}
+```
+
+- ยังต้องมี `ORDER BY` ที่แน่นอน และเพดาน `page_size` เหมือนเดิม
+- ควรจำกัด `page` สูงสุดด้วย เพราะ `OFFSET` ใหญ่ ๆ ทำให้ database ทำงานหนัก
+- `COUNT(*)` ต้องนับทุกแถวที่ตรงเงื่อนไข ข้อมูลยิ่งเยอะยิ่งช้า
+
+## สรุป
+
+- ทุก list endpoint ต้องมี limit ที่ server บังคับ (tasks-api: default 20, max 100)
+- offset ง่ายและกระโดดหน้าได้ แต่ช้าเมื่อหน้าลึกและซ้ำ/ข้ามแถวเมื่อข้อมูลเปลี่ยน cursor เร็วคงที่และไม่ซ้ำ แต่ไปได้แค่หน้าถัดไป
+- keyset ต้องมีลำดับที่ไม่กำกวม (`created_at DESC, id DESC`) และ index ที่ตรงกับ `WHERE` + `ORDER BY`
+- ใช้ row comparison `(created_at, id) < (...)` และส่ง cursor แบบ opaque (base64url JSON)
+- ขอ `limit + 1` แถวเพื่อรู้ว่ามีหน้าถัดไป โดยไม่ต้อง `COUNT(*)`
+- validate `limit`, `status`, `cursor` ใน handler แล้วตอบ 422 พร้อมรายละเอียดทุก field

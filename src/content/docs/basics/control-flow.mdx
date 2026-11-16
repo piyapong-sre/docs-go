@@ -1,0 +1,239 @@
+---
+title: Control flow
+description: if พร้อม init statement, for ทุกรูปแบบรวมถึง range over int, switch และการใช้ break/continue กับ label
+sidebar:
+  order: 3
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import controlflowSrc from '../../../../examples/learn/basics/controlflow/main.go?raw';
+
+Go มีโครงสร้างควบคุมการทำงานเพียงไม่กี่แบบ: `if`, `for`, `switch` (และ `select` สำหรับ channel ซึ่งจะเรียนใน [บท Concurrency](/concurrency/goroutines/)) ไม่มี `while`, ไม่มี `do-while` และไม่ต้องใส่วงเล็บรอบเงื่อนไข แต่ **ต้องมี `{ }` เสมอ**
+
+## ตัวอย่างรวม
+
+<Code code={controlflowSrc} lang="go" title="examples/learn/basics/controlflow/main.go" />
+
+```text title="Output"
+ได้ตัวเลข 42
+0 1 2 
+total = 243
+รอบที่ 0; รอบที่ 1; รอบที่ 2; 
+0 มะม่วง
+1 ทุเรียน
+2 มังคุด
+1 3 5 7 
+วันหยุด
+เกรด B
+one
+two
+เจอค่าติดลบที่ [1][1]
+```
+
+## `if`
+
+```go
+if x > 10 {
+	// ...
+} else if x > 5 {
+	// ...
+} else {
+	// ...
+}
+```
+
+### `if` พร้อม init statement
+
+ใส่ statement สั้น ๆ คั่นด้วย `;` ก่อนเงื่อนไขได้ ตัวแปรที่ประกาศตรงนั้นจะมี scope **เฉพาะใน `if`/`else` ชุดนั้น** ทำให้ไม่รก scope ด้านนอก
+
+```go
+if n, err := strconv.Atoi("42"); err != nil {
+	fmt.Println("แปลงไม่ได้:", err)
+} else {
+	fmt.Println("ได้ตัวเลข", n) // n ใช้ได้ใน else ด้วย
+}
+// ตรงนี้ไม่มี n และ err แล้ว
+```
+
+<Aside type="tip" title="early return">
+Go นิยมจัดการกรณี error ก่อนแล้ว `return` ออกไปเลย ทำให้ code ส่วนหลัก (happy path) ไม่ต้องซ้อนอยู่ใน `else`
+
+```go
+n, err := strconv.Atoi(input)
+if err != nil {
+	return err
+}
+// ใช้ n ต่อได้เลย ไม่ต้องอยู่ใน else
+```
+</Aside>
+
+## `for` — loop เดียวที่มี
+
+Go มี keyword สำหรับ loop แค่ `for` แต่ใช้ได้หลายรูปแบบ
+
+### 1. แบบ 3 ส่วน (classic)
+
+```go
+for i := 0; i < 3; i++ {
+	fmt.Print(i, " ")
+}
+```
+
+### 2. แบบ while
+
+ใส่แค่เงื่อนไข
+
+```go
+total := 1
+for total < 100 {
+	total *= 3
+}
+```
+
+### 3. วนไม่รู้จบ
+
+ไม่ใส่อะไรเลย แล้วออกด้วย `break` หรือ `return`
+
+```go
+for {
+	if done() {
+		break
+	}
+}
+```
+
+### 4. `range` over int (Go 1.22+)
+
+`for i := range n` วน `n` รอบ โดย `i` มีค่าตั้งแต่ `0` ถึง `n-1` สั้นและอ่านง่ายกว่าแบบ 3 ส่วนเมื่อแค่ต้องการนับรอบ ถ้าไม่ใช้ `i` เขียน `for range 3 { ... }` ได้
+
+```go
+for i := range 3 {
+	fmt.Print("รอบที่ ", i, "; ")
+}
+```
+
+### 5. `range` over slice, array, map, string, channel
+
+```go
+for i, f := range fruits { }   // index และค่า
+for i := range fruits { }      // index อย่างเดียว
+for _, f := range fruits { }   // ค่าอย่างเดียว (_ = ไม่ใช้ตัวแปรนี้)
+for k, v := range m { }        // map: key และ value
+for i, r := range "สวัสดี" { }  // string: byte index และ rune
+```
+
+`range` บน string ให้ค่าเป็น **rune** (ตัวอักษร Unicode) ไม่ใช่ byte ดูรายละเอียดในบท [String และ rune](/basics/strings-and-runes/)
+
+<Aside type="note" title="loop variable ใน Go 1.22+">
+ตั้งแต่ Go 1.22 ตัวแปรของ `for` (เช่น `i`, `f` ด้านบน) **ถูกสร้างใหม่ทุกรอบ** ทำให้ปลอดภัยเมื่อนำไปใช้ใน closure หรือ goroutine ปัญหาคลาสสิกที่ทุก goroutine เห็นค่ารอบสุดท้ายจึงหมดไป (ถ้า `go.mod` ระบุ `go 1.22` ขึ้นไป) บทความเก่า ๆ ที่แนะนำให้เขียน `v := v` ในลูปไม่จำเป็นอีกต่อไป
+</Aside>
+
+<Aside type="caution" title="ค่าจาก range เป็นสำเนา">
+`for _, v := range items` — `v` เป็น **สำเนา** ของสมาชิก แก้ `v` แล้วไม่กระทบ `items` ถ้าต้องการแก้ใน slice ให้ใช้ index: `items[i].Count++`
+</Aside>
+
+## `continue` และ `break`
+
+- `continue` — ข้ามไปรอบถัดไปทันที
+- `break` — ออกจาก loop (หรือ `switch`/`select`) ที่อยู่ในสุด
+
+ในตัวอย่าง loop ไม่รู้จบนับ `count` ขึ้นเรื่อย ๆ ข้ามเลขคู่ด้วย `continue` และออกเมื่อเกิน 7 จึงพิมพ์ `1 3 5 7`
+
+## `switch`
+
+```go
+switch day {
+case "sat", "sun":   // case เดียวรับหลายค่าได้
+	fmt.Println("วันหยุด")
+case "mon":
+	fmt.Println("วันจันทร์อีกแล้ว")
+default:
+	fmt.Println("วันทำงาน")
+}
+```
+
+ต่างจาก C/Java/JavaScript ตรงที่ **แต่ละ case จบในตัว ไม่ต้องเขียน `break`** (ไม่ตกไป case ถัดไปเอง) และค่าใน case ไม่จำเป็นต้องเป็นค่าคงที่
+
+### switch แบบไม่มีนิพจน์
+
+`switch { ... }` เท่ากับ `switch true` — ใช้แทน `if-else if` ยาว ๆ ได้อ่านง่ายกว่า case จะถูกตรวจจากบนลงล่าง และทำ case แรกที่เป็นจริง
+
+```go
+switch {
+case score >= 80:
+	fmt.Println("เกรด A")
+case score >= 70:
+	fmt.Println("เกรด B")
+default:
+	fmt.Println("เกรด C")
+}
+```
+
+`switch` ก็มี init statement ได้เหมือน `if` เช่น `switch n := 1; n { ... }`
+
+### `fallthrough`
+
+ถ้าต้องการให้ทำ case ถัดไปต่อจริง ๆ ใช้ `fallthrough` (ต้องเป็น statement สุดท้ายของ case) โดยจะเข้า case ถัดไป **โดยไม่ตรวจเงื่อนไข** — ในตัวอย่างจึงพิมพ์ทั้ง `one` และ `two` แต่ไม่พิมพ์ `three` ในทางปฏิบัติใช้น้อยมาก
+
+## Label
+
+เมื่อมี loop ซ้อนกัน `break` จะออกแค่ loop ในสุด ถ้าต้องการออกจาก loop ชั้นนอกโดยตรง ให้ตั้ง label แล้ว `break label`
+
+```go
+outer:
+	for r, row := range matrix {
+		for c, v := range row {
+			if v < 0 {
+				fmt.Printf("เจอค่าติดลบที่ [%d][%d]\n", r, c)
+				break outer // ออกจากทั้งสอง loop
+			}
+		}
+	}
+```
+
+`continue outer` ก็ใช้ได้เช่นกัน (ข้ามไปรอบถัดไปของ loop ชั้นนอก)
+
+<Aside type="caution" title="break ใน switch ที่อยู่ใน for">
+`break` ที่เขียนใน `switch` (หรือ `select`) จะออกจาก **switch** ไม่ใช่ loop ที่ครอบอยู่ ถ้าต้องการออกจาก loop ต้องใช้ label
+
+```go
+loop:
+	for {
+		switch cmd := next(); cmd {
+		case "quit":
+			break loop // ถ้าเขียนแค่ break จะวนต่อไม่รู้จบ
+		}
+	}
+```
+</Aside>
+
+Go มี `goto` ด้วย แต่แทบไม่มีเหตุผลให้ใช้ใน code ทั่วไป
+
+## แบบฝึกหัด
+
+1. **FizzBuzz**: พิมพ์ 1 ถึง 15 โดยใช้ `for i := range` และ `switch` แบบไม่มีนิพจน์ ถ้าหาร 3 ลงตัวพิมพ์ `Fizz`, หาร 5 ลงตัวพิมพ์ `Buzz`, หารทั้งคู่ลงตัวพิมพ์ `FizzBuzz`
+2. ใช้ loop แบบ while หา **ยกกำลังของ 2 ที่น้อยที่สุดที่มากกว่า 1000**
+3. ใช้ loop ซ้อนกับ label หาคู่ตัวเลข `(a, b)` คู่แรกที่ `a` และ `b` อยู่ระหว่าง 1–9 และ `a*b == 24` แล้วหยุดทันที
+
+<details>
+<summary>เฉลยข้อ 1</summary>
+
+```go
+for i := range 15 {
+	n := i + 1
+	switch {
+	case n%15 == 0:
+		fmt.Println("FizzBuzz")
+	case n%3 == 0:
+		fmt.Println("Fizz")
+	case n%5 == 0:
+		fmt.Println("Buzz")
+	default:
+		fmt.Println(n)
+	}
+}
+```
+
+ต้องตรวจ `n%15` ก่อน เพราะ switch ทำ case แรกที่เป็นจริงเท่านั้น
+
+</details>

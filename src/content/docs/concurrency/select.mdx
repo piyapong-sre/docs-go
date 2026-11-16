@@ -1,0 +1,209 @@
+---
+title: select
+description: รอหลาย channel พร้อมกันด้วย select ทำ non-blocking ด้วย default จัดการ timeout และงานตามจังหวะด้วย time.Ticker
+sidebar:
+  order: 3
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/concurrency/select/main.go?raw';
+
+`select` หน้าตาคล้าย `switch` แต่ทุก `case` เป็นการ **ส่งหรือรับ channel**
+มันจะรอจนกว่ามี case ใด case หนึ่งพร้อม แล้วทำ case นั้น ทำให้เรารอหลาย channel พร้อมกันได้
+เป็นเครื่องมือหลักสำหรับ timeout, cancellation และ event loop
+
+## รูปแบบพื้นฐาน
+
+```go
+select {
+case v := <-ch1:
+	// ได้ค่าจาก ch1
+case ch2 <- x:
+	// ส่ง x เข้า ch2 สำเร็จ
+case <-done:
+	// done ถูกปิดหรือได้ค่า
+default:
+	// ไม่มี case ไหนพร้อม (ถ้าใส่ default select จะไม่ block)
+}
+```
+
+กฎสำคัญ
+
+- ถ้าไม่มี case ไหนพร้อมและ **ไม่มี `default`** → block รอ
+- ถ้า **พร้อมหลาย case พร้อมกัน** → Go **สุ่ม** เลือกหนึ่ง case (ไม่ใช่ตามลำดับที่เขียน) เพื่อไม่ให้ channel ใดถูกละเลย
+- `select {}` ที่ไม่มี case เลยจะ block ตลอดไป
+
+## ตัวอย่างเต็ม
+
+<Code code={src} lang="go" title="examples/learn/concurrency/select/main.go" />
+
+```text title="Output"
+first: mirror-asia
+timeout!
+no message, moving on
+tick 1
+tick 2
+tick 3
+stopped after 3 ticks
+```
+
+(ผลขึ้นกับเวลาจริง ถ้าเครื่องช้ามากอาจต่างเล็กน้อย)
+
+## อธิบายทีละส่วน
+
+### 1. รอว่าใครมาก่อน
+
+`fetch` คืน channel ที่จะได้ค่าหลังเวลาที่กำหนด `select` รอทั้งสอง channel แล้วรับค่าจากตัวที่มาก่อน
+pattern นี้ใช้ส่ง request ไปหลาย server แล้วใช้คำตอบแรกที่ได้
+
+สังเกตว่า `fetch` ใช้ **buffered channel ขนาด 1** ทำให้ goroutine ของ `mirror-eu` ที่มาช้ายังส่งค่าเข้า buffer แล้วจบได้
+แม้ไม่มีใครรับ ถ้าใช้ unbuffered goroutine นั้นจะค้างตลอดไป (goroutine leak)
+
+### 2. Timeout ด้วย time.After
+
+```go
+select {
+case r := <-fetch("slow-api", 300*time.Millisecond):
+	fmt.Println("got", r)
+case <-time.After(100 * time.Millisecond):
+	fmt.Println("timeout!")
+}
+```
+
+`time.After(d)` คืน channel ที่จะได้ค่าหลังเวลา `d` ถ้างานยังไม่เสร็จภายในเวลานั้น case timeout จะถูกเลือก
+
+<Aside type="tip" title="ในงานจริงใช้ context">
+`time.After` เหมาะกับตัวอย่างสั้นๆ แต่ในโปรแกรมจริงที่ต้องยกเลิกงานต่อเป็นทอดๆ (เช่น HTTP request → database query)
+ให้ใช้ `context.WithTimeout` แล้วรอ `<-ctx.Done()` แทน (ดู [context](/concurrency/context/))
+</Aside>
+
+### 3. Non-blocking ด้วย default
+
+ถ้ามี `default` และไม่มี case ไหนพร้อม `select` จะทำ `default` ทันทีโดยไม่รอ
+ใช้ "ลอง" ส่งหรือรับโดยไม่ block เช่น
+
+```go
+// ส่ง event ถ้ามีที่ว่าง ถ้าเต็มก็ทิ้งไป (ไม่ให้ระบบหลักช้าเพราะ logging)
+select {
+case events <- e:
+default:
+	dropped++
+}
+```
+
+<Aside type="caution" title="อย่าใช้ default ใน loop เพื่อ busy-wait">
+```go
+for {
+	select {
+	case v := <-ch:
+		handle(v)
+	default:
+		// ❌ วนเปล่าๆ เป็นล้านรอบต่อวินาที กิน CPU 100%
+	}
+}
+```
+ถ้าต้องการรอ ให้เอา `default` ออกแล้วปล่อยให้ `select` block ตามปกติ
+</Aside>
+
+### 4. ทำงานเป็นจังหวะด้วย time.Ticker
+
+```go
+ticker := time.NewTicker(100 * time.Millisecond)
+defer ticker.Stop()
+```
+
+`ticker.C` จะได้ค่าทุกๆ 100 ms ใช้กับ `for` + `select` เพื่อทำงานเป็นรอบ เช่น health check, flush buffer, refresh cache
+และมี case อีกตัว (`stop` หรือ `ctx.Done()`) ไว้ออกจาก loop
+
+- เรียก `ticker.Stop()` เมื่อเลิกใช้ (ตั้งแต่ Go 1.23 ticker ที่ไม่มีใครอ้างถึงจะถูก garbage collect ได้แม้ไม่ Stop แต่การ Stop ก็ยังเป็นนิสัยที่ดีและหยุด tick ทันที)
+- ถ้าอยากทำงานครั้งเดียวในอนาคต ใช้ `time.NewTimer` หรือ `time.AfterFunc`
+- `ticker.Reset(d)` เปลี่ยนความถี่ได้ระหว่างทาง
+
+## select ใน for loop: event loop
+
+pattern ที่พบบ่อยที่สุดคือ goroutine ที่วนรอหลายแหล่ง
+
+```go
+func run(ctx context.Context, jobs <-chan Job) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return // ถูกสั่งให้หยุด
+		case j := <-jobs:
+			process(j)
+		case <-ticker.C:
+			reportStats()
+		}
+	}
+}
+```
+
+### ปิด case ด้วย nil channel
+
+ถ้ารับจากสอง channel และตัวหนึ่งถูกปิดแล้ว ให้ตั้งเป็น `nil` เพื่อไม่ให้ case นั้นถูกเลือกอีก
+(รับจาก nil channel จะ block ตลอด)
+
+```go
+for a != nil || b != nil {
+	select {
+	case v, ok := <-a:
+		if !ok {
+			a = nil // a ปิดแล้ว ไม่ต้องรอ a อีก
+			continue
+		}
+		fmt.Println("a:", v)
+	case v, ok := <-b:
+		if !ok {
+			b = nil
+			continue
+		}
+		fmt.Println("b:", v)
+	}
+}
+```
+
+<Aside type="caution" title="break ใน select ไม่ได้ออกจาก for">
+`break` ภายใน `select` จะออกแค่จาก `select` เท่านั้น ถ้าต้องการออกจาก `for` ด้วย ให้ใช้ `return`
+หรือ label เช่น `loop: for { select { case <-done: break loop } }`
+</Aside>
+
+## แบบฝึกหัด
+
+1. เขียน function `func withTimeout(ch <-chan int, d time.Duration) (int, bool)` ที่คืนค่าจาก `ch` ถ้ามาทันเวลา หรือ `0, false` ถ้าเกินเวลา
+2. เขียน loop ที่พิมพ์ `tick` ทุก 200 ms และหยุดเมื่อครบ 1 วินาที โดยใช้ `time.NewTicker` และ `time.After`
+3. ถ้า `ch1` และ `ch2` มีค่ารออยู่ทั้งคู่ `select` ที่มี case ของ `ch1` อยู่ก่อนจะเลือก `ch1` เสมอหรือไม่
+
+<details>
+<summary>เฉลย</summary>
+
+```go
+// 1
+func withTimeout(ch <-chan int, d time.Duration) (int, bool) {
+	select {
+	case v := <-ch:
+		return v, true
+	case <-time.After(d):
+		return 0, false
+	}
+}
+
+// 2
+ticker := time.NewTicker(200 * time.Millisecond)
+defer ticker.Stop()
+done := time.After(time.Second)
+for {
+	select {
+	case <-ticker.C:
+		fmt.Println("tick")
+	case <-done:
+		return
+	}
+}
+```
+
+3. ไม่ — เมื่อพร้อมหลาย case Go จะสุ่มเลือก ลำดับที่เขียนไม่มีผล
+
+</details>

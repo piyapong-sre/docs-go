@@ -1,0 +1,351 @@
+---
+title: ฐานข้อมูล (PostgreSQL, pgx, sqlc)
+description: เชื่อม PostgreSQL ด้วย pgx connection pool เขียน SQL แล้วให้ sqlc generate โค้ด Go ที่ type-safe และสร้าง repository ที่แปลงข้อมูลกับ error เป็นภาษาของ domain
+sidebar:
+  order: 8
+---
+
+import { Aside, Code, Steps } from '@astrojs/starlight/components';
+import sqlcYaml from '../../../../examples/tasks-api/sqlc.yaml?raw';
+import tasksSQL from '../../../../examples/tasks-api/internal/postgres/queries/tasks.sql?raw';
+
+หน้านี้ลงมือทำชั้นล่างสุดของ API: repository ที่คุยกับ PostgreSQL เราใช้เครื่องมือสองตัวคู่กัน
+
+- **pgx** (`github.com/jackc/pgx/v5`) driver ที่คุยกับ PostgreSQL พร้อม connection pool
+- **sqlc** เครื่องมือที่อ่านไฟล์ `.sql` แล้ว generate ฟังก์ชัน Go ที่มี type ถูกต้องให้
+
+## ทำไมไม่ใช้ ORM
+
+ORM ช่วยให้ไม่ต้องเขียน SQL แต่แลกมากับ SQL ที่มองไม่เห็น, query ที่ช้าโดยไม่รู้ตัว และ API ของ ORM ที่ต้องเรียนเพิ่ม ส่วนการเขียน SQL เองกับ `database/sql` ล้วนๆ ก็ต้อง `Scan` ทีละคอลัมน์ ซึ่งผิดลำดับง่ายและ compiler ช่วยอะไรไม่ได้
+
+sqlc อยู่ตรงกลาง: **เราเขียน SQL จริง** (ใช้ฟีเจอร์ของ PostgreSQL ได้เต็มที่) แล้ว sqlc ตรวจ SQL กับ schema และ generate โค้ด `Scan` ที่ถูกต้องให้ ถ้าชื่อคอลัมน์ผิดหรือ type ไม่ตรง จะรู้ตั้งแต่ตอน generate ไม่ใช่ตอน runtime
+
+## Connection pool ด้วย pgx
+
+```go title="internal/postgres/postgres.go"
+// Open creates a connection pool and verifies the database is reachable.
+func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	cfg.MaxConns = 10
+	cfg.MaxConnIdleTime = 5 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	return pool, nil
+}
+```
+
+- **`pgxpool.ParseConfig`** อ่าน `DATABASE_URL` แล้วให้เราปรับค่าก่อนสร้าง pool
+- **`MaxConns = 10`** จำนวน connection สูงสุดที่ instance นี้จะเปิด PostgreSQL รับ connection ได้จำกัด (ค่าเริ่มต้น `max_connections` คือ 100) ถ้ารันหลาย replica ต้องคิดรวม เช่น 5 replica × 10 = 50
+- **`MaxConnIdleTime`** ปิด connection ที่ว่างนานเกิน 5 นาที คืนทรัพยากรให้ฐานข้อมูล
+- **`Ping` พร้อม timeout** `NewWithConfig` ไม่ได้เชื่อมต่อจริงทันที การ ping ตอนเริ่มทำให้รู้ทันทีถ้าฐานข้อมูลเข้าไม่ถึง (fail fast) และ timeout 5 วินาทีกันไม่ให้ค้างตลอดไป ถ้า ping ไม่ผ่านก็ปิด pool ก่อน return
+
+`*pgxpool.Pool` ปลอดภัยต่อการใช้จากหลาย goroutine พร้อมกัน สร้างครั้งเดียวใน `main` แล้วส่งให้ทุก repository ใช้ร่วมกัน และ `defer pool.Close()` ใน `run()` (ดู [โครงสร้างโปรเจกต์](/web-api/project-structure/)) นอกจากนี้ pool ยังมี method `Ping` จึงใช้เป็น `server.Pinger` สำหรับ `/readyz` ได้เลย
+
+การสร้างตาราง (migration) ด้วย goose อยู่ในหน้า [Migration](/web-api/migrations/) หน้านี้สมมติว่ามีตาราง `users` และ `tasks` แล้ว
+
+## ตั้งค่า sqlc
+
+<Code code={sqlcYaml} lang="yaml" title="sqlc.yaml" />
+
+- **`schema`** ชี้ไปที่โฟลเดอร์ migration sqlc อ่าน `CREATE TABLE` จากที่นั่นเพื่อรู้ว่าตารางมีคอลัมน์อะไร type อะไร (schema มีที่เดียว ไม่ต้องเขียนซ้ำ)
+- **`queries`** โฟลเดอร์ไฟล์ SQL ที่เราเขียน
+- **`sql_package: pgx/v5`** generate โค้ดสำหรับ pgx โดยตรง ไม่ผ่าน `database/sql`
+- **`emit_empty_slices: true`** query แบบ `:many` ที่ไม่มีผลลัพธ์คืน `[]Task{}` แทน `nil`
+
+### overrides: เลือก type ของ Go เอง
+
+ถ้าไม่ตั้ง sqlc จะใช้ type ของ pgx เช่น `pgtype.UUID`, `pgtype.Text`, `pgtype.Timestamptz` ซึ่งต้องแปลงไปมาทุกครั้ง เรา override ให้เป็น type ธรรมดาของ Go
+
+| คอลัมน์ PostgreSQL | NOT NULL | nullable |
+| --- | --- | --- |
+| `uuid` | `string` | `*string` |
+| `timestamptz` | `time.Time` | `*time.Time` |
+| `text` | `string` | `*string` |
+
+กฎคือ **คอลัมน์ที่เป็น NULL ได้ → pointer** (`nil` = NULL) ซึ่งตรงกับวิธีที่ domain model ใช้อยู่แล้ว เช่น `DueAt *time.Time` ทำให้แปลงระหว่างชั้นได้ตรงๆ
+
+## เขียน query
+
+<Code code={tasksSQL} lang="sql" title="internal/postgres/queries/tasks.sql" />
+
+comment `-- name: <ชื่อ> <ชนิด>` บอก sqlc ว่าจะสร้างฟังก์ชันชื่ออะไร และคืนค่าแบบไหน
+
+| ชนิด | ความหมาย | ฟังก์ชันที่ได้ |
+| --- | --- | --- |
+| `:one` | คืน 1 แถว | `CreateTask(ctx, arg) (Task, error)` |
+| `:many` | คืนหลายแถว | `ListTasks(ctx, arg) ([]Task, error)` |
+| `:execrows` | ไม่คืนแถว แต่คืนจำนวนแถวที่ถูกกระทบ | `DeleteTask(ctx, arg) (int64, error)` |
+
+### sqlc.arg และ sqlc.narg
+
+query ง่ายๆ ใช้ `$1, $2` ได้ และ sqlc จะตั้งชื่อ parameter จากคอลัมน์ให้ แต่ query ที่ซับซ้อนควรตั้งชื่อเองด้วย
+
+- **`sqlc.arg(name)`** parameter ที่ห้ามเป็น NULL (ได้ type ปกติ)
+- **`sqlc.narg(name)`** parameter ที่เป็น NULL ได้ (ได้ pointer) ใช้สำหรับ "ตัวกรองที่ไม่บังคับ"
+
+```sql
+  AND (sqlc.narg(status)::text IS NULL OR status = sqlc.narg(status))
+```
+
+บรรทัดนี้แปลว่า "ถ้าไม่ได้ส่ง status มา (NULL) ไม่ต้องกรอง ถ้าส่งมาให้กรองตามนั้น" ใช้ query เดียวรองรับทั้งสองกรณีโดยไม่ต้องต่อ string SQL เอง ส่วน `::text` บอก type ให้ PostgreSQL เพราะการเทียบ `IS NULL` อย่างเดียวไม่พอให้มันอนุมาน type ของ parameter ได้
+
+### COALESCE สำหรับ PATCH
+
+```sql
+-- name: UpdateTask :one
+-- NULL arguments mean "leave the column unchanged" (PATCH semantics).
+UPDATE tasks
+SET title       = COALESCE(sqlc.narg(title), title),
+    -- ...
+    updated_at  = now()
+WHERE id = sqlc.arg(id) AND user_id = sqlc.arg(user_id)
+RETURNING *;
+```
+
+`COALESCE(a, b)` คืนค่าแรกที่ไม่ใช่ NULL ถ้า client ไม่ได้ส่ง title มา (pointer เป็น `nil` → NULL) คอลัมน์ก็จะได้ค่าเดิมของตัวเอง ทำ PATCH บางส่วนได้ใน query เดียว และ `RETURNING *` คืนแถวที่อัปเดตแล้วโดยไม่ต้อง `SELECT` ซ้ำ
+
+<Aside type="caution" title="ข้อจำกัดของ COALESCE">
+เพราะ NULL แปลว่า "ไม่เปลี่ยน" วิธีนี้จึง **ล้างค่ากลับเป็น NULL ไม่ได้** เช่น ส่ง `{"due_at": null}` เพื่อลบกำหนดส่ง จะไม่มีผลอะไร (JSON `null` ถูก decode เป็น pointer `nil` เหมือนกับไม่ส่ง) ถ้าต้องการรองรับ ต้องเพิ่ม parameter แยก เช่น `clear_due_at boolean` แล้วเขียน `CASE WHEN ... THEN NULL ...`
+</Aside>
+
+### Keyset pagination
+
+```sql
+-- name: ListTasks :many
+-- Keyset pagination: rows strictly "after" the cursor (created_at, id), newest first.
+SELECT * FROM tasks
+WHERE user_id = sqlc.arg(user_id)
+  AND (sqlc.narg(status)::text IS NULL OR status = sqlc.narg(status))
+  AND (
+        sqlc.narg(cursor_created_at)::timestamptz IS NULL
+        OR (created_at, id) < (sqlc.narg(cursor_created_at), sqlc.narg(cursor_id)::uuid)
+      )
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.arg(row_limit);
+```
+
+แทนที่จะใช้ `OFFSET` (ซึ่งช้าลงเรื่อยๆ เมื่อหน้าลึกขึ้น) เราขอ "แถวที่อยู่ถัดจาก cursor" ด้วยการเทียบ tuple `(created_at, id)` คู่กับ index `tasks_user_created_idx ON tasks (user_id, created_at DESC, id DESC)` ทำให้ทุกหน้าเร็วเท่ากัน รายละเอียดทั้งหมดอยู่ในหน้า [Pagination](/web-api/pagination/)
+
+## Generate โค้ด
+
+<Steps>
+
+1. แก้ไฟล์ใน `internal/postgres/queries/` (หรือเพิ่ม migration)
+2. รัน
+
+   ```bash
+   make sqlc
+   ```
+
+   ซึ่งเรียก sqlc ผ่าน Docker image จึงไม่ต้องติดตั้ง sqlc ในเครื่อง
+
+   ```makefile title="Makefile"
+   sqlc: ## Regenerate type-safe query code after editing internal/postgres/queries
+   	docker run --rm -v "$(CURDIR)":/src -w /src sqlc/sqlc:1.31.1 generate
+   ```
+
+3. commit ทั้งไฟล์ `.sql` และโค้ดที่ generate ใน `internal/postgres/sqlc/` ไปด้วยกัน
+
+</Steps>
+
+ผลลัพธ์คือ struct และฟังก์ชันที่ type ตรงกับ SQL เช่น
+
+```go title="internal/postgres/sqlc/tasks.sql.go"
+type ListTasksParams struct {
+	UserID          string
+	Status          *string
+	CursorCreatedAt *time.Time
+	CursorID        *string
+	RowLimit        int32
+}
+
+// Keyset pagination: rows strictly "after" the cursor (created_at, id), newest first.
+func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]Task, error) {
+	rows, err := q.db.Query(ctx, listTasks,
+		arg.UserID,
+		arg.Status,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
+	// ...
+}
+```
+
+สังเกตว่าชื่อ field มาจากชื่อใน `sqlc.arg`/`sqlc.narg` และ `sqlc.narg` กลายเป็น pointer ตาม overrides comment ใน SQL ก็กลายเป็น doc comment ของฟังก์ชันด้วย
+
+<Aside type="caution">
+ไฟล์ใน `internal/postgres/sqlc/` ขึ้นต้นด้วย `// Code generated by sqlc. DO NOT EDIT.` **ห้ามแก้มือ** เพราะจะถูกเขียนทับในการ generate ครั้งต่อไป ถ้าต้องการเปลี่ยน ให้แก้ SQL หรือ `sqlc.yaml` แล้วรัน `make sqlc` ใหม่
+</Aside>
+
+## Repository: สะพานระหว่าง sqlc กับ domain
+
+`TaskRepo` implement `task.Repository` โดยห่อ `*sqlc.Queries` ไว้
+
+```go title="internal/postgres/repos.go"
+// TaskRepo implements task.Repository.
+type TaskRepo struct {
+	q *sqlc.Queries
+}
+
+var _ task.Repository = (*TaskRepo)(nil)
+
+func NewTaskRepo(pool *pgxpool.Pool) *TaskRepo {
+	return &TaskRepo{q: sqlc.New(pool)}
+}
+```
+
+หน้าที่ของ repository มีสามอย่าง
+
+### 1. แปลง row ↔ domain model
+
+struct ที่ sqlc generate (`sqlc.Task`) เป็นของชั้นฐานข้อมูล ห้ามรั่วออกไปนอก package `postgres` repository แปลงเป็น `task.Task` ก่อนคืนเสมอ
+
+```go title="internal/postgres/repos.go"
+func toTask(row sqlc.Task) task.Task {
+	return task.Task{
+		ID:          row.ID,
+		UserID:      row.UserID,
+		Title:       row.Title,
+		Description: row.Description,
+		Status:      task.Status(row.Status),
+		DueAt:       row.DueAt,
+		CreatedAt:   row.CreatedAt,
+		UpdatedAt:   row.UpdatedAt,
+	}
+}
+```
+
+ฝั่งขาเข้าก็เช่นกัน เช่น `List` แปลง `task.ListParams` เป็น `sqlc.ListTasksParams` โดยใส่ค่า pointer เฉพาะเมื่อมีตัวกรอง
+
+```go title="internal/postgres/repos.go"
+func (r *TaskRepo) List(ctx context.Context, p task.ListParams) ([]task.Task, error) {
+	arg := sqlc.ListTasksParams{
+		UserID:   p.UserID,
+		RowLimit: int32(p.Limit),
+	}
+	if p.Status != nil {
+		s := string(*p.Status)
+		arg.Status = &s
+	}
+	if p.After != nil {
+		arg.CursorCreatedAt = &p.After.CreatedAt
+		arg.CursorID = &p.After.ID
+	}
+	// ...
+}
+```
+
+(`int32(p.Limit)` ปลอดภัย เพราะ service จำกัด limit ไว้ไม่เกิน 100 + 1 แล้ว)
+
+### 2. แปลง error ของฐานข้อมูลเป็น domain error
+
+service ไม่ควรรู้จัก `pgx.ErrNoRows` repository จึงแปลงให้
+
+```go title="internal/postgres/repos.go"
+func (r *TaskRepo) Get(ctx context.Context, userID, id string) (task.Task, error) {
+	row, err := r.q.GetTask(ctx, sqlc.GetTaskParams{ID: id, UserID: userID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return task.Task{}, task.ErrNotFound
+	}
+	if err != nil {
+		return task.Task{}, err
+	}
+	return toTask(row), nil
+}
+```
+
+`Delete` ใช้ query แบบ `:execrows` ซึ่งไม่มี `ErrNoRows` เราจึงดูจากจำนวนแถวที่ถูกลบแทน
+
+```go title="internal/postgres/repos.go"
+func (r *TaskRepo) Delete(ctx context.Context, userID, id string) error {
+	n, err := r.q.DeleteTask(ctx, sqlc.DeleteTaskParams{ID: id, UserID: userID})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return task.ErrNotFound
+	}
+	return nil
+}
+```
+
+ฝั่ง user มีอีกกรณีที่น่าสนใจ: อีเมลซ้ำ ตาราง `users` มี unique index บนคอลัมน์ `email` เมื่อ insert ซ้ำ PostgreSQL ตอบ error code `23505` (unique_violation)
+
+```go title="internal/postgres/repos.go"
+// PostgreSQL error code for unique_violation.
+const uniqueViolation = "23505"
+
+func (r *UserRepo) Create(ctx context.Context, email, name, hash string) (user.User, error) {
+	row, err := r.q.CreateUser(ctx, sqlc.CreateUserParams{Email: email, Name: name, PasswordHash: hash})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
+			return user.User{}, user.ErrEmailTaken
+		}
+		return user.User{}, err
+	}
+	return toUser(row), nil
+}
+```
+
+ทำไมไม่ `SELECT` เช็กก่อนว่ามีอีเมลนี้หรือยัง? เพราะถ้ามีสอง request สมัครด้วยอีเมลเดียวกันพร้อมกัน ทั้งคู่อาจเช็กผ่านก่อนที่อีกฝ่ายจะ insert เสร็จ (race condition) **ให้ฐานข้อมูลเป็นผู้ตัดสินด้วย constraint** แล้วแปลง error ทีหลังถูกต้องเสมอ
+
+เส้นทางเต็มของ error นี้คือ `23505` → `user.ErrEmailTaken` (repository) → `409 CONFLICT` (handler)
+
+```json
+{"error":{"code":"CONFLICT","message":"อีเมลนี้ถูกใช้แล้ว","request_id":"req_7fdf6775bca583f28c5acb5f"}}
+```
+
+### 3. กรองด้วย user_id ทุก query
+
+ดู `GetTask`, `UpdateTask`, `DeleteTask` และ `ListTasks` อีกครั้ง ทุกตัวมี `user_id` อยู่ในเงื่อนไข `WHERE`
+
+```sql
+-- name: GetTask :one
+-- Always filter by user_id so a user can never read another user's task.
+SELECT * FROM tasks
+WHERE id = $1 AND user_id = $2;
+```
+
+นี่คือ **authorization ที่ระดับ query**: ไม่มี query ไหนเลยที่อ่านหรือแก้ task ได้โดยไม่ระบุเจ้าของ และ `user_id` มาจาก token ที่ middleware ตรวจแล้ว (`mustUserID(r)`) ไม่ใช่จากสิ่งที่ client ส่งมา
+
+ทางเลือกอื่นคือ `SELECT` ด้วย id อย่างเดียวแล้วค่อยเช็ก `task.UserID == currentUser` ใน Go ซึ่งใช้ได้ แต่ถ้าลืมเช็กแม้แต่ที่เดียวก็เกิดช่องโหว่ทันที (IDOR: Insecure Direct Object Reference) การใส่ไว้ใน SQL ทำให้ "ลืม" ไม่ได้ และได้พฤติกรรม 404 สำหรับ task ของคนอื่นมาฟรีๆ (ดู [Validation และ error](/web-api/validation-and-errors/))
+
+## Context ไหลลงไปถึงฐานข้อมูล
+
+ทุก method ของ repository รับ `ctx context.Context` เป็น parameter แรก และส่งต่อให้ sqlc ซึ่งส่งต่อให้ pgx อีกที
+
+```text
+r.Context()  →  handler  →  service.Get(ctx, ...)  →  repo.Get(ctx, ...)  →  q.GetTask(ctx, ...)  →  pgx
+```
+
+context นี้มาจาก request ซึ่งถูก middleware `Timeout` ตั้ง deadline ไว้ ผลคือ
+
+- ถ้า client ตัดการเชื่อมต่อ query ที่ยังทำงานอยู่จะถูกยกเลิก ไม่เปลือง connection
+- ถ้า query ช้าเกิน `REQUEST_TIMEOUT` pgx จะยกเลิก query แล้วคืน error ที่ wrap `context.DeadlineExceeded` ซึ่งกลายเป็น `503 TIMEOUT` (ดู [Middleware](/web-api/middleware/))
+
+<Aside type="tip">
+อย่าใช้ `context.Background()` ในโค้ดที่ทำงานภายใต้ request เพราะจะตัดสายการยกเลิกทิ้ง ใช้ `context.Background()` เฉพาะจุดเริ่มต้นจริงๆ เช่นใน `main` หรือ background job
+</Aside>
+
+## สรุป
+
+- `postgres.Open` สร้าง `pgxpool.Pool` จาก URL, จำกัด `MaxConns` และ `Ping` พร้อม timeout เพื่อ fail fast; pool ใช้ร่วมกันได้ทุก goroutine
+- sqlc อ่าน schema จาก migration และ query จาก `queries/` แล้ว generate โค้ด type-safe; overrides ทำให้ได้ `string`/`time.Time` และ pointer สำหรับคอลัมน์ nullable
+- ใช้ `sqlc.narg` + `IS NULL OR` สำหรับตัวกรองที่ไม่บังคับ, `COALESCE` สำหรับ PATCH และ tuple comparison สำหรับ keyset pagination
+- repository แปลง row เป็น domain model, แปลง `pgx.ErrNoRows` เป็น `ErrNotFound` และ `23505` เป็น `ErrEmailTaken`
+- ทุก query กรองด้วย `user_id` (authorization ระดับ query) และ context จาก request ไหลลงไปถึง pgx เพื่อให้ยกเลิกได้

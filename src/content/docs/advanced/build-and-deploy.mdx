@@ -1,0 +1,206 @@
+---
+title: Build และ Deploy
+description: รู้จัก flag ของ go build การฝัง version ด้วย ldflags, build tags, cross-compile และการ build ให้ reproducible
+sidebar:
+  order: 4
+---
+
+import { Aside, Code, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+import src from '../../../../examples/learn/advanced/buildinfo/main.go?raw';
+import debugSrc from '../../../../examples/learn/advanced/buildinfo/mode_debug.go?raw';
+import releaseSrc from '../../../../examples/learn/advanced/buildinfo/mode_release.go?raw';
+
+## ทำไมต้องรู้
+
+`go run` สะดวกตอนพัฒนา แต่ตอนส่งขึ้น production เราต้องการมากกว่านั้น เช่น
+
+- binary เล็กลง และไม่มี path ของเครื่อง developer ติดไป
+- รู้ว่า binary ที่รันอยู่คือ version ไหน commit อะไร
+- build บน Mac แต่เอาไปรันบน Linux server
+- เปิด/ปิดโค้ดบางส่วนตามสภาพแวดล้อม
+
+ทั้งหมดนี้ทำได้ด้วย `go build` ตัวเดียว ไม่ต้องมีเครื่องมือเสริม
+
+## คำสั่งพื้นฐาน
+
+```sh
+go build                     # build package ในโฟลเดอร์ปัจจุบัน ได้ binary ชื่อตามโฟลเดอร์
+go build -o bin/api ./cmd/api  # กำหนดชื่อและตำแหน่ง output
+go build ./...               # build ทุก package เพื่อเช็กว่า compile ผ่าน (ไม่เก็บ binary)
+go install ./cmd/api         # build แล้วย้ายไปไว้ที่ $(go env GOBIN) หรือ $(go env GOPATH)/bin
+```
+
+`go install` ยังใช้ติดตั้งเครื่องมือจาก module อื่นได้ด้วย
+
+```sh
+go install golang.org/x/vuln/cmd/govulncheck@latest
+```
+
+## ตัวอย่าง: ฝัง version และใช้ build tag
+
+<Code code={src} lang="go" title="examples/learn/advanced/buildinfo/main.go" />
+
+<Tabs>
+<TabItem label="mode_release.go">
+<Code code={releaseSrc} lang="go" title="examples/learn/advanced/buildinfo/mode_release.go" />
+</TabItem>
+<TabItem label="mode_debug.go">
+<Code code={debugSrc} lang="go" title="examples/learn/advanced/buildinfo/mode_debug.go" />
+</TabItem>
+</Tabs>
+
+<Tabs>
+<TabItem label="go run ธรรมดา">
+```sh
+go run ./advanced/buildinfo
+```
+
+```text title="Output"
+version: dev
+commit:  none
+mode:    release
+target:  darwin/arm64
+go:      go1.27.1
+module:  learn
+  CGO_ENABLED=1
+```
+</TabItem>
+<TabItem label="build แบบ production">
+```sh
+cd advanced/buildinfo
+CGO_ENABLED=0 go build -trimpath -tags debug \
+  -ldflags "-s -w -X main.version=1.2.3 -X main.commit=abc1234" \
+  -o app .
+./app
+```
+
+```text title="Output"
+version: 1.2.3
+commit:  abc1234
+mode:    debug
+target:  darwin/arm64
+go:      go1.27.1
+module:  learn
+  -tags=debug
+  -trimpath=true
+  CGO_ENABLED=0
+```
+</TabItem>
+</Tabs>
+
+ค่า `target` และ `go` ขึ้นกับเครื่องและ toolchain ที่ใช้ build
+
+## อธิบายทีละส่วน
+
+### `-ldflags`: ส่ง option ให้ linker
+
+| Flag | ผล |
+| --- | --- |
+| `-s` | ตัด symbol table |
+| `-w` | ตัดข้อมูล DWARF สำหรับ debugger |
+| `-X importpath.name=value` | กำหนดค่า **string variable** ตอน link |
+
+`-s -w` ทำให้ binary เล็กลงพอสมควร (ในตัวอย่างนี้จากราว 2.5 MB เหลือราว 1.6 MB) แลกกับการ debug ด้วย delve ไม่ได้ ส่วน stack trace ตอน panic ยังอ่านได้ปกติ
+
+`-X` ใช้ได้กับตัวแปร `string` ระดับ package ที่เป็น `var` เท่านั้น (ใช้กับ `const` ไม่ได้) ถ้าตัวแปรไม่ได้อยู่ใน `main` ให้ใช้ import path เต็ม เช่น `-X example.com/shop/internal/build.Version=1.2.3`
+
+ใน CI มักดึงค่าจาก git
+
+```sh
+VERSION=$(git describe --tags --always --dirty)
+COMMIT=$(git rev-parse --short HEAD)
+go build -ldflags "-s -w -X main.version=$VERSION -X main.commit=$COMMIT" -o bin/api ./cmd/api
+```
+
+<Aside type="tip">
+ถ้า build ภายใน git repository Go จะฝังข้อมูล VCS ให้อัตโนมัติ (`vcs.revision`, `vcs.time`, `vcs.modified`) อ่านได้จาก `debug.ReadBuildInfo()` และตั้งแต่ Go 1.24 `info.Main.Version` จะถูกตั้งจาก git tag ด้วย หลายโปรเจกต์จึงไม่ต้องใช้ `-X` เลย ตรวจข้อมูลใน binary ใดก็ได้ด้วย `go version -m ./app`
+</Aside>
+
+### Build tags: เลือกไฟล์ที่จะ compile
+
+บรรทัด `//go:build <expr>` ที่หัวไฟล์ (ก่อน `package` และเว้นบรรทัดว่างหนึ่งบรรทัด) บอกว่าไฟล์นี้จะถูก compile เมื่อไหร่
+
+| Constraint | ไฟล์ถูก compile เมื่อ |
+| --- | --- |
+| `//go:build debug` | ใส่ `-tags debug` |
+| `//go:build !debug` | ไม่ได้ใส่ `-tags debug` |
+| `//go:build linux && amd64` | build สำหรับ Linux 64-bit (x86) เท่านั้น |
+| `//go:build integration` | ใช้กับ test ที่ช้า แล้วรันด้วย `go test -tags integration ./...` |
+
+ชื่อไฟล์ก็เป็น build constraint ได้ เช่น `file_linux.go`, `file_windows_amd64.go`, `file_test.go`
+
+<Aside type="caution">
+ไฟล์ที่ถูก build tag กันไว้จะไม่ถูก compile ตามปกติ ถ้ามีโค้ดพังในไฟล์ `-tags debug` คุณจะไม่รู้จนกว่าจะ build ด้วย tag นั้น ให้ CI รัน `go vet -tags debug ./...` ด้วย
+</Aside>
+
+### Cross-compile ด้วย GOOS/GOARCH
+
+Go compile ข้ามระบบได้ในตัว แค่ตั้ง environment variable
+
+```sh
+GOOS=linux   GOARCH=amd64 go build -o bin/api-linux-amd64 ./cmd/api
+GOOS=linux   GOARCH=arm64 go build -o bin/api-linux-arm64 ./cmd/api   # AWS Graviton, Raspberry Pi 64-bit
+GOOS=windows GOARCH=amd64 go build -o bin/api.exe ./cmd/api
+GOOS=darwin  GOARCH=arm64 go build -o bin/api-mac ./cmd/api
+```
+
+ดูคู่ที่รองรับทั้งหมดด้วย `go tool dist list`
+
+### `CGO_ENABLED=0`: binary แบบ static
+
+ถ้าโค้ด (หรือ dependency) ไม่ได้ใช้ C ผ่าน cgo การตั้ง `CGO_ENABLED=0` ทำให้ได้ binary ที่ไม่ผูกกับ libc ของเครื่อง จึงรันได้บน image เปล่าอย่าง `scratch` หรือ `distroless/static` และ cross-compile ได้โดยไม่ต้องมี C compiler ของ platform ปลายทาง
+
+<Aside type="caution">
+บาง package ต้องใช้ cgo เช่น `github.com/mattn/go-sqlite3` ถ้าปิด cgo จะ build ไม่ผ่านหรือใช้งานไม่ได้ ให้เลือก library ทางเลือกที่เป็น pure Go (เช่น `modernc.org/sqlite`) ถ้าต้องการ static binary
+</Aside>
+
+### Reproducible build ด้วย `-trimpath`
+
+ปกติ binary จะเก็บ path เต็มของไฟล์ source เช่น `/Users/alice/work/shop/main.go` ซึ่ง
+
+- ทำให้ build บนเครื่องต่างกันได้ binary ไม่เหมือนกัน
+- เปิดเผยชื่อ user และโครงสร้างโฟลเดอร์ของเครื่อง build
+
+`-trimpath` ตัด path เหล่านี้ออก เหลือแค่ import path ของ module เมื่อใช้ร่วมกับ Go version เดียวกันและ `go.sum` ที่ล็อกไว้ (และ flag เดียวกัน) จะได้ binary ที่เหมือนกันทุก byte ไม่ว่าจะ build บนเครื่องไหน
+
+## สูตรสำหรับ production
+
+<Steps>
+
+1. ล็อก Go version ใน `go.mod` (บรรทัด `go 1.25` และอาจใส่ `toolchain`)
+2. รัน test และ vet ก่อน build
+
+   ```sh
+   go vet ./... && go test ./...
+   ```
+
+3. build แบบ static, ตัด path, ฝัง version
+
+   ```sh
+   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+     go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+     -o bin/api ./cmd/api
+   ```
+
+4. ใส่ binary ลง container image ขนาดเล็ก (ดู [Docker และการ Deploy](/web-api/docker-deploy/))
+
+</Steps>
+
+## แบบฝึกหัด
+
+1. เพิ่มตัวแปร `buildTime` ในตัวอย่าง แล้วฝังเวลาที่ build ด้วย `-X` (ใบ้: `date -u +%Y-%m-%dT%H:%M:%SZ`)
+2. สร้างไฟล์ `feature_linux.go` ที่ประกาศ `const platformNote = "linux"` และไฟล์สำหรับ OS อื่น แล้ว cross-compile ไป Linux และ Windows เพื่อดูว่าค่าเปลี่ยน
+3. ทำไม `-X main.version=1.0` ใช้ไม่ได้ถ้าเขียน `const version = "dev"`
+
+<details>
+<summary>เฉลย</summary>
+
+1. ประกาศ `var buildTime = "unknown"` แล้ว build ด้วย
+   ```sh
+   go build -ldflags "-X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
+   ```
+   (การฝังเวลาทำให้ build ไม่ reproducible ถ้าต้องการ reproducible ให้ใช้เวลาของ commit แทน)
+2. ใช้ชื่อไฟล์ `feature_linux.go` และอีกไฟล์ที่มี `//go:build !linux` ที่หัวไฟล์ แล้ว `GOOS=linux go build` กับ `GOOS=windows go build`
+3. `const` ถูกแทนค่าตอน compile ไม่มีตัวตนเป็น symbol ใน binary ให้ linker ไปแก้ได้ จึงต้องใช้ `var` ชนิด `string`
+
+</details>

@@ -1,0 +1,238 @@
+---
+title: พื้นฐาน net/http
+description: เข้าใจ Handler, HandlerFunc, ServeMux และ routing แบบใหม่ของ Go 1.22 ก่อนต่อยอดเป็น API จริง
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+ก่อนจะสร้าง API เต็มรูปแบบ เรามาทำความเข้าใจชิ้นส่วนหลักของ `net/http` กันก่อน ข่าวดีคือมีแค่ไม่กี่ชิ้น และทุกอย่างในโปรเจกต์ tasks-api (รวมถึง middleware ทั้งหมด) ก็ประกอบขึ้นจากชิ้นส่วนเหล่านี้
+
+## Handler: หัวใจของ net/http
+
+ทุกอย่างที่ตอบ HTTP request ได้คือ `http.Handler` ซึ่งเป็น interface ที่มี method เดียว
+
+```go
+type Handler interface {
+	ServeHTTP(ResponseWriter, *Request)
+}
+```
+
+- `*http.Request` คือ request ที่เข้ามา มี method, URL, header, body และ `Context()`
+- `http.ResponseWriter` คือช่องทางเขียน response กลับ (status code, header, body)
+
+การเขียน struct ขึ้นมาเพื่อ implement `ServeHTTP` ทุกครั้งค่อนข้างยุ่งยาก Go จึงมี `http.HandlerFunc` ซึ่งเป็น adapter ให้ฟังก์ชันธรรมดากลายเป็น `Handler`
+
+```go
+type HandlerFunc func(ResponseWriter, *Request)
+
+// ServeHTTP calls f(w, r).
+func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
+	f(w, r)
+}
+```
+
+เทคนิค "ประกาศ type เป็นฟังก์ชันแล้วใส่ method ให้มัน" นี้สำคัญมาก เราจะใช้ซ้ำตอนสร้าง `httpx.HandlerFunc` ที่คืน `error` ได้ในหน้า [JSON และ response](/web-api/json-and-responses/) ถ้ายังไม่คุ้นกับ interface ทบทวนได้ที่ [Interfaces](/intermediate/interfaces/)
+
+## Hello server
+
+เริ่มจาก server เล็กที่สุดที่มี routing แบบ Go 1.22
+
+```go title="main.go"
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+)
+
+func main() {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /hello/{name}", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "สวัสดี %s\n", r.PathValue("name"))
+	})
+
+	log.Println("listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+```
+
+```bash
+$ curl -i localhost:8080/hello/somchai
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+
+สวัสดี somchai
+
+$ curl -i -X POST localhost:8080/hello/somchai
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD
+Content-Type: text/plain; charset=utf-8
+
+Method Not Allowed
+```
+
+(ตัด header `Date`, `Content-Length` ออกเพื่อให้อ่านง่าย)
+
+สังเกตสองอย่าง
+
+1. เราไม่ได้ตั้ง `Content-Type` เอง แต่ได้ `text/plain` เพราะ `net/http` เดา (sniff) จากข้อมูลที่เขียนครั้งแรก สำหรับ API เราจะตั้งเองเสมอ
+2. เรียกด้วย `POST` แล้วได้ `405` พร้อม header `Allow: GET, HEAD` อัตโนมัติ โดยไม่ต้องเขียนโค้ดเพิ่ม
+
+<Aside type="caution" title="อย่าใช้ http.ListenAndServe ใน production">
+`http.ListenAndServe` สร้าง `http.Server` ที่ **ไม่มี timeout เลย** client ที่ส่งข้อมูลช้าๆ (หรือตั้งใจโจมตีแบบ slowloris) สามารถค้าง connection ไว้ได้ไม่จำกัด โปรเจกต์จริงจึงสร้าง `http.Server` เองพร้อมกำหนด timeout ทุกตัว ดูรายละเอียดในหน้า [Graceful shutdown](/web-api/graceful-shutdown/)
+</Aside>
+
+## ServeMux และ pattern แบบ Go 1.22
+
+`http.ServeMux` คือ router ที่จับคู่ request กับ handler ตั้งแต่ Go 1.22 pattern มีรูปแบบ
+
+```text
+[METHOD ][HOST]/[PATH]
+```
+
+| Pattern | จับคู่กับ |
+| --- | --- |
+| `/v1/tasks` | path `/v1/tasks` ทุก method |
+| `GET /v1/tasks` | `GET` (และ `HEAD`) ที่ path `/v1/tasks` เท่านั้น |
+| `GET /v1/tasks/{id}` | `GET /v1/tasks/` ตามด้วย segment ใดก็ได้ 1 segment |
+| `GET /files/{path...}` | ทุก path ที่ขึ้นต้นด้วย `/files/` รวม `/` ข้างใน |
+| `GET /static/` | ทุก path ที่ขึ้นต้นด้วย `/static/` (trailing slash = subtree) |
+| `GET /{$}` | path `/` อย่างเดียว |
+| `/` | ทุก request ที่ไม่ตรงกับ pattern อื่น |
+
+### Path parameter
+
+wildcard `{name}` จับได้ 1 segment (ไม่ข้าม `/`) อ่านค่าด้วย `r.PathValue("name")` ถ้าต้องการจับทั้งส่วนที่เหลือของ path ให้ใส่ `...` ต่อท้าย เช่น `{path...}` ซึ่งต้องอยู่ท้ายสุดของ pattern เท่านั้น
+
+```go
+mux.HandleFunc("GET /files/{path...}", func(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, r.PathValue("path")) // GET /files/a/b/c.txt → "a/b/c.txt"
+})
+```
+
+### `{$}` และ trailing slash
+
+pattern ที่ลงท้ายด้วย `/` หมายถึง "ทั้ง subtree" ดังนั้น `/` เฉยๆ จับได้ทุก path ถ้าต้องการจับเฉพาะหน้าแรก ให้ใช้ `/{$}` ซึ่งแปลว่า "จบ path ตรงนี้"
+
+โปรเจกต์ tasks-api ไม่ใช้ trailing slash ใน path ของ API เลย (`/v1/tasks` ไม่ใช่ `/v1/tasks/`) เพื่อให้แต่ละ endpoint มี URL เดียวที่ชัดเจน
+
+### Precedence: pattern ที่เจาะจงกว่าชนะ
+
+ถ้ามีหลาย pattern ที่ตรงกับ request เดียวกัน ServeMux เลือกตัวที่ **เจาะจงกว่า** (match request ได้น้อยกว่า) โดยไม่สนลำดับที่ลงทะเบียน
+
+```go
+mux.HandleFunc("GET /hello/{name}", greet)  // GET /hello/somchai
+mux.HandleFunc("GET /hello/admin", admin)   // GET /hello/admin ชนะ เพราะเจาะจงกว่า
+```
+
+ถ้าสอง pattern เจาะจงพอๆ กันจนตัดสินไม่ได้ (เช่น `GET /posts/{id}` กับ `GET /{resource}/latest`) ServeMux จะ **panic ตอนลงทะเบียน** ซึ่งดีกว่าไปเจอบั๊กตอน runtime
+
+### 405 อัตโนมัติ และข้อยกเว้นในโปรเจกต์นี้
+
+ถ้า path ตรงกับ pattern บางตัวแต่ method ไม่ตรง ServeMux ตอบ `405 Method Not Allowed` พร้อม header `Allow` ให้เอง
+
+แต่ใน tasks-api เราลงทะเบียน pattern `/` (ไม่มี method) ไว้เป็น catch-all เพื่อให้ endpoint ที่ไม่รู้จักได้ JSON 404 แทนข้อความ `404 page not found` แบบ plain text ผลข้างเคียงคือ pattern `/` นี้ match **ทุก method ทุก path** ดังนั้น request อย่าง `DELETE /v1/tasks` (path มีแต่ไม่รองรับ method นี้) จะตกไปที่ catch-all และได้ 404 แทน 405
+
+```bash
+$ curl -s -X DELETE localhost:8080/v1/tasks
+{"error":{"code":"NOT_FOUND","message":"ไม่พบ endpoint นี้","request_id":"req_807340a2ae5baee89ec41914"}}
+```
+
+เป็น trade-off ที่ยอมรับได้สำหรับ API นี้ เพราะได้ error เป็น JSON รูปแบบเดียวกันทุกกรณี ถ้าอยากได้ทั้งสองอย่าง ต้องเขียน wrapper ที่ดักผลลัพธ์ 404/405 ของ ServeMux แล้วแปลงเป็น JSON เอง
+
+## ResponseWriter: ลำดับการเขียนสำคัญ
+
+การเขียน response มี 3 ขั้น และ **ต้องเรียงลำดับนี้เสมอ**
+
+1. `w.Header().Set(...)` ตั้ง header
+2. `w.WriteHeader(status)` ส่ง status line พร้อม header ทั้งหมดออกไป
+3. `w.Write(body)` เขียน body
+
+```go
+// ถูก
+w.Header().Set("Content-Type", "application/json; charset=utf-8")
+w.WriteHeader(http.StatusCreated)
+w.Write(body)
+
+// ผิด: header ที่ตั้งหลัง WriteHeader จะถูกทิ้งเงียบๆ
+w.WriteHeader(http.StatusCreated)
+w.Header().Set("Location", "/v1/tasks/123") // ไม่มีผลแล้ว
+```
+
+ถ้าเรียก `Write` โดยไม่เคยเรียก `WriteHeader` จะได้ status `200` อัตโนมัติ และถ้าเรียก `WriteHeader` ซ้ำ ครั้งหลังจะไม่มีผล (และ server จะ log ว่า `superfluous response.WriteHeader call`)
+
+นี่คือเหตุผลที่ handler `Create` ในโปรเจกต์ตั้ง header `Location` ก่อนเรียก helper ที่เขียน response
+
+```go title="internal/task/handler.go"
+	w.Header().Set("Location", "/v1/tasks/"+t.ID)
+	httpx.OK(w, r, http.StatusCreated, toResponse(t))
+	return nil
+```
+
+## แต่ละ request รันใน goroutine ของตัวเอง
+
+`http.Server` สร้าง goroutine ใหม่ให้ทุก connection ดังนั้น handler หลายตัวทำงาน **พร้อมกัน** เสมอ ข้อมูลที่ handler ใช้ร่วมกัน (เช่น map ใน memory) ต้องป้องกันด้วย mutex หรือใช้สิ่งที่ปลอดภัยต่อ concurrency อยู่แล้ว เช่น connection pool ของ pgx
+
+นอกจากนี้ `r.Context()` จะถูก cancel เมื่อ client ตัดการเชื่อมต่อ หรือเมื่อ handler ทำงานเสร็จ เราจึงส่ง `r.Context()` ต่อไปให้ service และ database เสมอ เพื่อให้งานที่ไม่มีใครรอผลแล้วหยุดได้ทันที (ทบทวนเรื่องนี้ที่ [context](/concurrency/context/))
+
+## เชื่อมกับโปรเจกต์จริง: server.go
+
+routing ทั้งหมดของ tasks-api อยู่ใน `internal/server/server.go` หน้าตาคล้ายกับ hello server ข้างบน แค่มี endpoint มากขึ้น
+
+```go title="internal/server/server.go"
+// NewHandler returns the root handler with every route registered.
+func NewHandler(d Deps) http.Handler {
+	mux := http.NewServeMux()
+	requireAuth := auth.RequireAuth(d.Tokens)
+
+	// Operational endpoints (not versioned).
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	// ...
+
+	// Auth: stricter rate limit against brute-force attempts.
+	limited := d.AuthLimiter.Middleware
+	mux.Handle("POST /v1/auth/register", limited(httpx.HandlerFunc(d.Users.Register)))
+	mux.Handle("POST /v1/auth/login", limited(httpx.HandlerFunc(d.Users.Login)))
+	mux.Handle("GET /v1/me", requireAuth(httpx.HandlerFunc(d.Users.Me)))
+
+	// Tasks: every route requires a logged-in user.
+	mux.Handle("GET /v1/tasks", requireAuth(httpx.HandlerFunc(d.Tasks.List)))
+	mux.Handle("POST /v1/tasks", requireAuth(httpx.HandlerFunc(d.Tasks.Create)))
+	mux.Handle("GET /v1/tasks/{id}", requireAuth(httpx.HandlerFunc(d.Tasks.Get)))
+	mux.Handle("PATCH /v1/tasks/{id}", requireAuth(httpx.HandlerFunc(d.Tasks.Update)))
+	mux.Handle("DELETE /v1/tasks/{id}", requireAuth(httpx.HandlerFunc(d.Tasks.Delete)))
+
+	// Anything else: JSON 404 instead of the default plain-text page.
+	mux.Handle("/", httpx.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return httpx.NotFound("ไม่พบ endpoint นี้")
+	}))
+
+	// Global middleware, outermost first.
+	return mw.Chain(mux,
+		mw.RequestID,
+		// ...
+	)
+}
+```
+
+สิ่งที่ต่างจาก hello server
+
+- ใช้ `mux.Handle` (รับ `http.Handler`) แทน `mux.HandleFunc` เพราะ handler ถูกห่อด้วย `httpx.HandlerFunc` และ middleware อย่าง `requireAuth(...)` ซึ่งล้วนคืนค่าเป็น `http.Handler`
+- method ของ handler เช่น `d.Tasks.Get` อ่าน path parameter ด้วย `r.PathValue("id")` (ผ่าน helper `httpx.PathUUID`) แบบเดียวกับ `{name}` ข้างบน
+- `NewHandler` คืนค่าเป็น `http.Handler` ตัวเดียวที่ห่อ mux ด้วย middleware ทั้งชุด ทำให้นำไป test ด้วย `httptest` ได้ทันทีโดยไม่ต้องเปิด port จริง
+
+ทั้ง `httpx.HandlerFunc` และ middleware จะอธิบายละเอียดในหน้า [JSON และ response](/web-api/json-and-responses/) และ [Middleware](/web-api/middleware/)
+
+## สรุป
+
+- `http.Handler` คือ interface ที่มี `ServeHTTP` method เดียว และ `http.HandlerFunc` แปลงฟังก์ชันให้เป็น Handler
+- Go 1.22+ รองรับ pattern แบบ `GET /v1/tasks/{id}` อ่านค่าด้วย `r.PathValue`, มี `{path...}` และ `{$}`, pattern ที่เจาะจงกว่าชนะ
+- ServeMux ตอบ 405 ให้อัตโนมัติ ยกเว้นเมื่อมี catch-all `/` ที่ match ทุก method
+- ตั้ง header ก่อน `WriteHeader` เสมอ และส่ง `r.Context()` ต่อไปทุกชั้น
+- `http.ListenAndServe` ไม่มี timeout ใช้ `http.Server` ที่ตั้งค่าเองใน production

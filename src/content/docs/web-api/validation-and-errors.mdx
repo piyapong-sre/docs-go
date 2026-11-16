@@ -1,0 +1,346 @@
+---
+title: Validation และ error
+description: อ่าน JSON จาก request อย่างปลอดภัย ตรวจ input ให้ครบทุก field และแปลง error ทุกชนิดเป็น HTTP status กับ error code ที่ client ใช้งานได้
+sidebar:
+  order: 7
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import decodeSrc from '../../../../examples/tasks-api/internal/httpx/decode.go?raw';
+import validateSrc from '../../../../examples/tasks-api/internal/httpx/validate.go?raw';
+
+กฎข้อแรกของการทำ API: **อย่าเชื่อ input จาก client** body อาจใหญ่ผิดปกติ, JSON อาจพัง, field อาจผิดชนิดหรือผิดชื่อ, ค่าอาจว่างหรือยาวเกิน หน้านี้แบ่งการรับมือเป็น 3 ด่าน
+
+1. **Decode** อ่าน body เป็น struct อย่างเข้มงวด (`httpx.DecodeJSON`)
+2. **Validate** ตรวจกฎของแต่ละ field (`validate()` ของ request DTO)
+3. **Map error** แปลง error จาก service เป็น HTTP response ที่เหมาะสม (`mapError`)
+
+## ด่านที่ 1: DecodeJSON
+
+<Code code={decodeSrc} lang="go" title="internal/httpx/decode.go" />
+
+### จำกัดขนาด body ด้วย MaxBytesReader
+
+```go title="internal/httpx/decode.go"
+	r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
+```
+
+ถ้าไม่จำกัด client ส่ง body ขนาดหลาย GB มาก็ทำให้ server ใช้ memory จนล่มได้ `http.MaxBytesReader` คืน error `*http.MaxBytesError` เมื่ออ่านเกิน 1 MB (`MaxBodyBytes = 1 << 20`) และบอก server ให้ปิด connection หลังตอบเสร็จ ไม่ต้องอ่านส่วนที่เหลือ
+
+### DisallowUnknownFields
+
+```go title="internal/httpx/decode.go"
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+```
+
+โดยปกติ `encoding/json` ข้าม field ที่ไม่รู้จักแบบเงียบๆ ถ้า client พิมพ์ผิดเป็น `{"titel":"..."}` ก็จะได้ title ว่างโดยไม่รู้ตัวว่าผิดตรงไหน การเปิดโหมดนี้ทำให้เราบอก client ได้ทันทีว่า field ไหนไม่รู้จัก
+
+### แปลง error ของ decoder เป็นข้อความที่ client เข้าใจ
+
+error จาก `dec.Decode` เป็นข้อความภาษาโปรแกรมเมอร์ เช่น `json: cannot unmarshal string into Go struct field .age of type int` เราจึงตรวจชนิดของ error ด้วย `errors.As` / `errors.Is` แล้วแปลงเป็น `*APIError` ที่เหมาะสม
+
+| สถานการณ์ | ตัวอย่าง body | ผลลัพธ์ |
+| --- | --- | --- |
+| JSON syntax ผิด | `{"email":}` | `400 BAD_REQUEST` "JSON ไม่ถูกต้องที่ตำแหน่ง 10" |
+| JSON ขาดตอน | `{"name":"a"` | `400 BAD_REQUEST` "JSON ไม่สมบูรณ์" |
+| ชนิดข้อมูลผิด | `{"email":123}` | `422 VALIDATION_ERROR` field `email`: "ต้องเป็นชนิด string" |
+| body ว่าง | (ไม่มี body) | `400 BAD_REQUEST` "request body ว่าง" |
+| field ไม่รู้จัก | `{"nickname":"x"}` | `422 VALIDATION_ERROR` field `nickname`: "ไม่รู้จัก field นี้" |
+| body ใหญ่เกิน 1 MB | | `413 PAYLOAD_TOO_LARGE` |
+| JSON หลายก้อน | `{"a":1}{"b":2}` | `400 BAD_REQUEST` "request body ต้องมี JSON object เดียว" |
+| error อื่น (เช่น connection หลุด) | | คืน error เดิม กลายเป็น `500` |
+
+เกณฑ์ที่ใช้แบ่ง 400 กับ 422: **400** คือ "อ่านไม่ออก" (body ไม่ใช่ JSON ที่ถูกต้อง) ส่วน **422** คือ "อ่านออกแต่เนื้อหาไม่ผ่าน" ซึ่งระบุได้ว่าผิดที่ field ไหน
+
+<Aside type="caution" title="unknown field ตรวจจากข้อความ error">
+`encoding/json` ไม่มี error type เฉพาะสำหรับ field ที่ไม่รู้จัก โค้ดจึงต้องตรวจจากข้อความด้วย `strings.HasPrefix(err.Error(), "json: unknown field ")` ซึ่งเปราะบางถ้าข้อความเปลี่ยนใน Go เวอร์ชันหน้า โปรเจกต์จึงมี table-driven test ใน `internal/httpx/decode_test.go` คุมทุกกรณีในตารางข้างบนไว้ ถ้าอัปเกรด Go แล้วพฤติกรรมเปลี่ยน test จะแจ้งทันที
+</Aside>
+
+### dec.More(): ต้องมี JSON แค่ก้อนเดียว
+
+```go title="internal/httpx/decode.go"
+	// A body like `{"a":1}{"b":2}` contains more than one value.
+	if dec.More() {
+		return BadRequest("request body ต้องมี JSON object เดียว")
+	}
+```
+
+`Decode` อ่านแค่ JSON value แรกแล้วหยุด ถ้าไม่เช็ก body ที่มีขยะต่อท้ายจะผ่านไปได้ `dec.More()` บอกว่ายังมีข้อมูลเหลือหรือไม่
+
+### ลองยิงจริง
+
+```bash
+$ curl -s -X POST localhost:8080/v1/auth/register \
+    -H 'Content-Type: application/json' \
+    -d '{"email":"a@b.com","nickname":"x"}'
+```
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "ข้อมูลไม่ผ่านการตรวจสอบ",
+    "details": [{ "field": "nickname", "issue": "ไม่รู้จัก field นี้" }],
+    "request_id": "req_596673e1cc86908e6d91bb57"
+  }
+}
+```
+
+## ด่านที่ 2: Validation
+
+### Validator: เก็บ error ทุก field
+
+<Code code={validateSrc} lang="go" title="internal/httpx/validate.go" />
+
+`Validator` เล็กมากแต่ทำสิ่งสำคัญ: **ไม่หยุดที่ error แรก** ถ้าฟอร์มผิด 3 ช่อง client ควรรู้ทั้ง 3 ช่องในครั้งเดียว ไม่ใช่ส่งแก้ทีละช่อง 3 รอบ (แนวคิดเดียวกับ `errors.Join` ในหน้า [Configuration](/web-api/configuration/))
+
+### validate() บน request DTO
+
+แต่ละ request มี struct ของตัวเอง และมี method `validate()` ที่ใช้ `Validator` ตรวจกฎ
+
+```go title="internal/task/handler.go"
+type createRequest struct {
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	Status      Status     `json:"status"`
+	DueAt       *time.Time `json:"due_at"`
+}
+
+func (req *createRequest) validate() error {
+	req.Title = strings.TrimSpace(req.Title)
+
+	var v httpx.Validator
+	v.Check(req.Title != "", "title", "ห้ามว่าง")
+	v.Check(utf8.RuneCountInString(req.Title) <= maxTitleLen, "title", "ยาวได้ไม่เกิน 200 ตัวอักษร")
+	v.Check(utf8.RuneCountInString(req.Description) <= maxDescriptionLen, "description", "ยาวได้ไม่เกิน 5000 ตัวอักษร")
+	v.Check(req.Status == "" || req.Status.Valid(), "status", "ต้องเป็น todo, in_progress หรือ done")
+	return v.Err()
+}
+```
+
+- **trim ก่อนตรวจ** title ที่มีแต่ช่องว่าง (`"   "`) ต้องถือว่าว่าง และค่าที่ trim แล้วคือค่าที่บันทึกลงฐานข้อมูล (method มี pointer receiver จึงแก้ค่าใน struct ได้)
+- **status ว่างได้** เพราะ service จะใส่ `todo` ให้เป็นค่าเริ่มต้น แต่ถ้าส่งมาต้องเป็นค่าที่รู้จัก
+- handler เรียกตามลำดับ decode → validate → service
+
+```go title="internal/task/handler.go"
+	var req createRequest
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		return err
+	}
+	if err := req.validate(); err != nil {
+		return err
+	}
+```
+
+### นับความยาวเป็นตัวอักษร ไม่ใช่ byte
+
+นี่คือจุดที่สำคัญมากสำหรับข้อความภาษาไทย `len()` ของ string ใน Go นับเป็น **byte** ไม่ใช่ตัวอักษร และอักษรไทยแต่ละตัวใช้ 3 bytes ใน UTF-8
+
+```go
+s := "เรียน Go"
+len(s)                    // 18  (เรียน = 5 ตัว × 3 bytes + " Go" 3 bytes)
+utf8.RuneCountInString(s) // 8   ตัวอักษร (rune)
+```
+
+ถ้าใช้ `len(title) <= 200` ผู้ใช้ภาษาไทยจะพิมพ์ได้แค่ราว 66 ตัวอักษร ทั้งที่ข้อความแจ้งว่า "ไม่เกิน 200 ตัวอักษร" จึงต้องใช้ `utf8.RuneCountInString` เสมอเมื่อกฎเป็นเรื่อง "จำนวนตัวอักษรที่ผู้ใช้เห็น"
+
+<Aside type="note">
+มีกรณีเดียวในโปรเจกต์ที่ตั้งใจใช้ `len()` คือ password ใน `registerRequest` ซึ่งตรวจ `len(req.Password) <= auth.MaxPasswordBytes` เพราะ bcrypt จำกัดที่ **72 bytes** จริงๆ ไม่ใช่ 72 ตัวอักษร ส่วนความยาวขั้นต่ำ 8 ตัวอักษรยังใช้ `utf8.RuneCountInString` (รายละเอียดในหน้า [Authentication](/web-api/authentication/))
+</Aside>
+
+### PATCH: แยก "ไม่ส่ง" กับ "ส่งค่าว่าง"
+
+request สำหรับ `PATCH` ใช้ pointer ทุก field เพื่อแยกระหว่าง "ไม่ได้ส่ง field นี้มา" (`nil` = ไม่ต้องแก้) กับ "ส่งมาเป็นค่าว่าง"
+
+```go title="internal/task/handler.go"
+// updateRequest uses pointers so we can tell "field omitted" (nil)
+// from "field set to the zero value" ("" or false).
+type updateRequest struct {
+	Title       *string    `json:"title"`
+	Description *string    `json:"description"`
+	Status      *Status    `json:"status"`
+	DueAt       *time.Time `json:"due_at"`
+}
+
+func (req *updateRequest) validate() error {
+	var v httpx.Validator
+	v.Check(req.Title != nil || req.Description != nil || req.Status != nil || req.DueAt != nil,
+		"body", "ต้องส่งอย่างน้อย 1 field")
+	if req.Title != nil {
+		t := strings.TrimSpace(*req.Title)
+		req.Title = &t
+		v.Check(t != "", "title", "ห้ามว่าง")
+		v.Check(utf8.RuneCountInString(t) <= maxTitleLen, "title", "ยาวได้ไม่เกิน 200 ตัวอักษร")
+	}
+	// ...
+	return v.Err()
+}
+```
+
+ตรวจกฎเฉพาะ field ที่ส่งมา และบังคับว่าต้องส่งอย่างน้อย 1 field
+
+### Query parameter ก็ต้อง validate
+
+`GET /v1/tasks` ไม่มี body แต่มี query parameter ที่ต้องตรวจด้วย `Validator` ตัวเดียวกัน
+
+```bash
+$ curl -s "localhost:8080/v1/tasks?limit=500&status=x" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "ข้อมูลไม่ผ่านการตรวจสอบ",
+    "details": [
+      { "field": "status", "issue": "ต้องเป็น todo, in_progress หรือ done" },
+      { "field": "limit", "issue": "ต้องเป็นตัวเลข 1-100" }
+    ],
+    "request_id": "req_04fe924f346f3167c6e769f6"
+  }
+}
+```
+
+### ตัวอย่าง: ผิดหลาย field พร้อมกัน
+
+```bash
+curl -s -X POST localhost:8080/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"bad","name":"","password":"x"}'
+```
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "ข้อมูลไม่ผ่านการตรวจสอบ",
+    "details": [
+      { "field": "email", "issue": "รูปแบบอีเมลไม่ถูกต้อง" },
+      { "field": "name", "issue": "ห้ามว่าง" },
+      { "field": "password", "issue": "ต้องยาวอย่างน้อย 8 ตัวอักษร" }
+    ],
+    "request_id": "req_1e980678b8275cae8a5ac921"
+  }
+}
+```
+
+## ด่านที่ 3: แปลง error เป็น HTTP
+
+### ตาราง error code
+
+ทุก error ของ tasks-api มี `code` ที่คงที่ ประกาศเป็นค่าคงที่ใน `internal/httpx/errors.go`
+
+| HTTP status | `code` | เกิดเมื่อ |
+| --- | --- | --- |
+| 400 | `BAD_REQUEST` | body ไม่ใช่ JSON ที่ถูกต้อง, body ว่าง, มี JSON หลายก้อน |
+| 401 | `UNAUTHENTICATED` | ไม่มี token, token ผิดหรือหมดอายุ, login ผิด |
+| 403 | `FORBIDDEN` | (ประกาศไว้สำหรับอนาคต: login แล้วแต่ไม่มีสิทธิ์) |
+| 404 | `NOT_FOUND` | ไม่พบ task (รวมถึง task ของคนอื่น และ id ที่ไม่ใช่ UUID), ไม่พบ endpoint |
+| 409 | `CONFLICT` | อีเมลนี้สมัครไปแล้ว |
+| 413 | `PAYLOAD_TOO_LARGE` | body ใหญ่เกิน 1 MB |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | `Content-Type` ไม่ใช่ `application/json` |
+| 422 | `VALIDATION_ERROR` | ข้อมูลไม่ผ่านการตรวจสอบ (มี `details` บอกราย field) |
+| 429 | `RATE_LIMIT_EXCEEDED` | เรียก register/login บ่อยเกินไป (มี header `Retry-After`) |
+| 503 | `TIMEOUT` | request เกิน `REQUEST_TIMEOUT` |
+| 500 | `INTERNAL_ERROR` | error อื่นๆ ที่ไม่ได้คาดไว้ (รายละเอียดอยู่ใน log เท่านั้น) |
+
+client ควรตัดสินใจจาก `code` (และ status) ไม่ใช่จาก `message` เพราะ message เป็นภาษาคนและอาจเปลี่ยนได้
+
+### Domain error → HTTP error
+
+service และ repository ไม่รู้จัก HTTP จึงคืน error ในภาษาของ domain เช่น `task.ErrNotFound`
+
+```go title="internal/task/task.go"
+// ErrNotFound is returned when a task does not exist or belongs to another user.
+var ErrNotFound = errors.New("task not found")
+```
+
+handler มีหน้าที่แปลงเป็น HTTP error ใน `mapError`
+
+```go title="internal/task/handler.go"
+var errTaskNotFound = httpx.NotFound("ไม่พบ task")
+
+// mapError converts domain errors to HTTP errors. Anything unknown is
+// returned unchanged and becomes a 500.
+func mapError(err error) error {
+	if errors.Is(err, ErrNotFound) {
+		return errTaskNotFound
+	}
+	return err
+}
+```
+
+- ใช้ `errors.Is` ไม่ใช่ `==` เพื่อให้ยังเจอแม้ error จะถูก wrap ด้วย `%w` มาหลายชั้น (ทบทวนที่ [Error handling](/intermediate/errors/))
+- error ที่ไม่รู้จักถูกส่งต่อไปตามเดิม และ `httpx.Error` จะตอบเป็น 500
+
+feature user ทำแบบเดียวกันแต่เขียนไว้ใน handler ตรงๆ เพราะแต่ละ endpoint แปลงต่างกัน
+
+```go title="internal/user/handler.go"
+	u, err := h.svc.Register(r.Context(), req.Email, req.Name, req.Password)
+	if errors.Is(err, ErrEmailTaken) {
+		return httpx.Conflict("อีเมลนี้ถูกใช้แล้ว")
+	}
+	if err != nil {
+		return err
+	}
+```
+
+### อย่าเปิดเผยรายละเอียดของ 500
+
+error ที่ไม่รู้จักมักมีข้อมูลภายใน เช่น `create task: ERROR: relation "tasks" does not exist (SQLSTATE 42P01)` ซึ่งบอกผู้โจมตีถึงโครงสร้างฐานข้อมูล `httpx.Error` จึง log ข้อความจริงไว้ฝั่ง server และตอบ client แค่ข้อความกลางๆ
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "เกิดข้อผิดพลาดภายในระบบ",
+    "request_id": "req_..."
+  }
+}
+```
+
+ทีม support ใช้ `request_id` ค้น log ที่มีรายละเอียดจริงได้
+
+### 404 ไม่ใช่ 403 สำหรับ resource ของคนอื่น
+
+ถ้าผู้ใช้ A เรียก `GET /v1/tasks/{id}` ด้วย id ของ task ที่เป็นของผู้ใช้ B เราตอบ **404** ไม่ใช่ 403 เพราะ 403 บอกเป็นนัยว่า "task นี้มีอยู่จริง แค่คุณไม่มีสิทธิ์" ซึ่งเปิดช่องให้ไล่เดา id ได้ 404 ไม่ให้ข้อมูลอะไรเลย
+
+ไม่ต้องเขียนโค้ดพิเศษสำหรับเรื่องนี้ เพราะ query กรองด้วย `user_id` อยู่แล้ว task ของคนอื่นจึง "ไม่มีอยู่" ในมุมมองของผู้ใช้ A (ดู [ฐานข้อมูล](/web-api/database/))
+
+### id ที่ไม่ใช่ UUID ก็คือ 404
+
+```go title="internal/httpx/decode.go"
+// PathUUID reads a path parameter that must be a UUID.
+// An invalid UUID can never match a row, so callers should answer 404.
+func PathUUID(r *http.Request, name string) (string, bool) {
+	v := r.PathValue(name)
+	return strings.ToLower(v), IsUUID(v)
+}
+```
+
+```go title="internal/task/handler.go"
+	id, ok := httpx.PathUUID(r, "id")
+	if !ok {
+		return errTaskNotFound
+	}
+```
+
+`GET /v1/tasks/abc` ไม่มีทางตรงกับแถวใดในฐานข้อมูล จึงตอบ 404 ทันทีโดยไม่ต้อง query และยังกัน error จาก PostgreSQL (`invalid input syntax for type uuid`) ที่จะกลายเป็น 500 ถ้าส่ง `abc` ลงไปตรงๆ
+
+```bash
+$ curl -s localhost:8080/v1/tasks/abc -H "Authorization: Bearer $TOKEN"
+{"error":{"code":"NOT_FOUND","message":"ไม่พบ task","request_id":"req_4bffd9182af1012455547fbb"}}
+```
+
+<Aside type="tip">
+แบ่งหน้าที่ให้ชัด: **handler** ตรวจรูปแบบของ input (ว่าง, ยาวเกิน, ค่าที่อนุญาต) ส่วน **service** ดูแลกฎทางธุรกิจที่ต้องใช้ข้อมูลอื่นประกอบ (เช่น ค่าเริ่มต้นของ status หรือจำนวนต่อหน้าสูงสุด) และ **ฐานข้อมูล** เป็นด่านสุดท้ายด้วย constraint อย่าง `NOT NULL`, `CHECK` และ `UNIQUE`
+</Aside>
+
+## สรุป
+
+- `DecodeJSON` จำกัด body 1 MB, ปฏิเสธ field ที่ไม่รู้จัก, ตรวจ `dec.More()` และแปลง error ทุกแบบเป็น 400 / 413 / 422
+- `Validator` เก็บ error ทุก field แล้วตอบ 422 พร้อม `details` ในครั้งเดียว และ request DTO แต่ละตัวมี `validate()` ของตัวเอง
+- trim ก่อนตรวจ และใช้ `utf8.RuneCountInString` นับความยาวข้อความ (อักษรไทยตัวละ 3 bytes)
+- domain error ถูกแปลงเป็น HTTP error ด้วย `errors.Is` ใน handler, error ที่ไม่รู้จักเป็น 500 โดยไม่เปิดเผยรายละเอียด
+- resource ของคนอื่นและ id ที่ไม่ใช่ UUID ตอบ 404 เสมอ

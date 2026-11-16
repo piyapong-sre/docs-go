@@ -1,0 +1,263 @@
+---
+title: Testing
+description: เขียน test ด้วย package testing ตั้งแต่ table-driven test, subtest, benchmark ด้วย b.Loop ไปจนถึง fuzzing และ example test
+sidebar:
+  order: 8
+---
+
+import { Aside, Code, FileTree } from '@astrojs/starlight/components';
+import calcSrc from '../../../../examples/learn/intermediate/testing/calc.go?raw';
+import testSrc from '../../../../examples/learn/intermediate/testing/calc_test.go?raw';
+import exampleSrc from '../../../../examples/learn/intermediate/testing/example_test.go?raw';
+
+Go มีเครื่องมือ test มาในตัว ไม่ต้องติดตั้ง framework เพิ่ม แค่มี package `testing` กับคำสั่ง `go test`
+ก็เขียน unit test, benchmark, fuzz test และตัวอย่างประกอบเอกสารได้ครบ
+
+## กฎพื้นฐาน
+
+- ไฟล์ test ต้องลงท้ายด้วย **`_test.go`** (จะไม่ถูก compile รวมเข้ากับโปรแกรมจริง)
+- function test ขึ้นต้นด้วย **`Test`** และรับ `t *testing.T`
+- วางไว้ในโฟลเดอร์เดียวกับ code ที่ทดสอบ
+
+<FileTree>
+- examples/learn/intermediate/testing/
+  - calc.go           code จริง (package calc)
+  - calc_test.go      test แบบ white-box (package calc)
+  - example_test.go   example test แบบ black-box (package calc_test)
+  - testdata/
+    - sample.txt      ไฟล์ข้อมูลสำหรับ test
+</FileTree>
+
+## Code ที่จะทดสอบ
+
+<Code code={calcSrc} lang="go" title="examples/learn/intermediate/testing/calc.go" />
+
+## ไฟล์ test
+
+<Code code={testSrc} lang="go" title="examples/learn/intermediate/testing/calc_test.go" />
+
+รัน test ทั้งหมดใน package
+
+```bash
+cd examples/learn
+go test ./intermediate/testing
+```
+
+```text title="Output"
+ok  	learn/intermediate/testing	0.361s
+```
+
+คำสั่งที่ใช้บ่อย
+
+```bash
+go test ./...                     # ทุก package ใน module
+go test -v ./intermediate/testing # แสดงทุก test ที่รัน
+go test -run TestDivide ./...     # รันเฉพาะ test ที่ชื่อตรงกับ regex
+go test -run 'TestDivide/by_zero' ./intermediate/testing # เฉพาะ subtest
+go test -count=1 ./...            # ไม่ใช้ผลจาก cache
+go test -race ./...               # เปิด race detector (ดูบท Race detector)
+```
+
+## อธิบายทีละส่วน
+
+### t.Error vs t.Fatal
+
+| | ทำอะไร |
+|---|---|
+| `t.Errorf(...)` | บันทึกว่า fail แล้ว **ทำต่อ** — เห็นปัญหาหลายจุดในรอบเดียว |
+| `t.Fatalf(...)` | บันทึกว่า fail แล้ว **หยุด test นั้นทันที** — ใช้เมื่อไปต่อไม่ได้ เช่น ได้ error แล้วค่าที่เหลือไม่มีความหมาย |
+
+ข้อความควรบอก **input, ค่าที่ได้ และค่าที่ต้องการ** ตามรูปแบบ `Func(input) = got; want X`
+Go ไม่มี assert library ในตัว และทีม Go แนะนำให้ใช้ `if` ธรรมดา
+
+### Table-driven test
+
+`TestDivide` เก็บ test case เป็น slice ของ struct แล้ววน loop ทดสอบทีละ case
+เพิ่ม case ใหม่ได้ด้วยการเพิ่มบรรทัดเดียว นี่คือรูปแบบที่นิยมที่สุดใน Go
+
+### Subtest ด้วย t.Run
+
+`t.Run(tt.name, ...)` สร้าง subtest แยกชื่อกัน ผลจะแสดงเป็น `TestDivide/by_zero` และเลือกรันเฉพาะตัวได้
+
+```text title="go test -v -run TestDivide"
+=== RUN   TestDivide
+=== RUN   TestDivide/even
+=== PAUSE TestDivide/even
+...
+--- PASS: TestDivide (0.00s)
+    --- PASS: TestDivide/even (0.00s)
+    --- PASS: TestDivide/by_zero (0.00s)
+    --- PASS: TestDivide/negative (0.00s)
+    --- PASS: TestDivide/truncate (0.00s)
+```
+
+(ลำดับของ subtest ที่ขนานกันอาจไม่ตรงกันในแต่ละครั้ง)
+
+### t.Parallel
+
+`t.Parallel()` บอกว่า subtest นี้รันพร้อมกับ subtest อื่นที่เรียก `t.Parallel()` ได้
+ตั้งแต่ Go 1.22 ตัวแปร loop (`tt`) เป็นตัวใหม่ทุกรอบ จึงไม่ต้องเขียน `tt := tt` แบบสมัยก่อนแล้ว
+
+<Aside type="caution">
+ใช้ `t.Parallel()` เฉพาะเมื่อ test **ไม่แชร์ state** กัน เช่น ไม่แก้ตัวแปร global, ไฟล์เดียวกัน หรือ environment variable
+(`t.Setenv` ใช้ร่วมกับ `t.Parallel` ไม่ได้)
+</Aside>
+
+### t.Helper
+
+`assertEqual` เรียก `t.Helper()` ทำให้เวลา fail ข้อความจะชี้ไปที่ **บรรทัดที่เรียก `assertEqual`** ใน `TestReverse`
+แทนที่จะชี้เข้าไปข้างใน helper ซึ่งไม่มีประโยชน์ในการหาบั๊ก
+
+### testdata/
+
+โฟลเดอร์ชื่อ `testdata` ถูก Go tool **ข้าม** ไม่ compile ใช้เก็บไฟล์ input/output สำหรับ test
+ตอนรัน `go test` working directory คือโฟลเดอร์ของ package จึงอ้าง path แบบ relative ได้เลย
+
+<Aside type="tip" title="helper ที่ควรรู้จัก">
+- `t.TempDir()` สร้างโฟลเดอร์ชั่วคราว ลบให้เองเมื่อ test จบ
+- `t.Cleanup(func(){...})` ลงทะเบียน cleanup ทำงานเมื่อ test จบ
+- `t.Context()` (Go 1.24+) ได้ context ที่ถูก cancel ตอน test จบ
+- `t.Setenv("KEY", "v")` ตั้ง env ชั่วคราวแล้วคืนค่าเดิมให้
+</Aside>
+
+## Coverage
+
+```bash
+go test -cover ./intermediate/testing
+```
+
+```text title="Output"
+ok  	learn/intermediate/testing	0.336s	coverage: 100.0% of statements
+```
+
+ดูว่าบรรทัดไหนยังไม่ถูก test ด้วย HTML report
+
+```bash
+go test -coverprofile=cover.out ./intermediate/testing
+go tool cover -html=cover.out
+```
+
+coverage สูงไม่ได้แปลว่าไม่มีบั๊ก แต่ coverage ต่ำบอกได้ชัดว่ามีส่วนที่ไม่เคยถูกรันเลย
+
+## Benchmark ด้วย b.Loop()
+
+benchmark ขึ้นต้นด้วย `Benchmark` รับ `b *testing.B` ตั้งแต่ Go 1.24 ให้ใช้ **`for b.Loop()`**
+
+```go
+func BenchmarkReverse(b *testing.B) {
+	s := strings.Repeat("สวัสดี golang ", 20) // setup ไม่ถูกนับเวลา
+	for b.Loop() {
+		Reverse(s)
+	}
+}
+```
+
+```bash
+go test -run '^$' -bench . -benchmem ./intermediate/testing
+```
+
+```text title="Output (ตัวเลขขึ้นกับเครื่อง)"
+BenchmarkReverse-12    	  686461	      1746 ns/op
+```
+
+`-run '^$'` คือไม่รัน unit test ใดๆ รันแค่ benchmark ส่วน `-benchmem` แสดงจำนวน allocation ด้วย
+
+<Aside type="tip" title="ทำไม b.Loop() ดีกว่า for i := 0; i < b.N; i++">
+- ส่วน setup ก่อน loop ไม่ถูกนับเวลา ไม่ต้องเรียก `b.ResetTimer()` เอง
+- compiler จะไม่ optimize ตัด function call ใน loop ทิ้ง ผลที่วัดได้จึงเชื่อถือได้
+- function benchmark ถูกเรียกครั้งเดียว setup ราคาแพงจึงไม่ถูกทำซ้ำหลายรอบ
+
+code เก่าที่ใช้ `b.N` ยังใช้ได้ แต่ code ใหม่ให้ใช้ `b.Loop()`
+ดูการวิเคราะห์ประสิทธิภาพเพิ่มเติมใน [Profiling](/advanced/profiling/)
+</Aside>
+
+## Fuzzing
+
+fuzz test ให้ Go **สุ่มสร้าง input** มาทดสอบ เพื่อหา edge case ที่เราคิดไม่ถึง
+แทนที่จะเช็คค่าที่ตายตัว เราเช็ค **คุณสมบัติที่ต้องจริงเสมอ** เช่น "กลับ string สองครั้งต้องได้ค่าเดิม"
+
+```go
+func FuzzReverse(f *testing.F) {
+	f.Add("hello")   // seed corpus: input ตั้งต้น
+	f.Fuzz(func(t *testing.T, s string) {
+		if got := Reverse(Reverse(s)); got != s { ... }
+	})
+}
+```
+
+- `go test` ปกติจะรัน fuzz test กับ **seed corpus เท่านั้น** (เหมือน unit test ธรรมดา)
+- สั่งให้สุ่มจริงด้วย `-fuzz`
+
+```bash
+go test -run '^$' -fuzz FuzzReverse -fuzztime 10s ./intermediate/testing
+```
+
+ถ้าเจอ input ที่ทำให้ fail Go จะบันทึกไว้ใน `testdata/fuzz/FuzzReverse/` และ input นั้นจะถูกรันทุกครั้งที่ `go test` ต่อจากนี้
+ในตัวอย่างเราใช้ `t.Skip` ข้าม string ที่ไม่ใช่ UTF-8 ที่ถูกต้อง เพราะการแปลงเป็น `[]rune` จะเปลี่ยน byte ที่เสียเป็น `U+FFFD` ทำให้กลับไม่เหมือนเดิม — นี่คือบั๊กแบบที่ fuzzing หาเจอ
+
+## Example test
+
+<Code code={exampleSrc} lang="go" title="examples/learn/intermediate/testing/example_test.go" />
+
+- function ขึ้นต้นด้วย `Example` แล้วตามด้วยชื่อสิ่งที่จะยกตัวอย่าง (`ExampleAdd` = ตัวอย่างของ `Add`)
+- `go test` จะรันแล้ว **เทียบ stdout กับ comment `// Output:`** ถ้าไม่ตรงถือว่า fail
+- ตัวอย่างจะไปปรากฏใน `go doc` และ pkg.go.dev เอกสารจึงไม่มีวันล้าสมัย
+
+ไฟล์นี้ใช้ `package calc_test` (มี `_test` ต่อท้าย) เป็น **black-box test** คือเรียกใช้ package เหมือนคนนอก
+เห็นแค่สิ่งที่ exported เหมาะกับการทดสอบ public API ส่วน `calc_test.go` ใช้ `package calc` เข้าถึงของ unexported ได้
+
+<Aside type="caution" title="ชื่อโฟลเดอร์กับชื่อ package">
+ตัวอย่างนี้มี import path ลงท้ายด้วย `/testing` แต่ชื่อ package คือ `calc` เราจึงใส่ alias `calc` ตอน import ให้อ่านชัด
+(ชื่อ package ไม่จำเป็นต้องตรงกับโฟลเดอร์ แต่ **ควร** ตรงกัน ในโปรเจกต์จริงให้ตั้งโฟลเดอร์เป็น `calc`)
+</Aside>
+
+ต้องการทดสอบ HTTP handler ดูต่อได้ที่ [Testing Web API](/web-api/testing/)
+
+## แบบฝึกหัด
+
+1. เพิ่ม test case ใน `TestDivide` สำหรับ `-7 / 2` (ผลลัพธ์ที่ถูกต้องใน Go คือเท่าไร)
+2. เขียน table-driven test สำหรับ `WordCount` อย่างน้อย 4 case รวม string ว่างและ string ที่มีแต่ช่องว่าง
+3. เขียน `ExampleReverse` ที่พิมพ์ `Reverse("Go")` พร้อม `// Output:` ที่ถูกต้อง
+
+<details>
+<summary>เฉลย</summary>
+
+1. Go ตัดเศษเข้าหาศูนย์ (truncation) ได้ `-3`
+
+   ```go
+   {name: "negative truncate", a: -7, b: 2, want: -3},
+   ```
+
+2. ตัวอย่าง
+
+   ```go
+   func TestWordCount(t *testing.T) {
+   	tests := []struct {
+   		in   string
+   		want int
+   	}{
+   		{"", 0},
+   		{"   ", 0},
+   		{"hello", 1},
+   		{"  go  is fun ", 3},
+   	}
+   	for _, tt := range tests {
+   		t.Run(tt.in, func(t *testing.T) {
+   			if got := WordCount(tt.in); got != tt.want {
+   				t.Errorf("WordCount(%q) = %d; want %d", tt.in, got, tt.want)
+   			}
+   		})
+   	}
+   }
+   ```
+
+3. ใน `example_test.go`
+
+   ```go
+   func ExampleReverse() {
+   	fmt.Println(calc.Reverse("Go"))
+   	// Output: oG
+   }
+   ```
+
+</details>
